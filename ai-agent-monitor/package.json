@@ -1,0 +1,81 @@
+{
+  "name": "ai-agent-monitor",
+  "displayName": "AI Agent Monitor",
+  "description": "Live structured feed of AI agent conversations — user inputs, agent thinking, and agent output in a dedicated sidebar panel",
+  "version": "0.2.0",
+  "publisher": "ameyakulkarni",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "enabledApiProposals": [
+    "cursor"
+  ],
+  "categories": [
+    "Other",
+    "Visualization"
+  ],
+  "keywords": [
+    "ai", "agent", "monitor", "cursor", "copilot",
+    "continue", "antigravity", "llm", "conversation"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ai-agent-monitor",
+          "title": "AI Agent Monitor",
+          "icon": "media/sidebar-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "ai-agent-monitor": [
+        {
+          "type": "webview",
+          "id": "aiAgentMonitor.sidebarView",
+          "name": "Conversation Feed"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "aiAgentMonitor.open",
+        "title": "AI Agent Monitor: Open Panel"
+      },
+      {
+        "command": "aiAgentMonitor.openSidebar",
+        "title": "AI Agent Monitor: Focus Sidebar"
+      },
+      {
+        "command": "aiAgentMonitor.clear",
+        "title": "AI Agent Monitor: Clear History"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "aiAgentMonitor.openSidebar",
+        "key": "ctrl+shift+m",
+        "mac": "cmd+shift+m"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "lint": "tsc --noEmit",
+    "package": "npm run build && vsce package --no-dependencies --allow-missing-repository -o ai-agent-monitor.vsix",
+    "install:local": "npm run build && vsce package --no-dependencies --allow-missing-repository -o ai-agent-monitor.vsix && code --install-extension ai-agent-monitor.vsix --force"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.11.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.22.0"
+  }
+}
