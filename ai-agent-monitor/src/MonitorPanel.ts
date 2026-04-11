@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { ConversationTurn, MonitorStatus, WebviewOutgoing } from './types';
+import { cloneSnapshot, MonitorSnapshot, MonitorStatus, WebviewOutgoing } from './types';
 import { getConversationWebviewHtml } from './webviewContent';
 
 export class MonitorPanel implements vscode.Disposable {
@@ -9,7 +9,11 @@ export class MonitorPanel implements vscode.Disposable {
   private readonly panel: vscode.WebviewPanel;
   private readonly disposables: vscode.Disposable[] = [];
   private ready = false;
-  private currentTurns: ConversationTurn[] = [];
+  private currentSnapshot: MonitorSnapshot = {
+    app: 'unknown',
+    appLabel: 'AI Sidebar',
+    chats: [],
+  };
   private currentStatus: MonitorStatus = {
     status: 'monitoring',
     text: 'Listening for AI conversations...',
@@ -23,7 +27,7 @@ export class MonitorPanel implements vscode.Disposable {
       this.panel.webview.onDidReceiveMessage((message) => {
         if (message.command === 'ready') {
           this.ready = true;
-          this.sync(this.currentTurns, this.currentStatus);
+          this.sync(this.currentSnapshot, this.currentStatus);
         }
       })
     );
@@ -68,13 +72,13 @@ export class MonitorPanel implements vscode.Disposable {
     return MonitorPanel.instance;
   }
 
-  sync(turns: ConversationTurn[], status: MonitorStatus): void {
-    this.currentTurns = turns.map((turn) => cloneTurn(turn));
+  sync(snapshot: MonitorSnapshot, status: MonitorStatus): void {
+    this.currentSnapshot = cloneSnapshot(snapshot);
     this.currentStatus = { ...status };
 
     this.postMessage({
       command: 'sync',
-      turns: this.currentTurns,
+      snapshot: this.currentSnapshot,
     });
     this.postMessage({
       command: 'setStatus',
@@ -83,24 +87,12 @@ export class MonitorPanel implements vscode.Disposable {
     });
   }
 
-  updateTurn(turn: ConversationTurn): void {
-    const next = cloneTurn(turn);
-    const existingIndex = this.currentTurns.findIndex((candidate) => candidate.id === next.id);
-
-    if (existingIndex === -1) {
-      this.currentTurns.push(next);
-    } else {
-      this.currentTurns[existingIndex] = next;
-    }
-
-    this.postMessage({
-      command: 'updateTurn',
-      turn: next,
-    });
-  }
-
   clear(): void {
-    this.currentTurns = [];
+    this.currentSnapshot = {
+      ...this.currentSnapshot,
+      chats: [],
+      selectedChatId: undefined,
+    };
     this.postMessage({ command: 'clear' });
   }
 
@@ -126,15 +118,4 @@ export class MonitorPanel implements vscode.Disposable {
 
     this.panel.webview.postMessage(message);
   }
-}
-
-function cloneTurn(turn: ConversationTurn): ConversationTurn {
-  return {
-    ...turn,
-    blocks: {
-      'user-input': { ...turn.blocks['user-input'] },
-      'agent-thinking': { ...turn.blocks['agent-thinking'] },
-      'agent-output': { ...turn.blocks['agent-output'] },
-    },
-  };
 }

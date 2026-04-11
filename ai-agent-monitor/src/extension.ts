@@ -20,12 +20,12 @@ export function activate(context: vscode.ExtensionContext) {
     )
   );
 
-  sidebarProvider.sync(monitor.getTurns(), monitor.getStatus());
+  sidebarProvider.sync(monitor.getSnapshot(), monitor.getStatus());
 
   context.subscriptions.push(
     vscode.commands.registerCommand('aiAgentMonitor.open', () => {
       const panel = MonitorPanel.createOrShow(context.extensionUri);
-      panel.sync(monitor!.getTurns(), monitor!.getStatus());
+      panel.sync(monitor!.getSnapshot(), monitor!.getStatus());
     })
   );
 
@@ -46,26 +46,19 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand(
       'aiAgentMonitor.pushMessage',
-      (type?: BlockType, content?: string, source?: string) => {
+      (type?: BlockType, content?: string) => {
         if (!type || !content) {
           return;
         }
 
-        const turn = monitor!.pushMessage({ type, content, source });
-        sidebarProvider?.updateTurn(turn);
-        MonitorPanel.getInstance()?.updateTurn(turn);
+        monitor!.pushMessage({ type, content });
       }
     )
   );
 
-  monitor.onTurnAdded((turn) => {
-    sidebarProvider?.updateTurn(turn);
-    MonitorPanel.getInstance()?.updateTurn(turn);
-  });
-
-  monitor.onTurnUpdated((turn) => {
-    sidebarProvider?.updateTurn(turn);
-    MonitorPanel.getInstance()?.updateTurn(turn);
+  monitor.onSnapshotChanged((snapshot) => {
+    sidebarProvider?.sync(snapshot, monitor!.getStatus());
+    MonitorPanel.getInstance()?.sync(snapshot, monitor!.getStatus());
   });
 
   monitor.onStatusChanged((status) => {
@@ -74,11 +67,11 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   return {
-    getTurns: () => monitor?.getTurns() ?? [],
+    getSnapshot: () => monitor?.getSnapshot(),
     openPanel: () => vscode.commands.executeCommand('aiAgentMonitor.open'),
     openSidebar: () => vscode.commands.executeCommand('aiAgentMonitor.openSidebar'),
-    pushMessage: (type: BlockType, content: string, source?: string) => {
-      return monitor?.pushMessage({ type, content, source });
+    pushMessage: (type: BlockType, content: string) => {
+      return monitor?.pushMessage({ type, content });
     },
   };
 }

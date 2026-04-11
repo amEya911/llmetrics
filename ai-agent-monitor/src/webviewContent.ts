@@ -17,13 +17,17 @@ export function getConversationWebviewHtml(
   <style>
     :root {
       --bg: var(--vscode-editor-background);
-      --surface: color-mix(in srgb, var(--bg) 92%, white 8%);
-      --border: var(--vscode-panel-border, rgba(128, 128, 128, 0.18));
+      --panel: color-mix(in srgb, var(--bg) 92%, white 8%);
+      --panel-strong: color-mix(in srgb, var(--bg) 88%, white 12%);
+      --panel-muted: color-mix(in srgb, var(--bg) 95%, white 5%);
+      --border: var(--vscode-panel-border, rgba(128, 128, 128, 0.22));
       --text: var(--vscode-editor-foreground);
       --muted: var(--vscode-descriptionForeground, rgba(128, 128, 128, 0.9));
+      --shadow: 0 10px 26px rgba(0, 0, 0, 0.12);
+      --accent: color-mix(in srgb, var(--vscode-focusBorder, #5b8def) 78%, white 22%);
       --user: #5b8def;
-      --thinking: #d6a63d;
-      --output: #37b36b;
+      --thinking: #d8a23f;
+      --output: #35b26f;
     }
 
     * { box-sizing: border-box; }
@@ -37,24 +41,41 @@ export function getConversationWebviewHtml(
       line-height: 1.5;
     }
 
+    .shell {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
     header {
       position: sticky;
       top: 0;
-      z-index: 1;
+      z-index: 2;
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      padding: 12px 16px;
-      background: var(--bg);
+      padding: 14px 16px;
+      background: color-mix(in srgb, var(--bg) 94%, black 6%);
       border-bottom: 1px solid var(--border);
     }
 
-    .title {
-      font-size: 12px;
+    .header-copy {
+      min-width: 0;
+    }
+
+    .eyebrow {
+      color: var(--muted);
+      font-size: 11px;
       font-weight: 700;
       letter-spacing: 0.08em;
       text-transform: uppercase;
+    }
+
+    .host-label {
+      margin-top: 2px;
+      font-size: 16px;
+      font-weight: 700;
     }
 
     .status {
@@ -67,8 +88,8 @@ export function getConversationWebviewHtml(
     }
 
     .status-dot {
-      width: 8px;
-      height: 8px;
+      width: 9px;
+      height: 9px;
       border-radius: 999px;
       background: var(--output);
       flex: 0 0 auto;
@@ -80,35 +101,179 @@ export function getConversationWebviewHtml(
     }
 
     .status-text {
+      max-width: 260px;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
 
     main {
-      padding: 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
+      flex: 1;
+      display: grid;
+      grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+      min-height: 0;
     }
 
-    .placeholder {
-      padding: 24px 16px;
+    aside {
+      border-right: 1px solid var(--border);
+      background: var(--panel-muted);
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .chat-list-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 14px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .chat-list-title {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .chat-count {
+      min-width: 24px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      text-align: center;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .chat-list {
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      overflow: auto;
+    }
+
+    .chat-item {
+      width: 100%;
+      padding: 12px 12px 11px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: inherit;
+      text-align: left;
+      cursor: pointer;
+      transition: border-color 0.14s ease, transform 0.14s ease, background 0.14s ease;
+    }
+
+    .chat-item:hover {
+      border-color: color-mix(in srgb, var(--accent) 55%, var(--border) 45%);
+      transform: translateY(-1px);
+    }
+
+    .chat-item.selected {
+      border-color: var(--accent);
+      background: color-mix(in srgb, var(--panel-strong) 78%, var(--accent) 22%);
+      box-shadow: var(--shadow);
+    }
+
+    .chat-title-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .chat-title {
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.35;
+    }
+
+    .chat-time {
+      flex: 0 0 auto;
+      color: var(--muted);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .chat-subtitle {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .chat-empty,
+    .pane-empty,
+    .shell-empty {
+      padding: 18px;
+      margin: 16px;
       border: 1px dashed var(--border);
-      border-radius: 12px;
+      border-radius: 16px;
+      background: var(--panel);
       color: var(--muted);
       text-align: center;
     }
 
-    .placeholder.hidden {
-      display: none;
+    .chat-pane {
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      background: linear-gradient(
+        180deg,
+        color-mix(in srgb, var(--bg) 94%, white 6%) 0%,
+        var(--bg) 100%
+      );
+    }
+
+    .chat-pane-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 20px 14px;
+      border-bottom: 1px solid var(--border);
+      background: color-mix(in srgb, var(--bg) 95%, black 5%);
+    }
+
+    .chat-pane-title {
+      font-size: 18px;
+      font-weight: 700;
+      line-height: 1.35;
+    }
+
+    .chat-pane-subtitle {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .chat-pane-time {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+      padding-top: 3px;
+    }
+
+    .turns {
+      padding: 18px 20px 24px;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
     }
 
     .turn {
       border: 1px solid var(--border);
-      border-radius: 14px;
-      background: var(--surface);
+      border-radius: 18px;
+      background: var(--panel);
       overflow: hidden;
+      box-shadow: var(--shadow);
     }
 
     .turn-meta {
@@ -116,29 +281,27 @@ export function getConversationWebviewHtml(
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      padding: 10px 14px;
+      padding: 12px 16px;
+      background: color-mix(in srgb, var(--panel) 88%, black 12%);
       border-bottom: 1px solid var(--border);
       color: var(--muted);
       font-size: 11px;
-    }
-
-    .source {
-      font-weight: 600;
-      color: var(--text);
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
     }
 
     .sections {
       display: flex;
       flex-direction: column;
+      gap: 14px;
+      padding: 16px;
     }
 
     .section {
-      padding: 14px;
-      border-top: 1px solid var(--border);
-    }
-
-    .section:first-child {
-      border-top: 0;
+      padding: 14px 15px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: color-mix(in srgb, var(--panel) 88%, white 12%);
     }
 
     .section.user-input {
@@ -161,17 +324,9 @@ export function getConversationWebviewHtml(
       text-transform: uppercase;
     }
 
-    .user-input .label {
-      color: var(--user);
-    }
-
-    .agent-thinking .label {
-      color: var(--thinking);
-    }
-
-    .agent-output .label {
-      color: var(--output);
-    }
+    .user-input .label { color: var(--user); }
+    .agent-thinking .label { color: var(--thinking); }
+    .agent-output .label { color: var(--output); }
 
     .content {
       min-height: 22px;
@@ -179,6 +334,7 @@ export function getConversationWebviewHtml(
       word-break: break-word;
       font-family: var(--vscode-editor-font-family, var(--vscode-font-family, monospace));
       font-size: var(--vscode-editor-font-size, 13px);
+      line-height: 1.55;
     }
 
     .content.empty::before {
@@ -186,7 +342,7 @@ export function getConversationWebviewHtml(
     }
 
     .agent-thinking .content {
-      opacity: 0.88;
+      opacity: 0.9;
     }
 
     .streaming .content::after {
@@ -199,26 +355,58 @@ export function getConversationWebviewHtml(
       0%, 100% { opacity: 1; }
       50% { opacity: 0; }
     }
+
+    @media (max-width: 760px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+
+      aside {
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .chat-list {
+        max-height: 220px;
+      }
+    }
   </style>
 </head>
 <body>
-  <header>
-    <div class="title">${title}</div>
-    <div class="status">
-      <div id="status-dot" class="status-dot monitoring"></div>
-      <div id="status-text" class="status-text">Listening for AI conversations...</div>
-    </div>
-  </header>
+  <div class="shell">
+    <header>
+      <div class="header-copy">
+        <div class="eyebrow">${title}</div>
+        <div id="host-label" class="host-label">AI Sidebar</div>
+      </div>
+      <div class="status">
+        <div id="status-dot" class="status-dot monitoring"></div>
+        <div id="status-text" class="status-text">Listening for AI conversations...</div>
+      </div>
+    </header>
 
-  <main>
-    <div id="placeholder" class="placeholder">The next captured AI conversation will appear here.</div>
-    <div id="turns"></div>
-  </main>
+    <main>
+      <aside>
+        <div class="chat-list-header">
+          <div class="chat-list-title">Chats</div>
+          <div id="chat-count" class="chat-count">0</div>
+        </div>
+        <div id="chat-list" class="chat-list"></div>
+      </aside>
+
+      <section id="chat-pane" class="chat-pane"></section>
+    </main>
+  </div>
 
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    const turns = [];
-    const turnIndex = new Map();
+    let snapshot = {
+      app: 'unknown',
+      appLabel: 'AI Sidebar',
+      chats: [],
+      selectedChatId: undefined,
+    };
+    let selectedChatId;
 
     const labels = {
       'user-input': 'User Input',
@@ -226,8 +414,10 @@ export function getConversationWebviewHtml(
       'agent-output': 'Agent Output',
     };
 
-    const container = document.getElementById('turns');
-    const placeholder = document.getElementById('placeholder');
+    const hostLabel = document.getElementById('host-label');
+    const chatCount = document.getElementById('chat-count');
+    const chatList = document.getElementById('chat-list');
+    const chatPane = document.getElementById('chat-pane');
     const statusDot = document.getElementById('status-dot');
     const statusText = document.getElementById('status-text');
 
@@ -245,7 +435,6 @@ export function getConversationWebviewHtml(
         return new Date(timestamp).toLocaleTimeString([], {
           hour: '2-digit',
           minute: '2-digit',
-          second: '2-digit',
         });
       } catch {
         return '';
@@ -257,15 +446,65 @@ export function getConversationWebviewHtml(
       statusText.textContent = text || 'Listening for AI conversations...';
     }
 
-    function upsertTurn(turn) {
-      const existingIndex = turnIndex.get(turn.id);
-      if (existingIndex === undefined) {
-        turnIndex.set(turn.id, turns.length);
-        turns.push(turn);
+    function ensureSelectedChat() {
+      const chatIds = new Set((snapshot.chats || []).map((chat) => chat.id));
+
+      if (selectedChatId && chatIds.has(selectedChatId)) {
         return;
       }
 
-      turns[existingIndex] = turn;
+      selectedChatId = snapshot.selectedChatId && chatIds.has(snapshot.selectedChatId)
+        ? snapshot.selectedChatId
+        : snapshot.chats[0]?.id;
+    }
+
+    function applySnapshot(nextSnapshot) {
+      snapshot = nextSnapshot || {
+        app: 'unknown',
+        appLabel: 'AI Sidebar',
+        chats: [],
+        selectedChatId: undefined,
+      };
+      ensureSelectedChat();
+      render();
+    }
+
+    function getSelectedChat() {
+      return (snapshot.chats || []).find((chat) => chat.id === selectedChatId);
+    }
+
+    function renderChatList() {
+      const chats = snapshot.chats || [];
+      chatCount.textContent = String(chats.length);
+      hostLabel.textContent = snapshot.appLabel || 'AI Sidebar';
+
+      if (chats.length === 0) {
+        chatList.innerHTML = '<div class="chat-empty">No tracked chats yet for this app.</div>';
+        return;
+      }
+
+      chatList.innerHTML = chats.map((chat) => {
+        const subtitle = chat.subtitle
+          ? '<div class="chat-subtitle">' + escapeHtml(chat.subtitle) + '</div>'
+          : '';
+        const selected = chat.id === selectedChatId ? ' selected' : '';
+        return \`
+          <button class="chat-item\${selected}" data-chat-id="\${escapeHtml(chat.id)}" type="button">
+            <div class="chat-title-row">
+              <div class="chat-title">\${escapeHtml(chat.title || 'Untitled chat')}</div>
+              <div class="chat-time">\${escapeHtml(formatTime(chat.updatedAt || chat.createdAt || Date.now()))}</div>
+            </div>
+            \${subtitle}
+          </button>
+        \`;
+      }).join('');
+
+      for (const button of chatList.querySelectorAll('[data-chat-id]')) {
+        button.addEventListener('click', () => {
+          selectedChatId = button.getAttribute('data-chat-id');
+          render();
+        });
+      }
     }
 
     function renderSection(type, block) {
@@ -285,15 +524,30 @@ export function getConversationWebviewHtml(
       \`;
     }
 
-    function render() {
-      placeholder.classList.toggle('hidden', turns.length > 0);
-      container.innerHTML = turns.map((turn) => {
-        const source = turn.source ? escapeHtml(turn.source) : 'AI Sidebar';
+    function renderChatPane() {
+      const chats = snapshot.chats || [];
+      const selectedChat = getSelectedChat();
+
+      if (chats.length === 0) {
+        chatPane.innerHTML = '<div class="shell-empty">The next captured AI chat will appear here.</div>';
+        return;
+      }
+
+      if (!selectedChat) {
+        chatPane.innerHTML = '<div class="pane-empty">Select a chat to view its captured conversation.</div>';
+        return;
+      }
+
+      const paneSubtitle = selectedChat.subtitle
+        ? '<div class="chat-pane-subtitle">' + escapeHtml(selectedChat.subtitle) + '</div>'
+        : '';
+
+      const turnMarkup = (selectedChat.turns || []).map((turn, index) => {
         return \`
-          <section class="turn" data-turn-id="\${turn.id}">
+          <section class="turn">
             <div class="turn-meta">
-              <span class="source">\${source}</span>
-              <span>\${formatTime(turn.updatedAt)}</span>
+              <span>Turn \${index + 1}</span>
+              <span>\${escapeHtml(formatTime(turn.updatedAt || turn.createdAt || Date.now()))}</span>
             </div>
             <div class="sections">
               \${renderSection('user-input', turn.blocks['user-input'])}
@@ -303,6 +557,26 @@ export function getConversationWebviewHtml(
           </section>
         \`;
       }).join('');
+
+      const turnsSection = turnMarkup
+        ? '<div class="turns">' + turnMarkup + '</div>'
+        : '<div class="pane-empty">No captured messages yet for this chat.</div>';
+
+      chatPane.innerHTML = \`
+        <div class="chat-pane-header">
+          <div>
+            <div class="chat-pane-title">\${escapeHtml(selectedChat.title || 'Untitled chat')}</div>
+            \${paneSubtitle}
+          </div>
+          <div class="chat-pane-time">\${escapeHtml(formatTime(selectedChat.updatedAt || selectedChat.createdAt || Date.now()))}</div>
+        </div>
+        \${turnsSection}
+      \`;
+    }
+
+    function render() {
+      renderChatList();
+      renderChatPane();
     }
 
     window.addEventListener('message', (event) => {
@@ -310,23 +584,14 @@ export function getConversationWebviewHtml(
 
       switch (message.command) {
         case 'sync':
-          turns.length = 0;
-          turnIndex.clear();
-          for (const turn of message.turns || []) {
-            upsertTurn(turn);
-          }
-          render();
-          break;
-        case 'updateTurn':
-          if (message.turn) {
-            upsertTurn(message.turn);
-            render();
-          }
+          applySnapshot(message.snapshot);
           break;
         case 'clear':
-          turns.length = 0;
-          turnIndex.clear();
-          render();
+          applySnapshot({
+            ...snapshot,
+            chats: [],
+            selectedChatId: undefined,
+          });
           break;
         case 'setStatus':
           updateStatus(message.status, message.text);
@@ -343,7 +608,7 @@ export function getConversationWebviewHtml(
 function getNonce(): string {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let value = '';
-  for (let i = 0; i < 32; i += 1) {
+  for (let index = 0; index < 32; index += 1) {
     value += alphabet.charAt(Math.floor(Math.random() * alphabet.length));
   }
   return value;

@@ -1,39 +1,78 @@
+import { execFile } from 'child_process';
+import type { Dirent, Stats } from 'fs';
 import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { promisify } from 'util';
 import * as vscode from 'vscode';
-import { ConversationTurn } from './types';
+import {
+  BlockType,
+  ConversationChat,
+  ConversationCollection,
+  ConversationSegment,
+  ConversationTurn,
+  HostApp,
+} from './types';
+
+const execFileAsync = promisify(execFile);
 
 const POLL_INTERVAL_MS = 900;
 const STREAMING_GRACE_MS = 2500;
 const RECENT_LOOKBACK_MS = 6 * 60 * 60 * 1000;
-const MAX_CURSOR_TRANSCRIPTS = 12;
-const MAX_ANTIGRAVITY_BRAIN_DIRS = 12;
+const MAX_CURSOR_TRANSCRIPTS = 24;
 
 interface StoreWatcherCallbacks {
-  onTurnCaptured(turn: ConversationTurn): void;
+  onCollectionCaptured(collection: ConversationCollection): void;
 }
 
-interface ParsedTurnState {
-  turn: ConversationTurn;
-  fingerprint: string;
+interface CursorComposerHeader {
+  composerId: string;
+  name?: string;
+  subtitle?: string;
+  createdAt?: number;
+  lastUpdatedAt?: number;
+  conversationCheckpointLastUpdatedAt?: number;
+  isArchived?: boolean;
+  isDraft?: boolean;
+  workspaceIdentifier?: {
+    uri?: {
+      fsPath?: string;
+      path?: string;
+      external?: string;
+    };
+  };
+}
+
+interface CursorComposerState {
+  selectedComposerIds: string[];
+  lastFocusedComposerIds: string[];
+}
+
+interface AntigravitySummaryEntry {
+  id: string;
+  title: string;
+  subtitle?: string;
+  order: number;
 }
 
 export class ConversationStoreWatcher implements vscode.Disposable {
-  private readonly knownFingerprints = new Map<string, string>();
-  private readonly knownRoots = new Set<string>();
   private readonly callbacks: StoreWatcherCallbacks;
   private readonly output: vscode.OutputChannel;
-  private readonly startedAt = Date.now();
+  private readonly hostApp: HostApp;
+  private readonly knownRoots = new Set<string>();
   private timer?: NodeJS.Timeout;
+  private baselineFingerprint = '';
+  private lastFingerprint = '';
   private resettingBaseline = false;
 
   constructor(
     callbacks: StoreWatcherCallbacks,
-    output: vscode.OutputChannel
+    output: vscode.OutputChannel,
+    hostApp: HostApp
   ) {
     this.callbacks = callbacks;
     this.output = output;
+    this.hostApp = hostApp;
   }
 
   start(): void {
@@ -62,11 +101,9 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     this.resettingBaseline = true;
 
     try {
-      const turns = await this.collectParsedTurns();
-      this.knownFingerprints.clear();
-      for (const state of turns) {
-        this.knownFingerprints.set(state.turn.id, state.fingerprint);
-      }
+      const collection = await this.collectCollection();
+      this.baselineFingerprint = fingerprintCollection(collection);
+      this.lastFingerprint = this.baselineFingerprint;
     } catch (error) {
       this.output.appendLine(`[stores] Failed to capture baseline: ${formatError(error)}`);
     } finally {
@@ -80,93 +117,265 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     }
 
     try {
-      const turns = await this.collectParsedTurns();
+      const collection = await this.collectCollection();
+      const fingerprint = fingerprintCollection(collection);
 
-      for (const state of turns) {
-        const previousFingerprint = this.knownFingerprints.get(state.turn.id);
-        if (previousFingerprint === state.fingerprint) {
-          continue;
-        }
-
-        this.knownFingerprints.set(state.turn.id, state.fingerprint);
-        this.callbacks.onTurnCaptured(state.turn);
+      if (fingerprint === this.lastFingerprint || fingerprint === this.baselineFingerprint) {
+        this.lastFingerprint = fingerprint;
+        return;
       }
+
+      this.lastFingerprint = fingerprint;
+      this.callbacks.onCollectionCaptured(collection);
     } catch (error) {
       this.output.appendLine(`[stores] Refresh failed: ${formatError(error)}`);
     }
   }
 
-  private async collectParsedTurns(): Promise<ParsedTurnState[]> {
-    const turns: ParsedTurnState[] = [];
-
-    await this.collectCursorTranscriptTurns(turns, '.cursor', 'Cursor');
-    await this.collectCursorTranscriptTurns(turns, '.antigravity', 'Antigravity');
-    await this.collectAntigravityBrainTurns(turns);
-
-    turns.sort((left, right) => {
-      if (left.turn.createdAt !== right.turn.createdAt) {
-        return left.turn.createdAt - right.turn.createdAt;
-      }
-
-      return left.turn.id.localeCompare(right.turn.id);
-    });
-
-    return turns;
+  private async collectCollection(): Promise<ConversationCollection> {
+    switch (this.hostApp) {
+      case 'cursor':
+        return this.collectCursorCollection();
+      case 'antigravity':
+        return this.collectAntigravityCollection();
+      default:
+        return { chats: [] };
+    }
   }
 
-  private async collectCursorTranscriptTurns(
-    target: ParsedTurnState[],
-    appDir: string,
-    sourceLabel: string
-  ): Promise<void> {
-    for (const transcriptRoot of this.getWorkspaceTranscriptRoots(appDir)) {
+  private async collectCursorCollection(): Promise<ConversationCollection> {
+    const workspacePaths = this.getWorkspacePaths();
+    if (workspacePaths.length === 0) {
+      return { chats: [] };
+    }
+
+    const [headers, composerState] = await Promise.all([
+      this.readCursorComposerHeaders(workspacePaths),
+      this.readCursorComposerState(workspacePaths),
+    ]);
+
+    const chatsById = new Map<string, ConversationChat>();
+
+    for (const transcriptRoot of this.getCursorTranscriptRoots(workspacePaths)) {
       if (!(await pathExists(transcriptRoot))) {
         continue;
       }
 
-      this.logDiscoveredRoot(transcriptRoot, `${sourceLabel} transcripts`);
+      this.logDiscoveredRoot(transcriptRoot, 'Cursor transcripts');
 
       const transcriptFiles = await this.listTranscriptFiles(transcriptRoot);
       for (const transcriptFile of transcriptFiles) {
-        const parsedTurns = await this.parseCursorTranscriptFile(transcriptFile, sourceLabel);
-        target.push(...parsedTurns);
+        const composerId = path.basename(path.dirname(transcriptFile));
+        const chat = await this.parseCursorTranscriptChat(transcriptFile, headers.get(composerId));
+        chatsById.set(chat.id, chat);
       }
     }
-  }
 
-  private async collectAntigravityBrainTurns(target: ParsedTurnState[]): Promise<void> {
-    const root = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
-    if (!(await pathExists(root))) {
-      return;
-    }
-
-    this.logDiscoveredRoot(root, 'Antigravity brain artifacts');
-
-    const dirEntries = await readDirSafe(root);
-    for (const entry of dirEntries) {
-      if (!entry.isDirectory()) {
+    for (const header of headers.values()) {
+      if (header.isArchived || header.isDraft) {
         continue;
       }
 
-      const dirPath = path.join(root, entry.name);
-      const parsedTurn = await this.parseAntigravityBrainDirectory(dirPath);
-      if (parsedTurn) {
-        target.push(parsedTurn);
+      if (!chatsById.has(header.composerId)) {
+        const now = header.lastUpdatedAt ?? header.conversationCheckpointLastUpdatedAt ?? header.createdAt ?? Date.now();
+        chatsById.set(header.composerId, {
+          id: header.composerId,
+          title: normalizeTitle(header.name) || normalizeTitle(header.subtitle) || 'Untitled chat',
+          subtitle: normalizeSubtitle(header.subtitle),
+          createdAt: header.createdAt ?? now,
+          updatedAt: now,
+          turns: [],
+        });
       }
+    }
+
+    const selectedCandidates = [
+      ...composerState.lastFocusedComposerIds,
+      ...composerState.selectedComposerIds,
+    ];
+
+    const selectedChatId = selectedCandidates.find((id) => chatsById.has(id));
+    const orderBySelection = new Map<string, number>();
+    selectedCandidates.forEach((id, index) => {
+      if (!orderBySelection.has(id)) {
+        orderBySelection.set(id, index);
+      }
+    });
+
+    const chats = [...chatsById.values()]
+      .sort((left, right) => {
+        const leftOrder = orderBySelection.get(left.id);
+        const rightOrder = orderBySelection.get(right.id);
+
+        if (leftOrder !== undefined || rightOrder !== undefined) {
+          return (leftOrder ?? Number.MAX_SAFE_INTEGER) - (rightOrder ?? Number.MAX_SAFE_INTEGER);
+        }
+
+        if (left.updatedAt !== right.updatedAt) {
+          return right.updatedAt - left.updatedAt;
+        }
+
+        return left.title.localeCompare(right.title);
+      });
+
+    return {
+      chats,
+      selectedChatId: selectedChatId ?? chats[0]?.id,
+    };
+  }
+
+  private async collectAntigravityCollection(): Promise<ConversationCollection> {
+    const workspacePaths = this.getWorkspacePaths();
+    if (workspacePaths.length === 0) {
+      return { chats: [] };
+    }
+
+    const globalDbPath = path.join(
+      os.homedir(),
+      'Library',
+      'Application Support',
+      'Antigravity',
+      'User',
+      'globalStorage',
+      'state.vscdb'
+    );
+    const workspaceStorageDir = await findWorkspaceStorageDir('Antigravity', workspacePaths);
+    const workspaceDbPath = workspaceStorageDir
+      ? path.join(workspaceStorageDir, 'state.vscdb')
+      : undefined;
+
+    if (workspaceDbPath) {
+      this.logDiscoveredRoot(workspaceDbPath, 'Antigravity workspace state');
+    }
+    this.logDiscoveredRoot(globalDbPath, 'Antigravity global state');
+
+    const globalValuesPromise = readSqliteKeyMap(
+      globalDbPath,
+      ['antigravityUnifiedStateSync.trajectorySummaries']
+    );
+    const workspaceValuesPromise: Promise<Record<string, string>> = workspaceDbPath
+      ? readSqliteKeyMap(workspaceDbPath, ['memento/antigravity.jetskiArtifactsEditor'])
+      : Promise.resolve({});
+
+    const [globalValues, workspaceValues] = await Promise.all([
+      globalValuesPromise,
+      workspaceValuesPromise,
+    ]);
+
+    const summaries = parseAntigravitySummaryEntries(
+      globalValues['antigravityUnifiedStateSync.trajectorySummaries'],
+      workspacePaths
+    );
+
+    const chats = await Promise.all(
+      summaries.map(async (summary, index) => {
+        const chat = await this.parseAntigravitySummaryChat(summary, index);
+        return chat;
+      })
+    );
+
+    const selectedChatId = parseAntigravitySelectedChatId(
+      workspaceValues['memento/antigravity.jetskiArtifactsEditor'],
+      summaries
+    );
+
+    return {
+      chats,
+      selectedChatId: selectedChatId ?? chats[0]?.id,
+    };
+  }
+
+  private async readCursorComposerHeaders(workspacePaths: string[]): Promise<Map<string, CursorComposerHeader>> {
+    const dbPath = path.join(
+      os.homedir(),
+      'Library',
+      'Application Support',
+      'Cursor',
+      'User',
+      'globalStorage',
+      'state.vscdb'
+    );
+
+    this.logDiscoveredRoot(dbPath, 'Cursor global state');
+
+    const values = await readSqliteKeyMap(dbPath, ['composer.composerHeaders']);
+    const raw = values['composer.composerHeaders'];
+    if (!raw) {
+      return new Map();
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as { allComposers?: CursorComposerHeader[] };
+      const map = new Map<string, CursorComposerHeader>();
+
+      for (const header of parsed.allComposers ?? []) {
+        const headerWorkspacePath = normalizeFsPath(
+          header.workspaceIdentifier?.uri?.fsPath ?? header.workspaceIdentifier?.uri?.path
+        );
+
+        if (
+          headerWorkspacePath &&
+          !workspacePaths.some((workspacePath) => pathsEqual(headerWorkspacePath, workspacePath))
+        ) {
+          continue;
+        }
+
+        map.set(header.composerId, header);
+      }
+
+      return map;
+    } catch (error) {
+      this.output.appendLine(`[stores] Failed to parse Cursor composer headers: ${formatError(error)}`);
+      return new Map();
     }
   }
 
-  private getWorkspaceTranscriptRoots(appDir: string): string[] {
-    const roots = new Set<string>();
-    const folders = vscode.workspace.workspaceFolders ?? [];
+  private async readCursorComposerState(workspacePaths: string[]): Promise<CursorComposerState> {
+    const workspaceStorageDir = await findWorkspaceStorageDir('Cursor', workspacePaths);
+    if (!workspaceStorageDir) {
+      return {
+        selectedComposerIds: [],
+        lastFocusedComposerIds: [],
+      };
+    }
 
-    for (const folder of folders) {
-      const slug = workspacePathToSlug(folder.uri.fsPath);
+    const dbPath = path.join(workspaceStorageDir, 'state.vscdb');
+    this.logDiscoveredRoot(dbPath, 'Cursor workspace state');
+
+    const values = await readSqliteKeyMap(dbPath, ['composer.composerData']);
+    const raw = values['composer.composerData'];
+    if (!raw) {
+      return {
+        selectedComposerIds: [],
+        lastFocusedComposerIds: [],
+      };
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as Partial<CursorComposerState>;
+      return {
+        selectedComposerIds: Array.isArray(parsed.selectedComposerIds) ? parsed.selectedComposerIds : [],
+        lastFocusedComposerIds: Array.isArray(parsed.lastFocusedComposerIds) ? parsed.lastFocusedComposerIds : [],
+      };
+    } catch (error) {
+      this.output.appendLine(`[stores] Failed to parse Cursor composer state: ${formatError(error)}`);
+      return {
+        selectedComposerIds: [],
+        lastFocusedComposerIds: [],
+      };
+    }
+  }
+
+  private getCursorTranscriptRoots(workspacePaths: string[]): string[] {
+    const roots = new Set<string>();
+
+    for (const workspacePath of workspacePaths) {
+      const slug = workspacePathToSlug(workspacePath);
       if (!slug) {
         continue;
       }
 
-      roots.add(path.join(os.homedir(), appDir, 'projects', slug, 'agent-transcripts'));
+      roots.add(path.join(os.homedir(), '.cursor', 'projects', slug, 'agent-transcripts'));
     }
 
     return [...roots];
@@ -194,7 +403,7 @@ export class ConversationStoreWatcher implements vscode.Disposable {
           continue;
         }
 
-        if (stats.mtimeMs < this.startedAt - RECENT_LOOKBACK_MS) {
+        if (stats.mtimeMs < Date.now() - RECENT_LOOKBACK_MS) {
           continue;
         }
 
@@ -209,18 +418,24 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     return transcriptFiles.slice(0, MAX_CURSOR_TRANSCRIPTS).map((item) => item.filePath);
   }
 
-  private async parseCursorTranscriptFile(
+  private async parseCursorTranscriptChat(
     filePath: string,
-    sourceLabel: string
-  ): Promise<ParsedTurnState[]> {
+    header?: CursorComposerHeader
+  ): Promise<ConversationChat> {
     const stats = await safeStat(filePath);
     const raw = await safeReadFile(filePath);
-    if (!stats || raw === undefined) {
-      return [];
-    }
+    const composerId = path.basename(path.dirname(filePath));
+    const fallbackTimestamp = Date.now();
+    const createdAt = header?.createdAt ?? stats?.birthtimeMs ?? stats?.mtimeMs ?? fallbackTimestamp;
+    const updatedAt = Math.max(
+      header?.lastUpdatedAt ?? 0,
+      header?.conversationCheckpointLastUpdatedAt ?? 0,
+      stats?.mtimeMs ?? 0,
+      createdAt
+    );
 
     const entries: Array<{ role: string; text: string }> = [];
-    for (const line of raw.split(/\r?\n/)) {
+    for (const line of (raw ?? '').split(/\r?\n/)) {
       const trimmed = line.trim();
       if (!trimmed) {
         continue;
@@ -238,7 +453,7 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       }
     }
 
-    const turns: Array<{ userInput: string; assistantMessages: string[] }> = [];
+    const turns: ConversationTurn[] = [];
     let currentTurn: { userInput: string; assistantMessages: string[] } | undefined;
 
     for (const entry of entries) {
@@ -247,67 +462,92 @@ export class ConversationStoreWatcher implements vscode.Disposable {
           userInput: normalizeUserMessage(entry.text),
           assistantMessages: [],
         };
-        turns.push(currentTurn);
+        turns.push(
+          this.createTurnFromMessages(
+            `${composerId}:turn:${turns.length + 1}`,
+            currentTurn.userInput,
+            [],
+            createdAt + turns.length,
+            updatedAt + turns.length,
+            false
+          )
+        );
         continue;
       }
 
-      if (entry.role !== 'assistant' || !currentTurn) {
+      if (entry.role !== 'assistant' || !currentTurn || turns.length === 0) {
         continue;
       }
 
       const assistantText = normalizeAssistantMessage(entry.text);
-      if (assistantText) {
-        currentTurn.assistantMessages.push(assistantText);
+      if (!assistantText) {
+        continue;
+      }
+
+      currentTurn.assistantMessages.push(assistantText);
+      const latestTurn = turns[turns.length - 1];
+      const reconstructed = this.createTurnFromMessages(
+        latestTurn.id,
+        currentTurn.userInput,
+        currentTurn.assistantMessages,
+        latestTurn.createdAt,
+        updatedAt + turns.length,
+        Date.now() - updatedAt < STREAMING_GRACE_MS
+      );
+      turns[turns.length - 1] = reconstructed;
+    }
+
+    const latestTurn = turns[turns.length - 1];
+    const title = normalizeTitle(header?.name)
+      || normalizeTitle(header?.subtitle)
+      || snippetForTitle(latestTurn?.blocks['user-input'].content)
+      || 'Untitled chat';
+
+    const subtitle = normalizeSubtitle(header?.subtitle)
+      || snippetForSubtitle(latestTurn?.blocks['agent-output'].content)
+      || snippetForSubtitle(latestTurn?.blocks['user-input'].content);
+
+    return {
+      id: composerId,
+      title,
+      subtitle,
+      createdAt,
+      updatedAt,
+      turns,
+    };
+  }
+
+  private async parseAntigravitySummaryChat(
+    summary: AntigravitySummaryEntry,
+    index: number
+  ): Promise<ConversationChat> {
+    const brainRoot = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
+    const brainDir = path.join(brainRoot, summary.id);
+
+    if (await pathExists(brainDir)) {
+      this.logDiscoveredRoot(brainRoot, 'Antigravity brain artifacts');
+      const populated = await this.parseAntigravityBrainChat(summary, brainDir, index);
+      if (populated) {
+        return populated;
       }
     }
 
-    const conversationId = path.basename(path.dirname(filePath));
-    const recentlyUpdated = Date.now() - stats.mtimeMs < STREAMING_GRACE_MS;
-
-    return turns
-      .filter((turn) => turn.userInput || turn.assistantMessages.length > 0)
-      .map((turn, index, allTurns) => {
-        const thinkingMessages = turn.assistantMessages.length > 1
-          ? turn.assistantMessages.slice(0, -1)
-          : [];
-        const output = turn.assistantMessages.length > 0
-          ? turn.assistantMessages[turn.assistantMessages.length - 1]
-          : '';
-        const thinking = thinkingMessages.join('\n\n');
-        const isLatestTurn = index === allTurns.length - 1;
-        const outputStreaming = isLatestTurn && recentlyUpdated && Boolean(output);
-        const thinkingStreaming = isLatestTurn && recentlyUpdated && !output && Boolean(thinking);
-
-        const parsedTurn: ConversationTurn = {
-          id: `store:${sourceLabel.toLowerCase()}:transcript:${conversationId}:${index + 1}`,
-          source: sourceLabel,
-          createdAt: Math.floor((stats.birthtimeMs || stats.mtimeMs) + index),
-          updatedAt: Math.floor(stats.mtimeMs + index),
-          isComplete: Boolean(output),
-          blocks: {
-            'user-input': {
-              content: turn.userInput,
-              isStreaming: false,
-            },
-            'agent-thinking': {
-              content: thinking,
-              isStreaming: thinkingStreaming,
-            },
-            'agent-output': {
-              content: output,
-              isStreaming: outputStreaming,
-            },
-          },
-        };
-
-        return {
-          turn: parsedTurn,
-          fingerprint: fingerprintTurn(parsedTurn),
-        };
-      });
+    const now = Date.now();
+    return {
+      id: summary.id,
+      title: summary.title,
+      subtitle: summary.subtitle,
+      createdAt: now - index,
+      updatedAt: now - index,
+      turns: [],
+    };
   }
 
-  private async parseAntigravityBrainDirectory(dirPath: string): Promise<ParsedTurnState | undefined> {
+  private async parseAntigravityBrainChat(
+    summary: AntigravitySummaryEntry,
+    dirPath: string,
+    index: number
+  ): Promise<ConversationChat | undefined> {
     const taskFile = await pickArtifactFile(dirPath, ['task.md']);
     const thinkingFile = await pickArtifactFile(dirPath, ['implementation_plan_retry.md', 'implementation_plan.md']);
     const outputFile = await pickArtifactFile(dirPath, [
@@ -342,39 +582,99 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     const timestamps = [taskStats?.mtimeMs, thinkingStats?.mtimeMs, outputStats?.mtimeMs]
       .filter((value): value is number => typeof value === 'number');
     const updatedAt = timestamps.length > 0 ? Math.max(...timestamps) : Date.now();
-    if (updatedAt < this.startedAt - RECENT_LOOKBACK_MS) {
-      return undefined;
-    }
-
     const createdAt = [taskStats?.birthtimeMs, taskStats?.mtimeMs, updatedAt]
       .filter((value): value is number => typeof value === 'number')[0] ?? updatedAt;
-    const recentlyUpdated = Date.now() - updatedAt < STREAMING_GRACE_MS;
-    const turn: ConversationTurn = {
-      id: `store:antigravity:brain:${path.basename(dirPath)}`,
-      source: 'Antigravity',
-      createdAt: Math.floor(createdAt),
-      updatedAt: Math.floor(updatedAt),
-      isComplete: Boolean(output),
-      blocks: {
+
+    const turn = this.createTurn(
+      `${summary.id}:turn:1`,
+      {
         'user-input': {
           content: userInput,
           isStreaming: false,
         },
         'agent-thinking': {
           content: thinking,
-          isStreaming: recentlyUpdated && !output && Boolean(thinking),
+          isStreaming: !output && Date.now() - updatedAt < STREAMING_GRACE_MS && Boolean(thinking),
         },
         'agent-output': {
           content: output,
-          isStreaming: recentlyUpdated && Boolean(output),
+          isStreaming: Date.now() - updatedAt < STREAMING_GRACE_MS && Boolean(output),
         },
       },
-    };
+      createdAt,
+      updatedAt
+    );
 
     return {
-      turn,
-      fingerprint: fingerprintTurn(turn),
+      id: summary.id,
+      title: summary.title,
+      subtitle: summary.subtitle
+        || snippetForSubtitle(output)
+        || snippetForSubtitle(userInput),
+      createdAt: createdAt - index,
+      updatedAt: updatedAt - index,
+      turns: [turn],
     };
+  }
+
+  private createTurnFromMessages(
+    turnId: string,
+    userInput: string,
+    assistantMessages: string[],
+    createdAt: number,
+    updatedAt: number,
+    isRecentWrite: boolean
+  ): ConversationTurn {
+    const thinkingMessages = assistantMessages.length > 1
+      ? assistantMessages.slice(0, -1)
+      : [];
+    const output = assistantMessages.length > 0
+      ? assistantMessages[assistantMessages.length - 1]
+      : '';
+    const thinking = thinkingMessages.join('\n\n');
+
+    return this.createTurn(
+      turnId,
+      {
+        'user-input': {
+          content: userInput,
+          isStreaming: false,
+        },
+        'agent-thinking': {
+          content: thinking,
+          isStreaming: isRecentWrite && !output && Boolean(thinking),
+        },
+        'agent-output': {
+          content: output,
+          isStreaming: isRecentWrite && Boolean(output),
+        },
+      },
+      createdAt,
+      updatedAt
+    );
+  }
+
+  private createTurn(
+    turnId: string,
+    blocks: Record<BlockType, ConversationSegment>,
+    createdAt: number,
+    updatedAt: number
+  ): ConversationTurn {
+    const isComplete = Boolean(blocks['agent-output'].content);
+
+    return {
+      id: turnId,
+      createdAt: Math.floor(createdAt),
+      updatedAt: Math.floor(updatedAt),
+      isComplete,
+      blocks,
+    };
+  }
+
+  private getWorkspacePaths(): string[] {
+    return (vscode.workspace.workspaceFolders ?? [])
+      .map((folder) => normalizeFsPath(folder.uri.fsPath))
+      .filter((value): value is string => Boolean(value));
   }
 
   private logDiscoveredRoot(root: string, label: string): void {
@@ -385,6 +685,152 @@ export class ConversationStoreWatcher implements vscode.Disposable {
 
     this.knownRoots.add(key);
     this.output.appendLine(`[stores] Using ${label}: ${root}`);
+  }
+}
+
+function parseAntigravitySummaryEntries(
+  encodedValue: string | undefined,
+  workspacePaths: string[]
+): AntigravitySummaryEntry[] {
+  if (!encodedValue) {
+    return [];
+  }
+
+  let decoded = '';
+  try {
+    decoded = Buffer.from(encodedValue, 'base64').toString('utf8');
+  } catch {
+    return [];
+  }
+
+  const workspaceNeedles = workspacePaths.flatMap((workspacePath) => [
+    workspacePath,
+    toFileUri(workspacePath),
+  ]);
+  const matches = [...decoded.matchAll(/\$([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi)];
+  const entries: AntigravitySummaryEntry[] = [];
+
+  matches.forEach((match, index) => {
+    const nextMatch = matches[index + 1];
+    const start = match.index ?? 0;
+    const end = nextMatch?.index ?? decoded.length;
+    const chunk = decoded.slice(start, end);
+    const segments = extractReadableSegments(chunk);
+
+    const belongsToWorkspace = segments.some((segment) =>
+      workspaceNeedles.some((needle) => segment.includes(needle))
+    );
+
+    if (!belongsToWorkspace) {
+      return;
+    }
+
+    const title = pickAntigravityTitle(segments) ?? `Chat ${entries.length + 1}`;
+    const subtitle = pickAntigravitySubtitle(segments, title);
+
+    entries.push({
+      id: match[1],
+      title,
+      subtitle,
+      order: entries.length,
+    });
+  });
+
+  return entries;
+}
+
+function pickAntigravityTitle(segments: string[]): string | undefined {
+  const candidates = segments
+    .map((segment) => stripDecoration(segment))
+    .filter((segment) => {
+      return Boolean(segment) &&
+        segment.length <= 160 &&
+        /[A-Za-z]/.test(segment) &&
+        !looksLikeFileUri(segment) &&
+        !looksLikeUuid(segment) &&
+        !looksLikeInternalMarker(segment) &&
+        !looksLikeEncodedBlob(segment);
+    });
+
+  return candidates.find((segment) => segment.length >= 4 || /\s/.test(segment))
+    ?? candidates.find((segment) => segment.length >= 2);
+}
+
+function pickAntigravitySubtitle(
+  segments: string[],
+  title: string
+): string | undefined {
+  const candidates = segments
+    .map((segment) => stripDecoration(segment))
+    .filter((segment) => {
+      return Boolean(segment) &&
+        segment !== title &&
+        segment.length <= 180 &&
+        /[A-Za-z]/.test(segment) &&
+        !looksLikeFileUri(segment) &&
+        !looksLikeUuid(segment) &&
+        !looksLikeInternalMarker(segment) &&
+        !looksLikeEncodedBlob(segment);
+    });
+
+  return candidates.find((segment) => segment.length >= 10 || /\s/.test(segment))
+    ?? candidates.find((segment) => segment.length >= 4);
+}
+
+function extractReadableSegments(chunk: string): string[] {
+  const collected = new Set<string>();
+
+  for (const printable of extractPrintableRuns(chunk)) {
+    collected.add(printable);
+  }
+
+  const candidates = chunk.match(/[A-Za-z0-9+/=]{8,}/g) ?? [];
+  for (const candidate of candidates) {
+    try {
+      const decoded = Buffer.from(candidate, 'base64').toString('utf8');
+      for (const printable of extractPrintableRuns(decoded)) {
+        collected.add(printable);
+      }
+    } catch {
+      // Ignore malformed base64 fragments.
+    }
+  }
+
+  return [...collected];
+}
+
+function extractPrintableRuns(value: string): string[] {
+  const matches = value.match(/[ -~]{3,}/g) ?? [];
+  return matches
+    .map((match) => normalizeWhitespace(match))
+    .filter(Boolean);
+}
+
+function parseAntigravitySelectedChatId(
+  rawValue: string | undefined,
+  summaries: AntigravitySummaryEntry[]
+): string | undefined {
+  if (!rawValue) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(rawValue) as {
+      'jetskiArtifactsEditor.viewState'?: Array<[string, unknown]>;
+    };
+
+    const selected = parsed['jetskiArtifactsEditor.viewState']?.[0]?.[0];
+    const match = typeof selected === 'string'
+      ? selected.match(/\/brain\/([0-9a-f-]{36})\//i)
+      : undefined;
+
+    if (!match) {
+      return undefined;
+    }
+
+    return summaries.some((summary) => summary.id === match[1]) ? match[1] : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -437,18 +883,175 @@ function normalizeBrainContent(value?: string): string {
   return (value ?? '').trim();
 }
 
+function normalizeTitle(value?: string): string | undefined {
+  const normalized = normalizeWhitespace(value ?? '');
+  return normalized || undefined;
+}
+
+function normalizeSubtitle(value?: string): string | undefined {
+  const normalized = normalizeWhitespace(value ?? '');
+  return normalized || undefined;
+}
+
+function normalizeWhitespace(value: string): string {
+  return value.replace(/[\u0000-\u001F]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function stripDecoration(value: string): string {
+  return normalizeWhitespace(value)
+    .replace(/^[^A-Za-z0-9]+/, '')
+    .replace(/[^A-Za-z0-9)\]]+$/, '')
+    .trim();
+}
+
+function snippetForTitle(value?: string): string | undefined {
+  const normalized = normalizeWhitespace((value ?? '').split('\n')[0] ?? '');
+  if (!normalized) {
+    return undefined;
+  }
+
+  return normalized.length <= 80
+    ? normalized
+    : `${normalized.slice(0, 77).trimEnd()}...`;
+}
+
+function snippetForSubtitle(value?: string): string | undefined {
+  const normalized = normalizeWhitespace((value ?? '').split('\n')[0] ?? '');
+  if (!normalized) {
+    return undefined;
+  }
+
+  return normalized.length <= 110
+    ? normalized
+    : `${normalized.slice(0, 107).trimEnd()}...`;
+}
+
 function workspacePathToSlug(fsPath: string): string {
   return fsPath.replace(/^\/+/, '').replace(/[\\/]+/g, '-');
 }
 
-function fingerprintTurn(turn: ConversationTurn): string {
-  return JSON.stringify({
-    updatedAt: turn.updatedAt,
-    isComplete: turn.isComplete,
-    source: turn.source,
-    userInput: turn.blocks['user-input'],
-    thinking: turn.blocks['agent-thinking'],
-    output: turn.blocks['agent-output'],
+async function findWorkspaceStorageDir(
+  appName: 'Cursor' | 'Antigravity',
+  workspacePaths: string[]
+): Promise<string | undefined> {
+  const root = path.join(
+    os.homedir(),
+    'Library',
+    'Application Support',
+    appName,
+    'User',
+    'workspaceStorage'
+  );
+
+  const entries = await readDirSafe(root);
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+
+    const workspaceJsonPath = path.join(root, entry.name, 'workspace.json');
+    const raw = await safeReadFile(workspaceJsonPath);
+    if (!raw) {
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as { folder?: string };
+      const workspacePath = normalizeFsPath(fileUriToFsPath(parsed.folder ?? ''));
+      if (!workspacePath) {
+        continue;
+      }
+
+      if (workspacePaths.some((candidate) => pathsEqual(candidate, workspacePath))) {
+        return path.join(root, entry.name);
+      }
+    } catch {
+      // Ignore malformed workspace storage descriptors.
+    }
+  }
+
+  return undefined;
+}
+
+async function readSqliteKeyMap(
+  dbPath: string,
+  keys: string[]
+): Promise<Record<string, string>> {
+  if (keys.length === 0) {
+    return {};
+  }
+
+  for (const candidatePath of [dbPath, `${dbPath}.backup`]) {
+    if (!(await pathExists(candidatePath))) {
+      continue;
+    }
+
+    const result = await querySqliteKeyMap(candidatePath, keys);
+    if (Object.keys(result).length > 0) {
+      return result;
+    }
+  }
+
+  return {};
+}
+
+async function querySqliteKeyMap(
+  sourceDbPath: string,
+  keys: string[]
+): Promise<Record<string, string>> {
+  const tempDbPath = path.join(
+    os.tmpdir(),
+    `ai-agent-monitor-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.sqlite`
+  );
+
+  try {
+    await fs.copyFile(sourceDbPath, tempDbPath);
+    const sql = `SELECT key, value FROM ItemTable WHERE key IN (${keys.map(quoteSqliteString).join(', ')})`;
+    const { stdout } = await execFileAsync('sqlite3', ['-json', tempDbPath, sql], {
+      maxBuffer: 8 * 1024 * 1024,
+    });
+
+    const rows = JSON.parse(stdout || '[]') as Array<{ key: string; value: string }>;
+    const map: Record<string, string> = {};
+    for (const row of rows) {
+      map[row.key] = row.value;
+    }
+
+    return map;
+  } catch {
+    return {};
+  } finally {
+    await fs.rm(tempDbPath, { force: true }).catch(() => undefined);
+  }
+}
+
+function quoteSqliteString(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function quoteJson(value: unknown): string {
+  return JSON.stringify(value);
+}
+
+function fingerprintCollection(collection: ConversationCollection): string {
+  return quoteJson({
+    selectedChatId: collection.selectedChatId,
+    chats: collection.chats.map((chat) => ({
+      id: chat.id,
+      title: chat.title,
+      subtitle: chat.subtitle,
+      createdAt: chat.createdAt,
+      updatedAt: chat.updatedAt,
+      turns: chat.turns.map((turn) => ({
+        id: turn.id,
+        createdAt: turn.createdAt,
+        updatedAt: turn.updatedAt,
+        isComplete: turn.isComplete,
+        userInput: turn.blocks['user-input'],
+        thinking: turn.blocks['agent-thinking'],
+        output: turn.blocks['agent-output'],
+      })),
+    })),
   });
 }
 
@@ -490,6 +1093,54 @@ async function pickArtifactFile(dirPath: string, preferredBaseNames: string[]): 
   return undefined;
 }
 
+function toFileUri(fsPath: string): string {
+  const uri = vscode.Uri.file(fsPath);
+  return uri.toString();
+}
+
+function fileUriToFsPath(value: string): string {
+  if (!value.startsWith('file://')) {
+    return value;
+  }
+
+  try {
+    return vscode.Uri.parse(value).fsPath;
+  } catch {
+    return value;
+  }
+}
+
+function normalizeFsPath(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  return path.normalize(value);
+}
+
+function pathsEqual(left: string, right: string): boolean {
+  return normalizeFsPath(left) === normalizeFsPath(right);
+}
+
+function looksLikeFileUri(value: string): boolean {
+  return /^file:\/\//i.test(value) || value.includes('/Users/');
+}
+
+function looksLikeUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+function looksLikeInternalMarker(value: string): boolean {
+  return value.startsWith('ARTIFACT_TYPE_')
+    || value.startsWith('MESSAGE_PRIORITY_')
+    || value.includes('.metadata.json')
+    || value.includes('.resolved');
+}
+
+function looksLikeEncodedBlob(value: string): boolean {
+  return /^[A-Za-z0-9+/=]+$/.test(value) && !value.includes(' ') && value.length > 12;
+}
+
 async function pathExists(targetPath: string): Promise<boolean> {
   try {
     await fs.access(targetPath);
@@ -507,7 +1158,7 @@ async function safeReadFile(filePath: string): Promise<string | undefined> {
   }
 }
 
-async function readDirSafe(dirPath: string): Promise<import('fs').Dirent[]> {
+async function readDirSafe(dirPath: string): Promise<Dirent[]> {
   try {
     return await fs.readdir(dirPath, { withFileTypes: true });
   } catch {
@@ -515,7 +1166,7 @@ async function readDirSafe(dirPath: string): Promise<import('fs').Dirent[]> {
   }
 }
 
-async function safeStat(targetPath: string): Promise<import('fs').Stats | undefined> {
+async function safeStat(targetPath: string): Promise<Stats | undefined> {
   try {
     return await fs.stat(targetPath);
   } catch {
@@ -524,9 +1175,5 @@ async function safeStat(targetPath: string): Promise<import('fs').Stats | undefi
 }
 
 function formatError(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-
-  return String(error);
+  return error instanceof Error ? error.message : String(error);
 }
