@@ -1,10 +1,14 @@
+import { execFile } from 'child_process';
+import { promises as fs } from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { promisify } from 'util';
 import * as vscode from 'vscode';
 import { ConversationStoreWatcher } from './ConversationStoreWatcher';
-import { NetworkInterceptor } from './NetworkInterceptor';
+import { buildDashboardSnapshot, createDefaultBudgets } from './dashboard';
 import {
   BLOCK_TYPES,
   BlockType,
-  cloneChat,
   cloneCollection,
   cloneSnapshot,
   cloneTurn,
@@ -13,10 +17,26 @@ import {
   ConversationSegment,
   ConversationTurn,
   HostApp,
+  ModelConfidence,
   MonitorMessage,
   MonitorSnapshot,
   MonitorStatus,
+  SavedPrompt,
+  SourceSnapshot,
+  WebviewIncoming,
 } from './types';
+
+const execFileAsync = promisify(execFile);
+
+const PROMPT_LIBRARY_KEY = 'aiAgentMonitor.promptLibrary';
+const BUDGET_SETTINGS_KEY = 'aiAgentMonitor.budgetSettings';
+const CURSOR_APP_STATE_KEY = 'src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser';
+
+const SOURCE_LABELS: Record<'cursor' | 'antigravity' | 'manual', string> = {
+  cursor: 'Cursor',
+  antigravity: 'Antigravity',
+  manual: 'Manual API',
+};
 
 function createEmptySegment(): ConversationSegment {
   return {
@@ -33,24 +53,54 @@ function createEmptyBlocks(): Record<BlockType, ConversationSegment> {
   };
 }
 
+interface CursorModelState {
+  model?: string;
+  confidence: ModelConfidence;
+}
+
+interface SourceAttentionState {
+  requestSeq: number;
+  selectedChatKey?: string;
+  selectedChatUpdatedAt: number;
+  promptCount: number;
+  latestUserTurnSignature?: string;
+  lastEngagedAt: number;
+}
+
+interface CollectionAttention {
+  chat: ConversationChat;
+  key: string;
+  promptCount: number;
+  latestUserTurnSignature?: string;
+}
+
 export class AgentMonitor implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly output: vscode.OutputChannel;
-  private readonly storeWatcher: ConversationStoreWatcher;
+  private readonly sourceWatchers = new Map<'cursor' | 'antigravity', ConversationStoreWatcher>();
+  private readonly extensionContext: vscode.ExtensionContext;
   private readonly hostApp: HostApp;
   private readonly appLabel: string;
-  private readonly runtimeChats = new Map<string, ConversationChat>();
-  private readonly networkInterceptor?: NetworkInterceptor;
 
-  private storeCollection: ConversationCollection = { chats: [] };
+  private readonly runtimeChats = new Map<string, ConversationChat>();
+  private readonly sourceCollections = new Map<'cursor' | 'antigravity', ConversationCollection>();
+  private readonly sourceAttention = new Map<'cursor' | 'antigravity', SourceAttentionState>();
+
   private status: MonitorStatus = {
     status: 'monitoring',
-    text: 'Listening for AI conversations...',
+    text: 'Building the AI analytics dashboard...',
   };
+
+  private promptLibrary: SavedPrompt[];
+  private budgets = createDefaultBudgets();
   private chatCounter = 0;
   private turnCounter = 0;
   private activeRuntimeChatId?: string;
   private activeRuntimeTurnId?: string;
+  private activeChatKey?: string;
+  private activeChatEngagedAt = 0;
+  private lastAlertIds = new Set<string>();
+  private cursorModelCache?: { state: CursorModelState; readAt: number };
 
   private readonly _onSnapshotChanged = new vscode.EventEmitter<MonitorSnapshot>();
   readonly onSnapshotChanged = this._onSnapshotChanged.event;
@@ -58,41 +108,30 @@ export class AgentMonitor implements vscode.Disposable {
   private readonly _onStatusChanged = new vscode.EventEmitter<MonitorStatus>();
   readonly onStatusChanged = this._onStatusChanged.event;
 
-  constructor() {
-    this.output = vscode.window.createOutputChannel('AI Agent Monitor');
-    this.output.appendLine('AI Agent Monitor activated.');
+  constructor(context: vscode.ExtensionContext) {
+    this.extensionContext = context;
+    this.output = vscode.window.createOutputChannel('AI Token Analytics');
+    this.output.appendLine('AI Token Analytics dashboard activated.');
 
     const host = detectHostApp();
     this.hostApp = host.app;
     this.appLabel = host.label;
     this.output.appendLine(`[host] Running inside ${this.appLabel}.`);
 
-    this.storeWatcher = new ConversationStoreWatcher({
-      onCollectionCaptured: (collection) => {
-        this.storeCollection = cloneCollection(collection);
-        this.emitSnapshot();
-      },
-    }, this.output, this.hostApp);
-    this.disposables.push(this.storeWatcher);
-    this.storeWatcher.start();
+    this.promptLibrary = loadPromptLibrary(context.globalState.get<unknown>(PROMPT_LIBRARY_KEY));
+    this.budgets = sanitizeBudgetSettings(context.globalState.get<unknown>(BUDGET_SETTINGS_KEY));
 
-    if (this.hostApp === 'antigravity') {
-      this.networkInterceptor = new NetworkInterceptor();
-      this.disposables.push(this.networkInterceptor);
-      this.setupAntigravityNetworkFallback(this.networkInterceptor);
-      this.networkInterceptor.start();
-      this.setStatus('monitoring', 'Antigravity chat capture enabled.');
-    } else if (this.hostApp === 'cursor') {
-      this.setStatus('monitoring', 'Cursor chat capture enabled.');
-    } else {
-      this.setStatus('monitoring', 'Chat capture enabled.');
-    }
+    this.startWatcher('cursor');
+    this.startWatcher('antigravity');
+
+    this.setStatus('monitoring', 'Tracking live AI usage across Cursor and Antigravity...');
   }
 
   pushMessage(message: MonitorMessage): ConversationTurn {
-    const chat = this.ensureRuntimeChat(this.getPreferredChatId() ?? this.createEphemeralChatId(), {
-      title: 'Manual Capture',
-      isEphemeral: true,
+    const chat = this.ensureRuntimeChat(this.activeRuntimeChatId ?? this.createRuntimeChatId(), {
+      title: message.sourceLabel ? `${message.sourceLabel} session` : 'Manual capture',
+      sourceLabel: message.sourceLabel ?? SOURCE_LABELS.manual,
+      model: message.model,
     });
 
     const turn = message.type === 'user-input'
@@ -100,23 +139,48 @@ export class AgentMonitor implements vscode.Disposable {
       : this.getLastOpenRuntimeTurn(chat) ?? this.createRuntimeTurn(chat);
 
     this.setBlockContent(chat, turn.id, message.type, message.content);
+    if (message.model) {
+      chat.model = message.model;
+      chat.modelConfidence = 'exact';
+    }
 
     if (message.type === 'agent-output') {
       this.finalizeTurn(chat, turn.id);
     }
 
+    this.activeRuntimeChatId = chat.id;
+    this.activeRuntimeTurnId = turn.id;
+    this.activeChatKey = `manual:${chat.id}`;
+    this.activeChatEngagedAt = Date.now();
     this.emitSnapshot();
     return cloneTurn(this.mustGetTurn(chat, turn.id));
   }
 
   clearBlocks(): void {
     this.runtimeChats.clear();
-    this.activeRuntimeChatId = undefined;
-    this.activeRuntimeTurnId = undefined;
+    this.sourceCollections.clear();
     this.chatCounter = 0;
     this.turnCounter = 0;
-    this.storeCollection = { chats: [] };
-    this.storeWatcher.resetBaseline();
+    this.activeRuntimeChatId = undefined;
+    this.activeRuntimeTurnId = undefined;
+    this.activeChatKey = undefined;
+    this.activeChatEngagedAt = 0;
+    this.cursorModelCache = undefined;
+
+    for (const sourceId of ['cursor', 'antigravity'] as const) {
+      const previous = this.sourceAttention.get(sourceId);
+      this.sourceAttention.set(sourceId, {
+        requestSeq: previous?.requestSeq ?? 0,
+        selectedChatUpdatedAt: 0,
+        promptCount: 0,
+        lastEngagedAt: 0,
+      });
+    }
+
+    for (const watcher of this.sourceWatchers.values()) {
+      watcher.resetBaseline();
+    }
+
     this.emitSnapshot();
   }
 
@@ -126,6 +190,28 @@ export class AgentMonitor implements vscode.Disposable {
 
   getStatus(): MonitorStatus {
     return { ...this.status };
+  }
+
+  handleWebviewMessage(message: WebviewIncoming): void {
+    switch (message.command) {
+      case 'ready':
+        return;
+      case 'savePrompt':
+        this.savePromptFromTurn(message);
+        return;
+      case 'copyPrompt':
+        void this.copyPrompt(message.promptId);
+        return;
+      case 'deletePrompt':
+        this.deletePrompt(message.promptId);
+        return;
+      case 'markPromptUsed':
+        this.markPromptUsed(message.promptId);
+        return;
+      case 'updateBudgets':
+        this.updateBudgets(message.budgets);
+        return;
+    }
   }
 
   dispose(): void {
@@ -138,219 +224,312 @@ export class AgentMonitor implements vscode.Disposable {
     this.output.dispose();
   }
 
-  private setupAntigravityNetworkFallback(interceptor: NetworkInterceptor): void {
-    this.disposables.push(
-      interceptor.onUserMessage(({ content }) => {
-        this.finishActiveRuntimeTurn();
+  private startWatcher(sourceId: 'cursor' | 'antigravity'): void {
+    const existing = this.sourceAttention.get(sourceId);
+    this.sourceAttention.set(sourceId, {
+      requestSeq: existing?.requestSeq ?? 0,
+      selectedChatUpdatedAt: existing?.selectedChatUpdatedAt ?? 0,
+      promptCount: existing?.promptCount ?? 0,
+      lastEngagedAt: existing?.lastEngagedAt ?? 0,
+      selectedChatKey: existing?.selectedChatKey,
+      latestUserTurnSignature: existing?.latestUserTurnSignature,
+    });
 
-        const chatId = this.resolveRuntimeChatIdForPrompt(content);
-        const chat = this.ensureRuntimeChat(chatId, {
-          title: snippetForTitle(content) ?? 'New chat',
-          subtitle: snippetForSubtitle(content),
-          isEphemeral: chatId.startsWith('live:'),
-        });
+    const watcher = new ConversationStoreWatcher({
+      onCollectionCaptured: (collection) => {
+        void this.handleSourceCollection(sourceId, collection);
+      },
+    }, this.output, sourceId);
 
-        const turn = this.createRuntimeTurn(chat);
-        this.activeRuntimeChatId = chat.id;
-        this.activeRuntimeTurnId = turn.id;
-        this.setBlockContent(chat, turn.id, 'user-input', content);
-        this.setStatus('connected', 'Capturing Antigravity conversation...');
-        this.emitSnapshot();
-      })
-    );
+    this.sourceWatchers.set(sourceId, watcher);
+    this.disposables.push(watcher);
+    watcher.start();
+  }
 
-    this.disposables.push(
-      interceptor.onAiResponseStart(() => {
-        const turn = this.getOrCreateActiveRuntimeTurn();
-        const chat = this.mustGetRuntimeChat(turn.chatId);
-        this.startBlock(chat, turn.turnId, 'agent-output');
-        this.setStatus('connected', 'Streaming Antigravity response...');
-        this.emitSnapshot();
-      })
-    );
+  private async handleSourceCollection(
+    sourceId: 'cursor' | 'antigravity',
+    collection: ConversationCollection
+  ): Promise<void> {
+    const nextRequestSeq = (this.sourceAttention.get(sourceId)?.requestSeq ?? 0) + 1;
+    this.sourceAttention.set(sourceId, {
+      ...(this.sourceAttention.get(sourceId) ?? {
+        selectedChatUpdatedAt: 0,
+        promptCount: 0,
+        lastEngagedAt: 0,
+      }),
+      requestSeq: nextRequestSeq,
+    });
 
-    this.disposables.push(
-      interceptor.onAiResponseChunk(({ content }) => {
-        if (!content) {
-          return;
-        }
+    const decorated = await this.decorateCollection(sourceId, collection);
+    const latestState = this.sourceAttention.get(sourceId);
+    if (!latestState || latestState.requestSeq !== nextRequestSeq) {
+      return;
+    }
 
-        const turn = this.getOrCreateActiveRuntimeTurn();
-        const chat = this.mustGetRuntimeChat(turn.chatId);
-        this.appendToBlock(chat, turn.turnId, 'agent-output', content);
-        this.emitSnapshot();
-      })
-    );
+    this.sourceCollections.set(sourceId, cloneCollection(decorated));
+    this.updateActiveChatLock(sourceId, decorated);
+    this.emitSnapshot();
+  }
 
-    this.disposables.push(
-      interceptor.onAiResponseEnd(() => {
-        this.finishActiveRuntimeTurn();
-        this.setStatus('monitoring', 'Waiting for the next Antigravity conversation...');
-        this.emitSnapshot();
-      })
-    );
+  private async decorateCollection(
+    sourceId: 'cursor' | 'antigravity',
+    collection: ConversationCollection
+  ): Promise<ConversationCollection> {
+    const next = cloneCollection(collection);
+    const cursorModelState = sourceId === 'cursor'
+      ? await this.readCursorModelState()
+      : undefined;
+
+    next.chats = next.chats.map((chat) => {
+      const model = sourceId === 'cursor'
+        ? cursorModelState?.model
+        : chat.model;
+
+      return {
+        ...chat,
+        sourceId,
+        sourceLabel: SOURCE_LABELS[sourceId],
+        model: model ?? chat.model,
+        modelConfidence: sourceId === 'cursor'
+          ? cursorModelState?.confidence ?? chat.modelConfidence ?? 'unknown'
+          : chat.modelConfidence ?? (chat.model ? 'inferred' : 'unknown'),
+      };
+    });
+
+    return next;
   }
 
   private buildSnapshot(): MonitorSnapshot {
-    const storeChats = this.storeCollection.chats.map((chat) => cloneChat(chat));
-    const mergedById = new Map<string, ConversationChat>();
-
-    for (const chat of storeChats) {
-      mergedById.set(chat.id, chat);
-    }
-
-    for (const runtimeChat of this.runtimeChats.values()) {
-      const existing = mergedById.get(runtimeChat.id);
-      if (!existing) {
-        mergedById.set(runtimeChat.id, cloneChat(runtimeChat));
-        continue;
-      }
-
-      mergedById.set(runtimeChat.id, this.mergeChat(existing, runtimeChat));
-    }
-
-    const storeOrder = new Map<string, number>();
-    storeChats.forEach((chat, index) => {
-      storeOrder.set(chat.id, index);
-    });
-
-    const runtimeOnlyChats = [...this.runtimeChats.values()]
-      .filter((chat) => !storeOrder.has(chat.id))
-      .map((chat) => mergedById.get(chat.id)!)
-      .sort((left, right) => right.updatedAt - left.updatedAt);
-
-    const mergedChats = [
-      ...runtimeOnlyChats,
-      ...storeChats.map((chat) => mergedById.get(chat.id) ?? chat),
-    ];
-
-    return {
+    return buildDashboardSnapshot({
       app: this.hostApp,
       appLabel: this.appLabel,
-      chats: mergedChats,
-      selectedChatId: this.resolveSelectedChatId(mergedChats),
-    };
+      sources: this.buildSourceSnapshots(),
+      activeChatKey: this.activeChatKey,
+      promptLibrary: this.promptLibrary,
+      budgets: this.budgets,
+    });
   }
 
-  private mergeChat(storeChat: ConversationChat, runtimeChat: ConversationChat): ConversationChat {
-    const mergedTurns = storeChat.turns.map((turn) => cloneTurn(turn));
+  private buildSourceSnapshots(): SourceSnapshot[] {
+    const sources: SourceSnapshot[] = [];
 
-    for (const runtimeTurn of runtimeChat.turns) {
-      const duplicateIndex = mergedTurns.findIndex((storeTurn) => turnsLikelyMatch(storeTurn, runtimeTurn));
-      if (duplicateIndex === -1) {
-        mergedTurns.push(cloneTurn(runtimeTurn));
+    for (const sourceId of ['cursor', 'antigravity'] as const) {
+      const collection = this.sourceCollections.get(sourceId);
+      if (!collection) {
         continue;
       }
 
-      mergedTurns[duplicateIndex] = mergeTurns(mergedTurns[duplicateIndex], runtimeTurn);
+      sources.push({
+        id: sourceId,
+        label: SOURCE_LABELS[sourceId],
+        chats: collection.chats.map((chat) => ({ ...chat })),
+        selectedChatId: collection.selectedChatId,
+      });
     }
 
-    mergedTurns.sort((left, right) => {
-      if (left.createdAt !== right.createdAt) {
-        return left.createdAt - right.createdAt;
+    if (this.runtimeChats.size > 0) {
+      const chats = [...this.runtimeChats.values()]
+        .map((chat) => ({ ...chat }))
+        .sort((left, right) => right.updatedAt - left.updatedAt);
+      sources.push({
+        id: 'manual',
+        label: SOURCE_LABELS.manual,
+        chats,
+        selectedChatId: chats[0]?.id,
+      });
+    }
+
+    return sources;
+  }
+
+  private async readCursorModelState(): Promise<CursorModelState> {
+    if (this.cursorModelCache && Date.now() - this.cursorModelCache.readAt < 2000) {
+      return this.cursorModelCache.state;
+    }
+
+    const dbPath = path.join(
+      os.homedir(),
+      'Library',
+      'Application Support',
+      'Cursor',
+      'User',
+      'globalStorage',
+      'state.vscdb'
+    );
+    const values = await readSqliteKeyMap(dbPath, [CURSOR_APP_STATE_KEY]);
+    const raw = values[CURSOR_APP_STATE_KEY];
+
+    let state: CursorModelState = {
+      model: 'Auto',
+      confidence: 'inferred',
+    };
+
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) as any;
+        const configuredModel = parsed?.aiSettings?.modelConfig?.composer?.modelName
+          ?? parsed?.aiSettings?.composerModel;
+        if (typeof configuredModel === 'string' && configuredModel.trim()) {
+          state = {
+            model: configuredModel === 'default' ? 'Auto' : configuredModel,
+            confidence: configuredModel === 'default' ? 'inferred' : 'exact',
+          };
+        }
+      } catch (error) {
+        this.output.appendLine(`[cursor] Failed to parse model state: ${formatError(error)}`);
+      }
+    }
+
+    this.cursorModelCache = {
+      state,
+      readAt: Date.now(),
+    };
+    return state;
+  }
+
+  private savePromptFromTurn(message: WebviewIncoming): void {
+    if (!message.sourceId || !message.chatId || !message.turnId) {
+      return;
+    }
+
+    const turnContext = this.findTurn(message.sourceId, message.chatId, message.turnId);
+    if (!turnContext) {
+      return;
+    }
+
+    const promptText = turnContext.turn.blocks['user-input'].content.trim();
+    if (!promptText) {
+      return;
+    }
+
+    const title = message.title?.trim() || summarizeForTitle(promptText);
+    const tags = [...new Set((message.tags ?? []).map((tag) => tag.trim()).filter(Boolean))];
+    const now = Date.now();
+
+    this.promptLibrary = [
+      {
+        id: `prompt:${now}:${Math.random().toString(16).slice(2, 8)}`,
+        title,
+        content: promptText,
+        tags,
+        createdAt: now,
+        updatedAt: now,
+        sourceId: message.sourceId,
+        sourceLabel: turnContext.chat.sourceLabel,
+        model: turnContext.turn.model ?? turnContext.chat.model,
+        useCount: 0,
+        efficiencyScore: turnContext.turn.assessment?.score,
+      },
+      ...this.promptLibrary,
+    ];
+
+    void this.extensionContext.globalState.update(PROMPT_LIBRARY_KEY, this.promptLibrary);
+    this.emitSnapshot();
+  }
+
+  private async copyPrompt(promptId: string | undefined): Promise<void> {
+    if (!promptId) {
+      return;
+    }
+
+    const prompt = this.promptLibrary.find((candidate) => candidate.id === promptId);
+    if (!prompt) {
+      return;
+    }
+
+    await vscode.env.clipboard.writeText(prompt.content);
+    this.markPromptUsed(promptId);
+  }
+
+  private deletePrompt(promptId: string | undefined): void {
+    if (!promptId) {
+      return;
+    }
+
+    this.promptLibrary = this.promptLibrary.filter((prompt) => prompt.id !== promptId);
+    void this.extensionContext.globalState.update(PROMPT_LIBRARY_KEY, this.promptLibrary);
+    this.emitSnapshot();
+  }
+
+  private markPromptUsed(promptId: string | undefined): void {
+    if (!promptId) {
+      return;
+    }
+
+    const now = Date.now();
+    this.promptLibrary = this.promptLibrary.map((prompt) => {
+      if (prompt.id !== promptId) {
+        return prompt;
       }
 
-      return left.id.localeCompare(right.id);
+      return {
+        ...prompt,
+        useCount: prompt.useCount + 1,
+        lastUsedAt: now,
+        updatedAt: now,
+      };
     });
 
-    const latestTurn = mergedTurns[mergedTurns.length - 1];
-
-    return {
-      ...cloneChat(storeChat),
-      subtitle: storeChat.subtitle
-        ?? runtimeChat.subtitle
-        ?? snippetForSubtitle(latestTurn?.blocks['agent-output'].content)
-        ?? snippetForSubtitle(latestTurn?.blocks['user-input'].content),
-      updatedAt: Math.max(storeChat.updatedAt, runtimeChat.updatedAt),
-      turns: mergedTurns,
-    };
+    void this.extensionContext.globalState.update(PROMPT_LIBRARY_KEY, this.promptLibrary);
+    this.emitSnapshot();
   }
 
-  private resolveSelectedChatId(chats: ConversationChat[]): string | undefined {
-    const preferred = this.storeCollection.selectedChatId;
-    if (preferred && chats.some((chat) => chat.id === preferred)) {
-      return preferred;
-    }
-
-    if (this.activeRuntimeChatId && chats.some((chat) => chat.id === this.activeRuntimeChatId)) {
-      return this.activeRuntimeChatId;
-    }
-
-    return chats[0]?.id;
+  private updateBudgets(nextBudgets: unknown): void {
+    this.budgets = sanitizeBudgetSettings(nextBudgets);
+    void this.extensionContext.globalState.update(BUDGET_SETTINGS_KEY, this.budgets);
+    this.emitSnapshot();
   }
 
-  private resolveRuntimeChatIdForPrompt(content: string): string {
-    const preferred = this.getPreferredChatId();
-    if (preferred) {
-      return preferred;
+  private findTurn(sourceId: 'cursor' | 'antigravity' | 'manual', chatId: string, turnId: string): {
+    chat: ConversationChat;
+    turn: ConversationTurn;
+  } | undefined {
+    const source = this.buildSourceSnapshots().find((candidate) => candidate.id === sourceId);
+    const chat = source?.chats.find((candidate) => candidate.id === chatId);
+    const turn = chat?.turns.find((candidate) => candidate.id === turnId);
+
+    if (!chat || !turn) {
+      return undefined;
     }
 
-    const normalizedPrompt = normalizeComparableText(content);
-    for (const chat of this.storeCollection.chats) {
-      const normalizedTitle = normalizeComparableText(chat.title);
-      if (!normalizedTitle) {
-        continue;
-      }
-
-      if (normalizedTitle === normalizedPrompt || normalizedPrompt.startsWith(normalizedTitle)) {
-        return chat.id;
-      }
-    }
-
-    return this.createEphemeralChatId();
-  }
-
-  private getPreferredChatId(): string | undefined {
-    if (this.storeCollection.selectedChatId) {
-      return this.storeCollection.selectedChatId;
-    }
-
-    if (this.storeCollection.chats.length === 1) {
-      return this.storeCollection.chats[0].id;
-    }
-
-    return undefined;
-  }
-
-  private createEphemeralChatId(): string {
-    return `live:${++this.chatCounter}`;
+    return { chat, turn };
   }
 
   private ensureRuntimeChat(
     chatId: string,
-    options: { title: string; subtitle?: string; isEphemeral?: boolean }
+    options: { title: string; sourceLabel: string; model?: string }
   ): ConversationChat {
     const existing = this.runtimeChats.get(chatId);
     if (existing) {
-      if (!existing.title && options.title) {
-        existing.title = options.title;
-      }
-      if (!existing.subtitle && options.subtitle) {
-        existing.subtitle = options.subtitle;
-      }
       return existing;
     }
 
-    const storeChat = this.storeCollection.chats.find((chat) => chat.id === chatId);
     const now = Date.now();
     const next: ConversationChat = {
       id: chatId,
-      title: storeChat?.title ?? options.title,
-      subtitle: storeChat?.subtitle ?? options.subtitle,
+      title: options.title,
       createdAt: now,
       updatedAt: now,
       turns: [],
-      isEphemeral: options.isEphemeral,
+      isEphemeral: true,
+      sourceId: 'manual',
+      sourceLabel: options.sourceLabel,
+      model: options.model,
+      modelConfidence: options.model ? 'exact' : 'unknown',
     };
 
     this.runtimeChats.set(chatId, next);
     return next;
   }
 
+  private createRuntimeChatId(): string {
+    return `manual-chat:${++this.chatCounter}`;
+  }
+
   private createRuntimeTurn(chat: ConversationChat): ConversationTurn {
     const now = Date.now();
     const turn: ConversationTurn = {
-      id: `runtime:${++this.turnCounter}`,
+      id: `runtime-turn:${++this.turnCounter}`,
       createdAt: now,
       updatedAt: now,
       isComplete: false,
@@ -362,69 +541,20 @@ export class AgentMonitor implements vscode.Disposable {
     return turn;
   }
 
-  private getOrCreateActiveRuntimeTurn(): { chatId: string; turnId: string } {
-    if (this.activeRuntimeChatId && this.activeRuntimeTurnId) {
-      const chat = this.runtimeChats.get(this.activeRuntimeChatId);
-      const turn = chat?.turns.find((candidate) => candidate.id === this.activeRuntimeTurnId);
-      if (chat && turn) {
-        return {
-          chatId: chat.id,
-          turnId: turn.id,
-        };
-      }
-    }
-
-    const chat = this.ensureRuntimeChat(this.getPreferredChatId() ?? this.createEphemeralChatId(), {
-      title: 'Live Capture',
-      isEphemeral: true,
-    });
-    const turn = this.createRuntimeTurn(chat);
-    this.activeRuntimeChatId = chat.id;
-    this.activeRuntimeTurnId = turn.id;
-    return {
-      chatId: chat.id,
-      turnId: turn.id,
-    };
-  }
-
-  private finishActiveRuntimeTurn(): void {
-    if (!this.activeRuntimeChatId || !this.activeRuntimeTurnId) {
-      return;
-    }
-
-    const chat = this.runtimeChats.get(this.activeRuntimeChatId);
-    if (chat) {
-      this.finalizeTurn(chat, this.activeRuntimeTurnId);
-    }
-
-    this.activeRuntimeChatId = undefined;
-    this.activeRuntimeTurnId = undefined;
-  }
-
   private getLastOpenRuntimeTurn(chat: ConversationChat): ConversationTurn | undefined {
     for (let index = chat.turns.length - 1; index >= 0; index -= 1) {
-      const turn = chat.turns[index];
-      if (!turn.isComplete) {
-        return turn;
+      if (!chat.turns[index].isComplete) {
+        return chat.turns[index];
       }
     }
 
     return undefined;
   }
 
-  private mustGetRuntimeChat(chatId: string): ConversationChat {
-    const chat = this.runtimeChats.get(chatId);
-    if (!chat) {
-      throw new Error(`Unknown runtime chat: ${chatId}`);
-    }
-
-    return chat;
-  }
-
   private mustGetTurn(chat: ConversationChat, turnId: string): ConversationTurn {
     const turn = chat.turns.find((candidate) => candidate.id === turnId);
     if (!turn) {
-      throw new Error(`Unknown conversation turn: ${turnId}`);
+      throw new Error(`Unknown turn: ${turnId}`);
     }
 
     return turn;
@@ -434,30 +564,13 @@ export class AgentMonitor implements vscode.Disposable {
     const turn = this.mustGetTurn(chat, turnId);
     turn.blocks[blockType].content = content;
     turn.blocks[blockType].isStreaming = false;
+
     if (blockType === 'agent-output') {
-      chat.subtitle = snippetForSubtitle(content) ?? chat.subtitle;
+      chat.subtitle = summarizeForSubtitle(content) ?? chat.subtitle;
     } else if (blockType === 'user-input' && !chat.subtitle) {
-      chat.subtitle = snippetForSubtitle(content);
+      chat.subtitle = summarizeForSubtitle(content);
     }
-    this.touchTurn(chat, turn);
-  }
 
-  private startBlock(chat: ConversationChat, turnId: string, blockType: BlockType): void {
-    const turn = this.mustGetTurn(chat, turnId);
-    turn.blocks[blockType].isStreaming = true;
-    this.touchTurn(chat, turn);
-  }
-
-  private appendToBlock(chat: ConversationChat, turnId: string, blockType: BlockType, content: string): void {
-    const turn = this.mustGetTurn(chat, turnId);
-    const block = turn.blocks[blockType];
-    if (!block.isStreaming) {
-      block.isStreaming = true;
-    }
-    block.content += content;
-    if (blockType === 'agent-output') {
-      chat.subtitle = snippetForSubtitle(block.content) ?? chat.subtitle;
-    }
     this.touchTurn(chat, turn);
   }
 
@@ -476,12 +589,169 @@ export class AgentMonitor implements vscode.Disposable {
   }
 
   private emitSnapshot(): void {
-    this._onSnapshotChanged.fire(this.getSnapshot());
+    const snapshot = this.getSnapshot();
+    this.notifyBudgetAlerts(snapshot);
+    this._onSnapshotChanged.fire(snapshot);
+  }
+
+  private notifyBudgetAlerts(snapshot: MonitorSnapshot): void {
+    const nextAlertIds = new Set(snapshot.alerts.map((alert) => alert.id));
+    for (const alert of snapshot.alerts) {
+      if ((alert.level === 'warn' || alert.level === 'critical') && !this.lastAlertIds.has(alert.id)) {
+        void vscode.window.showWarningMessage(`${alert.title}: ${alert.detail}`);
+      }
+    }
+    this.lastAlertIds = nextAlertIds;
   }
 
   private setStatus(status: MonitorStatus['status'], text: string): void {
     this.status = { status, text };
     this._onStatusChanged.fire({ ...this.status });
+  }
+
+  private updateActiveChatLock(
+    sourceId: 'cursor' | 'antigravity',
+    collection: ConversationCollection
+  ): void {
+    const attention = extractCollectionAttention(sourceId, collection);
+    const previous = this.sourceAttention.get(sourceId) ?? {
+      requestSeq: 0,
+      selectedChatUpdatedAt: 0,
+      promptCount: 0,
+      lastEngagedAt: 0,
+    };
+
+    if (!attention) {
+      this.sourceAttention.set(sourceId, {
+        ...previous,
+        selectedChatKey: undefined,
+        selectedChatUpdatedAt: 0,
+        promptCount: 0,
+        latestUserTurnSignature: undefined,
+      });
+      this.reconcileActiveChatLock();
+      return;
+    }
+
+    const selectionChanged = previous.selectedChatKey !== undefined && previous.selectedChatKey !== attention.key;
+    const promptChanged = previous.selectedChatKey === attention.key
+      && (
+        attention.promptCount > previous.promptCount
+        || (
+          attention.latestUserTurnSignature !== undefined
+          && attention.latestUserTurnSignature !== previous.latestUserTurnSignature
+        )
+      );
+    const streamUpdated = attention.chat.updatedAt > previous.selectedChatUpdatedAt;
+
+    const nextState: SourceAttentionState = {
+      requestSeq: previous.requestSeq,
+      selectedChatKey: attention.key,
+      selectedChatUpdatedAt: attention.chat.updatedAt,
+      promptCount: attention.promptCount,
+      latestUserTurnSignature: attention.latestUserTurnSignature,
+      lastEngagedAt: previous.lastEngagedAt,
+    };
+
+    if (selectionChanged || promptChanged) {
+      nextState.lastEngagedAt = Date.now();
+    } else if (!previous.selectedChatKey) {
+      nextState.lastEngagedAt = attention.chat.updatedAt;
+    }
+
+    this.sourceAttention.set(sourceId, nextState);
+
+    if (!this.activeChatKey) {
+      this.activeChatKey = attention.key;
+      this.activeChatEngagedAt = nextState.lastEngagedAt || attention.chat.updatedAt;
+      return;
+    }
+
+    if (this.activeChatKey === attention.key) {
+      this.activeChatEngagedAt = Math.max(
+        this.activeChatEngagedAt,
+        nextState.lastEngagedAt,
+        attention.chat.updatedAt
+      );
+      return;
+    }
+
+    if (selectionChanged || promptChanged) {
+      if (nextState.lastEngagedAt >= this.activeChatEngagedAt) {
+        this.activeChatKey = attention.key;
+        this.activeChatEngagedAt = nextState.lastEngagedAt;
+      }
+      return;
+    }
+
+    if (nextState.lastEngagedAt > this.activeChatEngagedAt) {
+      this.activeChatKey = attention.key;
+      this.activeChatEngagedAt = nextState.lastEngagedAt;
+      return;
+    }
+
+    const activeSourceId = extractSourceId(this.activeChatKey);
+    if (activeSourceId === sourceId && streamUpdated) {
+      this.activeChatKey = attention.key;
+      this.activeChatEngagedAt = Math.max(this.activeChatEngagedAt, attention.chat.updatedAt);
+      return;
+    }
+
+    this.reconcileActiveChatLock();
+  }
+
+  private reconcileActiveChatLock(): void {
+    const allSnapshots = this.buildSourceSnapshots();
+
+    if (this.activeChatKey && snapshotContainsChat(allSnapshots, this.activeChatKey)) {
+      return;
+    }
+
+    let bestCandidate: { key: string; engagedAt: number; updatedAt: number } | undefined;
+    for (const sourceId of ['cursor', 'antigravity'] as const) {
+      const state = this.sourceAttention.get(sourceId);
+      if (!state?.selectedChatKey) {
+        continue;
+      }
+
+      const chat = findChatByKey(allSnapshots, state.selectedChatKey);
+      if (!chat) {
+        continue;
+      }
+
+      const candidate = {
+        key: state.selectedChatKey,
+        engagedAt: state.lastEngagedAt,
+        updatedAt: chat.updatedAt,
+      };
+
+      if (
+        !bestCandidate
+        || candidate.engagedAt > bestCandidate.engagedAt
+        || (
+          candidate.engagedAt === bestCandidate.engagedAt
+          && candidate.updatedAt > bestCandidate.updatedAt
+        )
+      ) {
+        bestCandidate = candidate;
+      }
+    }
+
+    if (bestCandidate) {
+      this.activeChatKey = bestCandidate.key;
+      this.activeChatEngagedAt = Math.max(bestCandidate.engagedAt, bestCandidate.updatedAt);
+      return;
+    }
+
+    const fallback = allSnapshots
+      .flatMap((source) => source.chats.map((chat) => ({
+        key: toChatKey(source.id, chat.id),
+        updatedAt: chat.updatedAt,
+      })))
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+
+    this.activeChatKey = fallback?.key;
+    this.activeChatEngagedAt = fallback?.updatedAt ?? 0;
   }
 }
 
@@ -502,68 +772,225 @@ function detectHostApp(): { app: HostApp; label: string } {
     return { app: 'antigravity', label: 'Antigravity' };
   }
 
-  return { app: 'unknown', label: vscode.env.appName || 'AI Sidebar' };
+  return { app: 'unknown', label: vscode.env.appName || 'VS Code' };
 }
 
-function mergeTurns(storeTurn: ConversationTurn, runtimeTurn: ConversationTurn): ConversationTurn {
-  const next = cloneTurn(storeTurn);
-  next.updatedAt = Math.max(storeTurn.updatedAt, runtimeTurn.updatedAt);
-  next.isComplete = storeTurn.isComplete || runtimeTurn.isComplete;
+function summarizeForTitle(value: string): string {
+  const singleLine = value.replace(/\s+/g, ' ').trim();
+  if (!singleLine) {
+    return 'Saved prompt';
+  }
 
-  for (const blockType of BLOCK_TYPES) {
-    const storeBlock = next.blocks[blockType];
-    const runtimeBlock = runtimeTurn.blocks[blockType];
+  return singleLine.length <= 64
+    ? singleLine
+    : `${singleLine.slice(0, 61).trimEnd()}...`;
+}
 
-    if (!storeBlock.content && runtimeBlock.content) {
-      storeBlock.content = runtimeBlock.content;
-    } else if (runtimeBlock.isStreaming && runtimeBlock.content.length > storeBlock.content.length) {
-      storeBlock.content = runtimeBlock.content;
+function summarizeForSubtitle(value?: string): string | undefined {
+  const singleLine = (value ?? '').replace(/\s+/g, ' ').trim();
+  if (!singleLine) {
+    return undefined;
+  }
+
+  return singleLine.length <= 110
+    ? singleLine
+    : `${singleLine.slice(0, 107).trimEnd()}...`;
+}
+
+function loadPromptLibrary(rawValue: unknown): SavedPrompt[] {
+  if (!Array.isArray(rawValue)) {
+    return [];
+  }
+
+  return rawValue.flatMap((candidate) => {
+    if (!candidate || typeof candidate !== 'object') {
+      return [];
     }
 
-    storeBlock.isStreaming = storeBlock.isStreaming || runtimeBlock.isStreaming;
-  }
+    const prompt = candidate as Partial<SavedPrompt>;
+    if (typeof prompt.id !== 'string' || typeof prompt.title !== 'string' || typeof prompt.content !== 'string') {
+      return [];
+    }
 
-  return next;
+    return [{
+      id: prompt.id,
+      title: prompt.title,
+      content: prompt.content,
+      tags: Array.isArray(prompt.tags) ? prompt.tags.filter((tag): tag is string => typeof tag === 'string') : [],
+      createdAt: toFiniteNumber(prompt.createdAt) ?? Date.now(),
+      updatedAt: toFiniteNumber(prompt.updatedAt) ?? toFiniteNumber(prompt.createdAt) ?? Date.now(),
+      sourceId: prompt.sourceId === 'cursor' || prompt.sourceId === 'antigravity' || prompt.sourceId === 'manual'
+        ? prompt.sourceId
+        : undefined,
+      sourceLabel: typeof prompt.sourceLabel === 'string' ? prompt.sourceLabel : undefined,
+      model: typeof prompt.model === 'string' ? prompt.model : undefined,
+      useCount: toFiniteNumber(prompt.useCount) ?? 0,
+      lastUsedAt: toFiniteNumber(prompt.lastUsedAt),
+      efficiencyScore: toFiniteNumber(prompt.efficiencyScore),
+    }];
+  });
 }
 
-function turnsLikelyMatch(left: ConversationTurn, right: ConversationTurn): boolean {
-  const leftUser = normalizeComparableText(left.blocks['user-input'].content);
-  const rightUser = normalizeComparableText(right.blocks['user-input'].content);
-  if (leftUser && rightUser && leftUser === rightUser) {
-    return true;
+function sanitizeBudgetSettings(rawValue: unknown) {
+  const defaults = createDefaultBudgets();
+  if (!rawValue || typeof rawValue !== 'object') {
+    return defaults;
   }
 
-  const leftOutput = normalizeComparableText(left.blocks['agent-output'].content);
-  const rightOutput = normalizeComparableText(right.blocks['agent-output'].content);
-  if (leftOutput && rightOutput && leftOutput === rightOutput) {
-    return true;
+  const value = rawValue as Record<string, unknown>;
+  return {
+    dailyCostUsd: toNullableBudgetNumber(value.dailyCostUsd),
+    monthlyCostUsd: toNullableBudgetNumber(value.monthlyCostUsd),
+    dailyTokens: toNullableBudgetNumber(value.dailyTokens),
+    monthlyTokens: toNullableBudgetNumber(value.monthlyTokens),
+  };
+}
+
+function toNullableBudgetNumber(value: unknown): number | null {
+  const parsed = toFiniteNumber(value);
+  if (parsed === undefined || parsed <= 0) {
+    return null;
   }
 
-  return Math.abs(left.createdAt - right.createdAt) < 4000 && Boolean(leftUser || leftOutput);
+  return parsed;
+}
+
+function toFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
+async function readSqliteKeyMap(
+  dbPath: string,
+  keys: string[]
+): Promise<Record<string, string>> {
+  if (keys.length === 0) {
+    return {};
+  }
+
+  for (const candidatePath of [dbPath, `${dbPath}.backup`]) {
+    if (!(await pathExists(candidatePath))) {
+      continue;
+    }
+
+    const result = await querySqliteKeyMap(candidatePath, keys);
+    if (Object.keys(result).length > 0) {
+      return result;
+    }
+  }
+
+  return {};
+}
+
+async function querySqliteKeyMap(
+  sourceDbPath: string,
+  keys: string[]
+): Promise<Record<string, string>> {
+  const tempDbPath = path.join(
+    os.tmpdir(),
+    `ai-token-analytics-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.sqlite`
+  );
+
+  try {
+    await fs.copyFile(sourceDbPath, tempDbPath);
+    const sql = `SELECT key, value FROM ItemTable WHERE key IN (${keys.map(quoteSqliteString).join(', ')})`;
+    const { stdout } = await execFileAsync('sqlite3', ['-json', tempDbPath, sql], {
+      maxBuffer: 8 * 1024 * 1024,
+    });
+
+    const rows = JSON.parse(stdout || '[]') as Array<{ key: string; value: string }>;
+    const map: Record<string, string> = {};
+    for (const row of rows) {
+      map[row.key] = row.value;
+    }
+
+    return map;
+  } catch {
+    return {};
+  } finally {
+    await fs.rm(tempDbPath, { force: true }).catch(() => undefined);
+  }
+}
+
+function quoteSqliteString(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function formatError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
+}
+
+function extractCollectionAttention(
+  sourceId: 'cursor' | 'antigravity',
+  collection: ConversationCollection
+): CollectionAttention | undefined {
+  const chat = collection.chats.find((candidate) => candidate.id === collection.selectedChatId)
+    ?? collection.chats[0];
+  if (!chat) {
+    return undefined;
+  }
+
+  let promptCount = 0;
+  let latestUserTurn: ConversationTurn | undefined;
+  for (const turn of chat.turns) {
+    if (!turn.blocks['user-input'].content.trim()) {
+      continue;
+    }
+
+    promptCount += 1;
+    if (!latestUserTurn || turn.updatedAt >= latestUserTurn.updatedAt) {
+      latestUserTurn = turn;
+    }
+  }
+
+  return {
+    chat,
+    key: toChatKey(sourceId, chat.id),
+    promptCount,
+    latestUserTurnSignature: latestUserTurn
+      ? `${latestUserTurn.id}:${normalizeComparableText(latestUserTurn.blocks['user-input'].content).slice(0, 240)}`
+      : undefined,
+  };
+}
+
+function snapshotContainsChat(sources: SourceSnapshot[], chatKey: string): boolean {
+  return Boolean(findChatByKey(sources, chatKey));
+}
+
+function findChatByKey(sources: SourceSnapshot[], chatKey: string): ConversationChat | undefined {
+  const sourceId = extractSourceId(chatKey);
+  const chatId = extractChatId(chatKey);
+  return sources.find((source) => source.id === sourceId)?.chats.find((chat) => chat.id === chatId);
+}
+
+function toChatKey(sourceId: string, chatId: string): string {
+  return `${sourceId}:${chatId}`;
+}
+
+function extractSourceId(chatKey: string): string {
+  const separatorIndex = chatKey.indexOf(':');
+  return separatorIndex === -1 ? chatKey : chatKey.slice(0, separatorIndex);
+}
+
+function extractChatId(chatKey: string): string {
+  const separatorIndex = chatKey.indexOf(':');
+  return separatorIndex === -1 ? '' : chatKey.slice(separatorIndex + 1);
 }
 
 function normalizeComparableText(value: string): string {
   return value.replace(/\s+/g, ' ').trim().toLowerCase();
-}
-
-function snippetForTitle(value?: string): string | undefined {
-  const line = (value ?? '').split('\n')[0]?.trim();
-  if (!line) {
-    return undefined;
-  }
-
-  return line.length <= 80
-    ? line
-    : `${line.slice(0, 77).trimEnd()}...`;
-}
-
-function snippetForSubtitle(value?: string): string | undefined {
-  const line = (value ?? '').split('\n')[0]?.replace(/\s+/g, ' ').trim();
-  if (!line) {
-    return undefined;
-  }
-
-  return line.length <= 110
-    ? line
-    : `${line.slice(0, 107).trimEnd()}...`;
 }

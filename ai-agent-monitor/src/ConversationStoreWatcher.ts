@@ -16,10 +16,12 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-const POLL_INTERVAL_MS = 900;
+const POLL_INTERVAL_MS = 400;
 const STREAMING_GRACE_MS = 2500;
-const RECENT_LOOKBACK_MS = 6 * 60 * 60 * 1000;
-const MAX_CURSOR_TRANSCRIPTS = 24;
+const RECENT_LOOKBACK_MS = 35 * 24 * 60 * 60 * 1000;
+const MAX_CURSOR_TRANSCRIPTS = 240;
+const MAX_ANTIGRAVITY_CHATS = 240;
+const ANTIGRAVITY_NEW_CHAT_GRACE_MS = 35 * 24 * 60 * 60 * 1000;
 
 interface StoreWatcherCallbacks {
   onCollectionCaptured(collection: ConversationCollection): void;
@@ -29,6 +31,7 @@ interface CursorComposerHeader {
   composerId: string;
   name?: string;
   subtitle?: string;
+  contextUsagePercent?: number;
   createdAt?: number;
   lastUpdatedAt?: number;
   conversationCheckpointLastUpdatedAt?: number;
@@ -53,6 +56,21 @@ interface AntigravitySummaryEntry {
   title: string;
   subtitle?: string;
   order: number;
+}
+
+interface AntigravityArtifactMetadata {
+  artifactType?: string;
+  summary?: string;
+  updatedAt?: string;
+}
+
+interface AntigravityArtifact {
+  baseName: string;
+  content: string;
+  kind: BlockType;
+  summary?: string;
+  updatedAt: number;
+  createdAt: number;
 }
 
 export class ConversationStoreWatcher implements vscode.Disposable {
@@ -185,6 +203,11 @@ export class ConversationStoreWatcher implements vscode.Disposable {
           createdAt: header.createdAt ?? now,
           updatedAt: now,
           turns: [],
+          sourceId: 'cursor',
+          sourceLabel: 'Cursor',
+          contextUsagePercent: typeof header.contextUsagePercent === 'number'
+            ? header.contextUsagePercent
+            : undefined,
         });
       }
     }
@@ -262,21 +285,30 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       workspaceValuesPromise,
     ]);
 
-    const summaries = parseAntigravitySummaryEntries(
+    const summaryEntries = parseAntigravitySummaryEntries(
       globalValues['antigravityUnifiedStateSync.trajectorySummaries'],
       workspacePaths
     );
+    const summaries = new Map(summaryEntries.map((summary) => [summary.id, summary]));
+    const brainRoot = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
+    const chats = await this.collectAntigravityBrainChats(brainRoot, summaries);
 
-    const chats = await Promise.all(
-      summaries.map(async (summary, index) => {
-        const chat = await this.parseAntigravitySummaryChat(summary, index);
-        return chat;
-      })
-    );
+    if (chats.length === 0 && summaryEntries.length > 0) {
+      const fallbackChats = await Promise.all(
+        summaryEntries.map(async (summary, index) => this.parseAntigravitySummaryChat(summary, index))
+      );
+      return {
+        chats: fallbackChats,
+        selectedChatId: parseAntigravitySelectedChatId(
+          workspaceValues['memento/antigravity.jetskiArtifactsEditor'],
+          summaryEntries
+        ) ?? fallbackChats[0]?.id,
+      };
+    }
 
     const selectedChatId = parseAntigravitySelectedChatId(
       workspaceValues['memento/antigravity.jetskiArtifactsEditor'],
-      summaries
+      summaryEntries
     );
 
     return {
@@ -514,6 +546,11 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       createdAt,
       updatedAt,
       turns,
+      sourceId: 'cursor',
+      sourceLabel: 'Cursor',
+      contextUsagePercent: typeof header?.contextUsagePercent === 'number'
+        ? header.contextUsagePercent
+        : undefined,
     };
   }
 
@@ -540,7 +577,67 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       createdAt: now - index,
       updatedAt: now - index,
       turns: [],
+      sourceId: 'antigravity',
+      sourceLabel: 'Antigravity',
     };
+  }
+
+  private async collectAntigravityBrainChats(
+    brainRoot: string,
+    summaries: ReadonlyMap<string, AntigravitySummaryEntry>
+  ): Promise<ConversationChat[]> {
+    if (!(await pathExists(brainRoot))) {
+      return [];
+    }
+
+    this.logDiscoveredRoot(brainRoot, 'Antigravity brain artifacts');
+
+    const directories = await readDirSafe(brainRoot);
+    const candidates = await Promise.all(
+      directories
+        .filter((entry) => entry.isDirectory() && looksLikeUuid(entry.name))
+        .map(async (entry) => {
+          const dirPath = path.join(brainRoot, entry.name);
+          const stats = await safeStat(dirPath);
+          return {
+            id: entry.name,
+            dirPath,
+            updatedAt: stats?.mtimeMs ?? 0,
+          };
+        })
+    );
+
+    const summaryIds = new Set(summaries.keys());
+    const included = candidates
+      .filter((candidate) => {
+        if (summaryIds.size === 0) {
+          return true;
+        }
+
+        if (summaryIds.has(candidate.id)) {
+          return true;
+        }
+
+        return candidate.updatedAt >= Date.now() - ANTIGRAVITY_NEW_CHAT_GRACE_MS;
+      })
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .slice(0, MAX_ANTIGRAVITY_CHATS);
+
+    const chats = await Promise.all(
+      included.map(async (candidate, index) => {
+        const summary = summaries.get(candidate.id) ?? {
+          id: candidate.id,
+          title: 'New chat',
+          order: index,
+        };
+
+        return this.parseAntigravityBrainChat(summary, candidate.dirPath, index);
+      })
+    );
+
+    return chats
+      .filter((chat): chat is ConversationChat => Boolean(chat))
+      .sort((left, right) => right.updatedAt - left.updatedAt);
   }
 
   private async parseAntigravityBrainChat(
@@ -548,72 +645,82 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     dirPath: string,
     index: number
   ): Promise<ConversationChat | undefined> {
-    const taskFile = await pickArtifactFile(dirPath, ['task.md']);
-    const thinkingFile = await pickArtifactFile(dirPath, ['implementation_plan_retry.md', 'implementation_plan.md']);
-    const outputFile = await pickArtifactFile(dirPath, [
-      'final_walkthrough.md',
-      'final_testing_walkthrough.md',
-      'testing_guide.md',
-      'feature_audit_report.md',
-      'walkthrough.md',
-    ]);
+    const artifacts = await loadAntigravityArtifacts(dirPath);
+    const directoryStats = await safeStat(dirPath);
+    const userArtifact = pickAntigravityArtifact(artifacts, 'user-input');
+    const thinkingArtifact = pickAntigravityArtifact(artifacts, 'agent-thinking');
+    const outputArtifact = pickAntigravityArtifact(artifacts, 'agent-output');
 
-    if (!taskFile && !thinkingFile && !outputFile) {
-      return undefined;
-    }
+    const userInput = normalizeBrainContent(userArtifact?.content);
+    const thinking = normalizeBrainContent(thinkingArtifact?.content);
+    const output = normalizeBrainContent(outputArtifact?.content);
 
-    const [taskContent, thinkingContent, outputContent, taskStats, thinkingStats, outputStats] = await Promise.all([
-      taskFile ? safeReadFile(taskFile) : Promise.resolve(undefined),
-      thinkingFile ? safeReadFile(thinkingFile) : Promise.resolve(undefined),
-      outputFile ? safeReadFile(outputFile) : Promise.resolve(undefined),
-      taskFile ? safeStat(taskFile) : Promise.resolve(undefined),
-      thinkingFile ? safeStat(thinkingFile) : Promise.resolve(undefined),
-      outputFile ? safeStat(outputFile) : Promise.resolve(undefined),
-    ]);
-
-    const userInput = normalizeBrainContent(taskContent);
-    const thinking = normalizeBrainContent(thinkingContent);
-    const output = normalizeBrainContent(outputContent);
+    const artifactTimestamps = artifacts.map((artifact) => artifact.updatedAt);
+    const updatedAt = Math.max(
+      directoryStats?.mtimeMs ?? 0,
+      ...artifactTimestamps,
+      Date.now() - index
+    );
+    const createdAtCandidates = [
+      directoryStats?.birthtimeMs,
+      directoryStats?.mtimeMs,
+      ...artifacts.map((artifact) => artifact.createdAt),
+    ].filter((value): value is number => typeof value === 'number');
+    const createdAt = createdAtCandidates.length > 0 ? Math.min(...createdAtCandidates) : updatedAt;
 
     if (!userInput && !thinking && !output) {
-      return undefined;
+      return {
+        id: summary.id,
+        title: summary.title || 'New chat',
+        subtitle: summary.subtitle,
+        createdAt: createdAt - index,
+        updatedAt: updatedAt - index,
+        turns: [],
+        sourceId: 'antigravity',
+        sourceLabel: 'Antigravity',
+      };
     }
-
-    const timestamps = [taskStats?.mtimeMs, thinkingStats?.mtimeMs, outputStats?.mtimeMs]
-      .filter((value): value is number => typeof value === 'number');
-    const updatedAt = timestamps.length > 0 ? Math.max(...timestamps) : Date.now();
-    const createdAt = [taskStats?.birthtimeMs, taskStats?.mtimeMs, updatedAt]
-      .filter((value): value is number => typeof value === 'number')[0] ?? updatedAt;
 
     const turn = this.createTurn(
       `${summary.id}:turn:1`,
       {
         'user-input': {
           content: userInput,
-          isStreaming: false,
+          isStreaming: isAntigravityArtifactStreaming(userArtifact),
         },
         'agent-thinking': {
           content: thinking,
-          isStreaming: !output && Date.now() - updatedAt < STREAMING_GRACE_MS && Boolean(thinking),
+          isStreaming: isAntigravityArtifactStreaming(thinkingArtifact),
         },
         'agent-output': {
           content: output,
-          isStreaming: Date.now() - updatedAt < STREAMING_GRACE_MS && Boolean(output),
+          isStreaming: isAntigravityArtifactStreaming(outputArtifact),
         },
       },
       createdAt,
       updatedAt
     );
 
+    const title = normalizeTitle(summary.title)
+      || extractAntigravityTitle(userInput)
+      || extractAntigravityTitle(output)
+      || artifacts.map((artifact) => artifact.summary).find((value): value is string => Boolean(normalizeTitle(value)))
+      || 'Untitled chat';
+    const subtitle = normalizeSubtitle(summary.subtitle)
+      || artifacts.map((artifact) => normalizeSubtitle(artifact.summary)).find((value): value is string => Boolean(value))
+      || snippetForSubtitle(output)
+      || snippetForSubtitle(thinking)
+      || snippetForSubtitle(userInput);
+
     return {
       id: summary.id,
-      title: summary.title,
-      subtitle: summary.subtitle
-        || snippetForSubtitle(output)
-        || snippetForSubtitle(userInput),
+      title,
+      subtitle,
       createdAt: createdAt - index,
       updatedAt: updatedAt - index,
       turns: [turn],
+      sourceId: 'antigravity',
+      sourceLabel: 'Antigravity',
     };
   }
 
@@ -1042,6 +1149,11 @@ function fingerprintCollection(collection: ConversationCollection): string {
       subtitle: chat.subtitle,
       createdAt: chat.createdAt,
       updatedAt: chat.updatedAt,
+      sourceId: chat.sourceId,
+      sourceLabel: chat.sourceLabel,
+      model: chat.model,
+      modelConfidence: chat.modelConfidence,
+      contextUsagePercent: chat.contextUsagePercent,
       turns: chat.turns.map((turn) => ({
         id: turn.id,
         createdAt: turn.createdAt,
@@ -1053,6 +1165,210 @@ function fingerprintCollection(collection: ConversationCollection): string {
       })),
     })),
   });
+}
+
+async function loadAntigravityArtifacts(dirPath: string): Promise<AntigravityArtifact[]> {
+  const entries = await readDirSafe(dirPath);
+  const groups = new Map<string, { contentPaths: string[]; metadataPath?: string }>();
+
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+
+    if (entry.name.endsWith('.metadata.json')) {
+      const baseName = entry.name.slice(0, -'.metadata.json'.length);
+      if (!isAntigravityTextBaseName(baseName)) {
+        continue;
+      }
+
+      const existing = groups.get(baseName) ?? { contentPaths: [] };
+      existing.metadataPath = path.join(dirPath, entry.name);
+      groups.set(baseName, existing);
+      continue;
+    }
+
+    if (!isAntigravityTextArtifactFile(entry.name)) {
+      continue;
+    }
+
+    const baseName = toAntigravityArtifactBaseName(entry.name);
+    const existing = groups.get(baseName) ?? { contentPaths: [] };
+    existing.contentPaths.push(path.join(dirPath, entry.name));
+    groups.set(baseName, existing);
+  }
+
+  const loadedArtifacts = await Promise.all(
+    [...groups.entries()].map(async ([baseName, group]) => {
+      if (group.contentPaths.length === 0) {
+        return undefined;
+      }
+
+      const contentCandidates = await Promise.all(
+        group.contentPaths.map(async (filePath) => ({
+          filePath,
+          stats: await safeStat(filePath),
+        }))
+      );
+      contentCandidates.sort((left, right) => (right.stats?.mtimeMs ?? 0) - (left.stats?.mtimeMs ?? 0));
+
+      const latest = contentCandidates[0];
+      if (!latest) {
+        return undefined;
+      }
+
+      const [content, metadata] = await Promise.all([
+        safeReadFile(latest.filePath),
+        loadAntigravityArtifactMetadata(group.metadataPath),
+      ]);
+
+      const normalizedContent = normalizeBrainContent(content);
+      if (!normalizedContent && !normalizeSubtitle(metadata?.summary ?? '')) {
+        return undefined;
+      }
+
+      const metadataUpdatedAt = metadata?.updatedAt ? Date.parse(metadata.updatedAt) : NaN;
+      const updatedAt = Math.max(
+        latest.stats?.mtimeMs ?? 0,
+        Number.isFinite(metadataUpdatedAt) ? metadataUpdatedAt : 0
+      );
+      const createdAt = latest.stats?.birthtimeMs ?? latest.stats?.mtimeMs ?? updatedAt;
+
+      const artifact: AntigravityArtifact = {
+        baseName,
+        content: normalizedContent,
+        kind: classifyAntigravityArtifact(baseName, metadata),
+        summary: normalizeSubtitle(metadata?.summary),
+        updatedAt,
+        createdAt,
+      };
+
+      return artifact;
+    })
+  );
+
+  return loadedArtifacts
+    .filter((artifact): artifact is AntigravityArtifact => Boolean(artifact))
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+async function loadAntigravityArtifactMetadata(
+  filePath?: string
+): Promise<AntigravityArtifactMetadata | undefined> {
+  if (!filePath) {
+    return undefined;
+  }
+
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    const parsed = JSON.parse(raw) as AntigravityArtifactMetadata;
+    return parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+function pickAntigravityArtifact(
+  artifacts: AntigravityArtifact[],
+  kind: BlockType
+): AntigravityArtifact | undefined {
+  const candidates = artifacts.filter((artifact) => artifact.kind === kind);
+  candidates.sort((left, right) => {
+    const priorityDiff = antigravityArtifactPriority(kind, right.baseName) - antigravityArtifactPriority(kind, left.baseName);
+    if (priorityDiff !== 0) {
+      return priorityDiff;
+    }
+
+    return right.updatedAt - left.updatedAt;
+  });
+  return candidates[0];
+}
+
+function antigravityArtifactPriority(kind: BlockType, baseName: string): number {
+  const value = baseName.toLowerCase();
+
+  if (kind === 'user-input') {
+    if (value === 'task.md') {
+      return 100;
+    }
+    return 10;
+  }
+
+  if (kind === 'agent-thinking') {
+    if (value === 'implementation_plan_retry.md') {
+      return 100;
+    }
+    if (value === 'implementation_plan.md') {
+      return 90;
+    }
+    return value.includes('plan') ? 50 : 10;
+  }
+
+  if (value === 'final_walkthrough.md') {
+    return 100;
+  }
+  if (value === 'final_testing_walkthrough.md') {
+    return 95;
+  }
+  if (value === 'walkthrough.md') {
+    return 90;
+  }
+  if (value.includes('final')) {
+    return 80;
+  }
+  if (value.includes('walkthrough') || value.includes('guide') || value.includes('report')) {
+    return 70;
+  }
+
+  return 10;
+}
+
+function classifyAntigravityArtifact(
+  baseName: string,
+  metadata?: AntigravityArtifactMetadata
+): BlockType {
+  const artifactType = (metadata?.artifactType ?? '').toUpperCase();
+  const value = baseName.toLowerCase();
+
+  if (artifactType === 'ARTIFACT_TYPE_TASK' || value === 'task.md') {
+    return 'user-input';
+  }
+
+  if (
+    artifactType === 'ARTIFACT_TYPE_IMPLEMENTATION_PLAN'
+    || value === 'implementation_plan.md'
+    || value === 'implementation_plan_retry.md'
+  ) {
+    return 'agent-thinking';
+  }
+
+  return 'agent-output';
+}
+
+function isAntigravityArtifactStreaming(artifact?: AntigravityArtifact): boolean {
+  return Boolean(artifact?.content) && Date.now() - (artifact?.updatedAt ?? 0) < STREAMING_GRACE_MS;
+}
+
+function extractAntigravityTitle(value?: string): string | undefined {
+  const lines = (value ?? '').split(/\r?\n/);
+  const heading = lines.find((line) => /^#\s+/.test(line));
+  if (heading) {
+    return normalizeTitle(heading.replace(/^#\s+/, ''));
+  }
+
+  return snippetForTitle(value);
+}
+
+function isAntigravityTextArtifactFile(fileName: string): boolean {
+  return /\.(md|txt)(?:\.resolved(?:\.\d+)?)?$/i.test(fileName);
+}
+
+function isAntigravityTextBaseName(fileName: string): boolean {
+  return /\.(md|txt)$/i.test(fileName);
+}
+
+function toAntigravityArtifactBaseName(fileName: string): string {
+  return fileName.replace(/\.resolved(?:\.\d+)?$/i, '');
 }
 
 async function pickArtifactFile(dirPath: string, preferredBaseNames: string[]): Promise<string | undefined> {

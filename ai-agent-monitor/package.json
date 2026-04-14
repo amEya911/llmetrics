@@ -1,7 +1,7 @@
 {
   "name": "ai-agent-monitor",
-  "displayName": "AI Agent Monitor",
-  "description": "Live structured feed of AI agent conversations — user inputs, agent thinking, and agent output in a dedicated sidebar panel",
+  "displayName": "AI Token Analytics",
+  "description": "Universal AI token analytics dashboard for Cursor, Antigravity, and active AI agent sessions inside VS Code",
   "version": "0.2.0",
   "publisher": "ameyakulkarni",
   "license": "MIT",
@@ -38,7 +38,7 @@
         {
           "type": "webview",
           "id": "aiAgentMonitor.sidebarView",
-          "name": "Conversation Feed"
+          "name": "Token Dashboard"
         }
       ]
     },

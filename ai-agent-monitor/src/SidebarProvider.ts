@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { cloneSnapshot, MonitorSnapshot, MonitorStatus, WebviewOutgoing } from './types';
+import { cloneSnapshot, MonitorSnapshot, MonitorStatus, WebviewIncoming, WebviewOutgoing } from './types';
 import { getConversationWebviewHtml } from './webviewContent';
 
 export class SidebarProvider implements vscode.WebviewViewProvider {
@@ -9,15 +9,38 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private ready = false;
   private currentSnapshot: MonitorSnapshot = {
     app: 'unknown',
-    appLabel: 'AI Sidebar',
-    chats: [],
+    appLabel: 'VS Code',
+    sources: [],
+    analytics: {
+      today: { tokens: 0, costUsd: 0, prompts: 0, sessions: 0 },
+      week: { tokens: 0, costUsd: 0, prompts: 0, sessions: 0 },
+      month: { tokens: 0, costUsd: 0, prompts: 0, sessions: 0 },
+      byAgent: [],
+      byModel: [],
+      expensiveSessions: [],
+      expensivePrompts: [],
+      trend: [],
+      coach: [],
+    },
+    promptLibrary: [],
+    budgets: {
+      dailyCostUsd: null,
+      monthlyCostUsd: null,
+      dailyTokens: null,
+      monthlyTokens: null,
+    },
+    alerts: [],
+    generatedAt: Date.now(),
   };
   private currentStatus: MonitorStatus = {
     status: 'monitoring',
-    text: 'Listening for AI conversations...',
+    text: 'Building the AI analytics dashboard...',
   };
 
-  constructor(private readonly extensionUri: vscode.Uri) {}
+  constructor(
+    private readonly extensionUri: vscode.Uri,
+    private readonly messageHandler?: (message: WebviewIncoming) => void
+  ) {}
 
   resolveWebviewView(
     webviewView: vscode.WebviewView,
@@ -32,13 +55,16 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [this.extensionUri],
     };
 
-    webviewView.webview.html = getConversationWebviewHtml(webviewView.webview, 'AI Agent Monitor');
+    webviewView.webview.html = getConversationWebviewHtml(webviewView.webview, 'AI Token Analytics');
 
-    webviewView.webview.onDidReceiveMessage((message) => {
+    webviewView.webview.onDidReceiveMessage((message: WebviewIncoming) => {
       if (message.command === 'ready') {
         this.ready = true;
         this.sync(this.currentSnapshot, this.currentStatus);
+        return;
       }
+
+      this.messageHandler?.(message);
     });
 
     webviewView.onDidDispose(() => {
@@ -65,8 +91,17 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   clear(): void {
     this.currentSnapshot = {
       ...this.currentSnapshot,
-      chats: [],
-      selectedChatId: undefined,
+      sources: [],
+      activeChat: undefined,
+      analytics: {
+        ...this.currentSnapshot.analytics,
+        byAgent: [],
+        byModel: [],
+        expensiveSessions: [],
+        expensivePrompts: [],
+        trend: [],
+        coach: [],
+      },
     };
     this.postMessage({ command: 'clear' });
   }

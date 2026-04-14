@@ -1,6 +1,34 @@
 import * as vscode from 'vscode';
-import { cloneSnapshot, MonitorSnapshot, MonitorStatus, WebviewOutgoing } from './types';
+import { cloneSnapshot, MonitorSnapshot, MonitorStatus, WebviewIncoming, WebviewOutgoing } from './types';
 import { getConversationWebviewHtml } from './webviewContent';
+
+function createEmptySnapshot(): MonitorSnapshot {
+  return {
+    app: 'unknown',
+    appLabel: 'VS Code',
+    sources: [],
+    analytics: {
+      today: { tokens: 0, costUsd: 0, prompts: 0, sessions: 0 },
+      week: { tokens: 0, costUsd: 0, prompts: 0, sessions: 0 },
+      month: { tokens: 0, costUsd: 0, prompts: 0, sessions: 0 },
+      byAgent: [],
+      byModel: [],
+      expensiveSessions: [],
+      expensivePrompts: [],
+      trend: [],
+      coach: [],
+    },
+    promptLibrary: [],
+    budgets: {
+      dailyCostUsd: null,
+      monthlyCostUsd: null,
+      dailyTokens: null,
+      monthlyTokens: null,
+    },
+    alerts: [],
+    generatedAt: Date.now(),
+  };
+}
 
 export class MonitorPanel implements vscode.Disposable {
   static readonly viewType = 'aiAgentMonitor.panel';
@@ -8,27 +36,31 @@ export class MonitorPanel implements vscode.Disposable {
 
   private readonly panel: vscode.WebviewPanel;
   private readonly disposables: vscode.Disposable[] = [];
+  private readonly messageHandler?: (message: WebviewIncoming) => void;
   private ready = false;
-  private currentSnapshot: MonitorSnapshot = {
-    app: 'unknown',
-    appLabel: 'AI Sidebar',
-    chats: [],
-  };
+  private currentSnapshot: MonitorSnapshot = createEmptySnapshot();
   private currentStatus: MonitorStatus = {
     status: 'monitoring',
-    text: 'Listening for AI conversations...',
+    text: 'Building the AI analytics dashboard...',
   };
 
-  private constructor(panel: vscode.WebviewPanel) {
+  private constructor(
+    panel: vscode.WebviewPanel,
+    messageHandler?: (message: WebviewIncoming) => void
+  ) {
     this.panel = panel;
-    this.panel.webview.html = getConversationWebviewHtml(this.panel.webview, 'AI Agent Monitor');
+    this.messageHandler = messageHandler;
+    this.panel.webview.html = getConversationWebviewHtml(this.panel.webview, 'AI Token Analytics');
 
     this.disposables.push(
-      this.panel.webview.onDidReceiveMessage((message) => {
+      this.panel.webview.onDidReceiveMessage((message: WebviewIncoming) => {
         if (message.command === 'ready') {
           this.ready = true;
           this.sync(this.currentSnapshot, this.currentStatus);
+          return;
         }
+
+        this.messageHandler?.(message);
       })
     );
 
@@ -40,7 +72,10 @@ export class MonitorPanel implements vscode.Disposable {
     );
   }
 
-  static createOrShow(extensionUri: vscode.Uri): MonitorPanel {
+  static createOrShow(
+    extensionUri: vscode.Uri,
+    messageHandler?: (message: WebviewIncoming) => void
+  ): MonitorPanel {
     const column = vscode.ViewColumn.Beside;
 
     if (MonitorPanel.instance) {
@@ -50,7 +85,7 @@ export class MonitorPanel implements vscode.Disposable {
 
     const panel = vscode.window.createWebviewPanel(
       MonitorPanel.viewType,
-      'AI Agent Monitor',
+      'AI Token Analytics',
       column,
       {
         enableScripts: true,
@@ -64,7 +99,7 @@ export class MonitorPanel implements vscode.Disposable {
       dark: vscode.Uri.joinPath(extensionUri, 'media', 'icon-dark.svg'),
     };
 
-    MonitorPanel.instance = new MonitorPanel(panel);
+    MonitorPanel.instance = new MonitorPanel(panel, messageHandler);
     return MonitorPanel.instance;
   }
 
@@ -90,8 +125,19 @@ export class MonitorPanel implements vscode.Disposable {
   clear(): void {
     this.currentSnapshot = {
       ...this.currentSnapshot,
-      chats: [],
-      selectedChatId: undefined,
+      sources: [],
+      activeChat: undefined,
+      analytics: {
+        ...this.currentSnapshot.analytics,
+        byAgent: [],
+        byModel: [],
+        expensiveSessions: [],
+        expensivePrompts: [],
+        trend: [],
+        coach: [],
+      },
+      alerts: [],
+      generatedAt: Date.now(),
     };
     this.postMessage({ command: 'clear' });
   }
