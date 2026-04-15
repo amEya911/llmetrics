@@ -1,11 +1,12 @@
-import { execFile } from 'child_process';
-import { promises as fs } from 'fs';
-import * as os from 'os';
-import * as path from 'path';
-import { promisify } from 'util';
 import * as vscode from 'vscode';
 import { ConversationStoreWatcher } from './ConversationStoreWatcher';
 import { buildDashboardSnapshot, createDefaultBudgets } from './dashboard';
+import {
+  buildAppStoragePathCandidates,
+  firstExistingPath,
+  formatError,
+  readMergedSqliteKeyMap,
+} from './stateSqlite';
 import {
   BLOCK_TYPES,
   BlockType,
@@ -25,8 +26,6 @@ import {
   SourceSnapshot,
   WebviewIncoming,
 } from './types';
-
-const execFileAsync = promisify(execFile);
 
 const PROMPT_LIBRARY_KEY = 'aiAgentMonitor.promptLibrary';
 const BUDGET_SETTINGS_KEY = 'aiAgentMonitor.budgetSettings';
@@ -100,7 +99,6 @@ export class AgentMonitor implements vscode.Disposable {
   private activeChatKey?: string;
   private activeChatEngagedAt = 0;
   private lastAlertIds = new Set<string>();
-  private cursorModelCache?: { state: CursorModelState; readAt: number };
 
   private readonly _onSnapshotChanged = new vscode.EventEmitter<MonitorSnapshot>();
   readonly onSnapshotChanged = this._onSnapshotChanged.event;
@@ -165,7 +163,6 @@ export class AgentMonitor implements vscode.Disposable {
     this.activeRuntimeTurnId = undefined;
     this.activeChatKey = undefined;
     this.activeChatEngagedAt = 0;
-    this.cursorModelCache = undefined;
 
     for (const sourceId of ['cursor', 'antigravity'] as const) {
       const previous = this.sourceAttention.get(sourceId);
@@ -343,20 +340,12 @@ export class AgentMonitor implements vscode.Disposable {
   }
 
   private async readCursorModelState(): Promise<CursorModelState> {
-    if (this.cursorModelCache && Date.now() - this.cursorModelCache.readAt < 2000) {
-      return this.cursorModelCache.state;
-    }
-
-    const dbPath = path.join(
-      os.homedir(),
-      'Library',
-      'Application Support',
-      'Cursor',
-      'User',
-      'globalStorage',
-      'state.vscdb'
+    const dbPath = await firstExistingPath(
+      buildAppStoragePathCandidates('Cursor', 'User', 'globalStorage', 'state.vscdb')
     );
-    const values = await readSqliteKeyMap(dbPath, [CURSOR_APP_STATE_KEY]);
+    const values = dbPath
+      ? await readMergedSqliteKeyMap(dbPath, [CURSOR_APP_STATE_KEY])
+      : {};
     const raw = values[CURSOR_APP_STATE_KEY];
 
     let state: CursorModelState = {
@@ -380,10 +369,6 @@ export class AgentMonitor implements vscode.Disposable {
       }
     }
 
-    this.cursorModelCache = {
-      state,
-      readAt: Date.now(),
-    };
     return state;
   }
 
@@ -859,79 +844,6 @@ function toFiniteNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value)
     ? value
     : undefined;
-}
-
-async function readSqliteKeyMap(
-  dbPath: string,
-  keys: string[]
-): Promise<Record<string, string>> {
-  if (keys.length === 0) {
-    return {};
-  }
-
-  for (const candidatePath of [dbPath, `${dbPath}.backup`]) {
-    if (!(await pathExists(candidatePath))) {
-      continue;
-    }
-
-    const result = await querySqliteKeyMap(candidatePath, keys);
-    if (Object.keys(result).length > 0) {
-      return result;
-    }
-  }
-
-  return {};
-}
-
-async function querySqliteKeyMap(
-  sourceDbPath: string,
-  keys: string[]
-): Promise<Record<string, string>> {
-  const tempDbPath = path.join(
-    os.tmpdir(),
-    `ai-token-analytics-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.sqlite`
-  );
-
-  try {
-    await fs.copyFile(sourceDbPath, tempDbPath);
-    const sql = `SELECT key, value FROM ItemTable WHERE key IN (${keys.map(quoteSqliteString).join(', ')})`;
-    const { stdout } = await execFileAsync('sqlite3', ['-json', tempDbPath, sql], {
-      maxBuffer: 8 * 1024 * 1024,
-    });
-
-    const rows = JSON.parse(stdout || '[]') as Array<{ key: string; value: string }>;
-    const map: Record<string, string> = {};
-    for (const row of rows) {
-      map[row.key] = row.value;
-    }
-
-    return map;
-  } catch {
-    return {};
-  } finally {
-    await fs.rm(tempDbPath, { force: true }).catch(() => undefined);
-  }
-}
-
-function quoteSqliteString(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
-}
-
-async function pathExists(targetPath: string): Promise<boolean> {
-  try {
-    await fs.access(targetPath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function formatError(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
-  }
-
-  return String(error);
 }
 
 function extractCollectionAttention(

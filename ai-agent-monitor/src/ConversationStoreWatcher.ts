@@ -1,10 +1,16 @@
-import { execFile } from 'child_process';
 import type { Dirent, Stats } from 'fs';
 import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { promisify } from 'util';
 import * as vscode from 'vscode';
+import {
+  buildAppStoragePathCandidates,
+  extractAntigravitySelectedModelName,
+  firstExistingPath,
+  formatError,
+  pathExists,
+  readMergedSqliteKeyMap,
+} from './stateSqlite';
 import {
   BlockType,
   ConversationChat,
@@ -12,16 +18,14 @@ import {
   ConversationSegment,
   ConversationTurn,
   HostApp,
+  ModelConfidence,
 } from './types';
-
-const execFileAsync = promisify(execFile);
-
-const POLL_INTERVAL_MS = 400;
 const STREAMING_GRACE_MS = 2500;
 const RECENT_LOOKBACK_MS = 35 * 24 * 60 * 60 * 1000;
 const MAX_CURSOR_TRANSCRIPTS = 240;
 const MAX_ANTIGRAVITY_CHATS = 240;
 const ANTIGRAVITY_NEW_CHAT_GRACE_MS = 35 * 24 * 60 * 60 * 1000;
+const REFRESH_DEBOUNCE_MS = 60;
 
 interface StoreWatcherCallbacks {
   onCollectionCaptured(collection: ConversationCollection): void;
@@ -73,12 +77,28 @@ interface AntigravityArtifact {
   createdAt: number;
 }
 
+interface WatchTarget {
+  basePath: string;
+  pattern: string;
+  label: string;
+}
+
+interface AntigravityState {
+  summaries: AntigravitySummaryEntry[];
+  selectedChatId?: string;
+  model?: string;
+  modelConfidence?: ModelConfidence;
+}
+
 export class ConversationStoreWatcher implements vscode.Disposable {
   private readonly callbacks: StoreWatcherCallbacks;
   private readonly output: vscode.OutputChannel;
   private readonly hostApp: HostApp;
   private readonly knownRoots = new Set<string>();
-  private timer?: NodeJS.Timeout;
+  private readonly fileWatchers: vscode.Disposable[] = [];
+  private refreshHandle?: NodeJS.Timeout;
+  private started = false;
+  private watchTargetFingerprint = '';
   private baselineFingerprint = '';
   private lastFingerprint = '';
   private resettingBaseline = false;
@@ -94,14 +114,13 @@ export class ConversationStoreWatcher implements vscode.Disposable {
   }
 
   start(): void {
-    if (this.timer) {
+    if (this.started) {
       return;
     }
 
-    void this.refresh();
-    this.timer = setInterval(() => {
-      void this.refresh();
-    }, POLL_INTERVAL_MS);
+    this.started = true;
+    void this.syncWatchers();
+    this.scheduleRefresh();
   }
 
   resetBaseline(): void {
@@ -109,9 +128,54 @@ export class ConversationStoreWatcher implements vscode.Disposable {
   }
 
   dispose(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = undefined;
+    if (this.refreshHandle) {
+      clearTimeout(this.refreshHandle);
+      this.refreshHandle = undefined;
+    }
+    this.watchTargetFingerprint = '';
+
+    while (this.fileWatchers.length > 0) {
+      this.fileWatchers.pop()?.dispose();
+    }
+  }
+
+  private scheduleRefresh(): void {
+    if (this.refreshHandle) {
+      clearTimeout(this.refreshHandle);
+    }
+
+    this.refreshHandle = setTimeout(() => {
+      this.refreshHandle = undefined;
+      void this.refresh();
+    }, REFRESH_DEBOUNCE_MS);
+  }
+
+  private async syncWatchers(): Promise<void> {
+    const targets = await this.getWatchTargets();
+    const fingerprint = JSON.stringify(targets);
+    if (fingerprint === this.watchTargetFingerprint) {
+      return;
+    }
+
+    this.watchTargetFingerprint = fingerprint;
+    while (this.fileWatchers.length > 0) {
+      this.fileWatchers.pop()?.dispose();
+    }
+
+    for (const target of targets) {
+      if (!(await pathExists(target.basePath))) {
+        continue;
+      }
+
+      const watcher = vscode.workspace.createFileSystemWatcher(
+        new vscode.RelativePattern(vscode.Uri.file(target.basePath), target.pattern)
+      );
+      const schedule = () => this.scheduleRefresh();
+      watcher.onDidCreate(schedule);
+      watcher.onDidChange(schedule);
+      watcher.onDidDelete(schedule);
+      this.fileWatchers.push(watcher);
+      this.logDiscoveredRoot(path.join(target.basePath, target.pattern), target.label);
     }
   }
 
@@ -135,6 +199,7 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     }
 
     try {
+      await this.syncWatchers();
       const collection = await this.collectCollection();
       const fingerprint = fingerprintCollection(collection);
 
@@ -159,6 +224,48 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       default:
         return { chats: [] };
     }
+  }
+
+  private async getWatchTargets(): Promise<WatchTarget[]> {
+    const workspacePaths = this.getWorkspacePaths();
+    const targets: WatchTarget[] = [];
+
+    if (this.hostApp === 'cursor') {
+      const globalDbPath = await firstExistingPath(
+        buildAppStoragePathCandidates('Cursor', 'User', 'globalStorage', 'state.vscdb')
+      );
+      if (globalDbPath) {
+        targets.push(...buildSqliteWatchTargets(globalDbPath, 'Cursor global state'));
+      }
+
+      const workspaceStorageDir = await findWorkspaceStorageDir('Cursor', workspacePaths);
+      if (workspaceStorageDir) {
+        targets.push(...buildSqliteWatchTargets(path.join(workspaceStorageDir, 'state.vscdb'), 'Cursor workspace state'));
+      }
+
+      for (const transcriptRoot of this.getCursorTranscriptRoots(workspacePaths)) {
+        targets.push(...buildRecursiveWatchTargets(transcriptRoot, 'Cursor transcripts'));
+      }
+    }
+
+    if (this.hostApp === 'antigravity') {
+      const globalDbPath = await firstExistingPath(
+        buildAppStoragePathCandidates('Antigravity', 'User', 'globalStorage', 'state.vscdb')
+      );
+      if (globalDbPath) {
+        targets.push(...buildSqliteWatchTargets(globalDbPath, 'Antigravity global state'));
+      }
+
+      const workspaceStorageDir = await findWorkspaceStorageDir('Antigravity', workspacePaths);
+      if (workspaceStorageDir) {
+        targets.push(...buildSqliteWatchTargets(path.join(workspaceStorageDir, 'state.vscdb'), 'Antigravity workspace state'));
+      }
+
+      const brainRoot = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
+      targets.push(...buildRecursiveWatchTargets(brainRoot, 'Antigravity brain artifacts'));
+    }
+
+    return dedupeWatchTargets(targets);
   }
 
   private async collectCursorCollection(): Promise<ConversationCollection> {
@@ -253,84 +360,54 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       return { chats: [] };
     }
 
-    const globalDbPath = path.join(
-      os.homedir(),
-      'Library',
-      'Application Support',
-      'Antigravity',
-      'User',
-      'globalStorage',
-      'state.vscdb'
-    );
-    const workspaceStorageDir = await findWorkspaceStorageDir('Antigravity', workspacePaths);
-    const workspaceDbPath = workspaceStorageDir
-      ? path.join(workspaceStorageDir, 'state.vscdb')
-      : undefined;
-
-    if (workspaceDbPath) {
-      this.logDiscoveredRoot(workspaceDbPath, 'Antigravity workspace state');
-    }
-    this.logDiscoveredRoot(globalDbPath, 'Antigravity global state');
-
-    const globalValuesPromise = readSqliteKeyMap(
-      globalDbPath,
-      ['antigravityUnifiedStateSync.trajectorySummaries']
-    );
-    const workspaceValuesPromise: Promise<Record<string, string>> = workspaceDbPath
-      ? readSqliteKeyMap(workspaceDbPath, ['memento/antigravity.jetskiArtifactsEditor'])
-      : Promise.resolve({});
-
-    const [globalValues, workspaceValues] = await Promise.all([
-      globalValuesPromise,
-      workspaceValuesPromise,
-    ]);
-
-    const summaryEntries = parseAntigravitySummaryEntries(
-      globalValues['antigravityUnifiedStateSync.trajectorySummaries'],
-      workspacePaths
-    );
-    const summaries = new Map(summaryEntries.map((summary) => [summary.id, summary]));
+    const antigravityState = await this.readAntigravityState(workspacePaths);
+    const summaries = new Map(antigravityState.summaries.map((summary) => [summary.id, summary]));
     const brainRoot = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
-    const chats = await this.collectAntigravityBrainChats(brainRoot, summaries);
+    const chats = (await this.collectAntigravityBrainChats(brainRoot, summaries))
+      .map((chat) => ({
+        ...chat,
+        model: antigravityState.model ?? chat.model,
+        modelConfidence: antigravityState.model
+          ? antigravityState.modelConfidence ?? chat.modelConfidence ?? 'inferred'
+          : chat.modelConfidence,
+      }));
 
-    if (chats.length === 0 && summaryEntries.length > 0) {
+    if (chats.length === 0 && antigravityState.summaries.length > 0) {
       const fallbackChats = await Promise.all(
-        summaryEntries.map(async (summary, index) => this.parseAntigravitySummaryChat(summary, index))
+        antigravityState.summaries.map(async (summary, index) => {
+          const chat = await this.parseAntigravitySummaryChat(summary, index);
+          return {
+            ...chat,
+            model: antigravityState.model ?? chat.model,
+            modelConfidence: antigravityState.model
+              ? antigravityState.modelConfidence ?? chat.modelConfidence ?? 'inferred'
+              : chat.modelConfidence,
+          };
+        })
       );
       return {
         chats: fallbackChats,
-        selectedChatId: parseAntigravitySelectedChatId(
-          workspaceValues['memento/antigravity.jetskiArtifactsEditor'],
-          summaryEntries
-        ) ?? fallbackChats[0]?.id,
+        selectedChatId: antigravityState.selectedChatId ?? fallbackChats[0]?.id,
       };
     }
 
-    const selectedChatId = parseAntigravitySelectedChatId(
-      workspaceValues['memento/antigravity.jetskiArtifactsEditor'],
-      summaryEntries
-    );
-
     return {
       chats,
-      selectedChatId: selectedChatId ?? chats[0]?.id,
+      selectedChatId: antigravityState.selectedChatId ?? chats[0]?.id,
     };
   }
 
   private async readCursorComposerHeaders(workspacePaths: string[]): Promise<Map<string, CursorComposerHeader>> {
-    const dbPath = path.join(
-      os.homedir(),
-      'Library',
-      'Application Support',
-      'Cursor',
-      'User',
-      'globalStorage',
-      'state.vscdb'
+    const dbPath = await firstExistingPath(
+      buildAppStoragePathCandidates('Cursor', 'User', 'globalStorage', 'state.vscdb')
     );
+    if (!dbPath) {
+      return new Map();
+    }
 
     this.logDiscoveredRoot(dbPath, 'Cursor global state');
 
-    const values = await readSqliteKeyMap(dbPath, ['composer.composerHeaders']);
+    const values = await readMergedSqliteKeyMap(dbPath, ['composer.composerHeaders']);
     const raw = values['composer.composerHeaders'];
     if (!raw) {
       return new Map();
@@ -374,7 +451,7 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     const dbPath = path.join(workspaceStorageDir, 'state.vscdb');
     this.logDiscoveredRoot(dbPath, 'Cursor workspace state');
 
-    const values = await readSqliteKeyMap(dbPath, ['composer.composerData']);
+    const values = await readMergedSqliteKeyMap(dbPath, ['composer.composerData']);
     const raw = values['composer.composerData'];
     if (!raw) {
       return {
@@ -396,6 +473,59 @@ export class ConversationStoreWatcher implements vscode.Disposable {
         lastFocusedComposerIds: [],
       };
     }
+  }
+
+  private async readAntigravityState(workspacePaths: string[]): Promise<AntigravityState> {
+    const globalDbPath = await firstExistingPath(
+      buildAppStoragePathCandidates('Antigravity', 'User', 'globalStorage', 'state.vscdb')
+    );
+    const workspaceStorageDir = await findWorkspaceStorageDir('Antigravity', workspacePaths);
+    const workspaceDbPath = workspaceStorageDir
+      ? path.join(workspaceStorageDir, 'state.vscdb')
+      : undefined;
+
+    if (globalDbPath) {
+      this.logDiscoveredRoot(globalDbPath, 'Antigravity global state');
+    }
+    if (workspaceDbPath) {
+      this.logDiscoveredRoot(workspaceDbPath, 'Antigravity workspace state');
+    }
+
+    const globalValuesPromise: Promise<Record<string, string>> = globalDbPath
+      ? readMergedSqliteKeyMap(globalDbPath, [
+          'antigravityUnifiedStateSync.trajectorySummaries',
+          'antigravityUnifiedStateSync.modelPreferences',
+          'antigravityUnifiedStateSync.userStatus',
+        ])
+      : Promise.resolve({});
+    const workspaceValuesPromise: Promise<Record<string, string>> = workspaceDbPath
+      ? readMergedSqliteKeyMap(workspaceDbPath, ['memento/antigravity.jetskiArtifactsEditor'])
+      : Promise.resolve({});
+
+    const [globalValues, workspaceValues] = await Promise.all([
+      globalValuesPromise,
+      workspaceValuesPromise,
+    ]);
+
+    const summaries = parseAntigravitySummaryEntries(
+      globalValues['antigravityUnifiedStateSync.trajectorySummaries'],
+      workspacePaths
+    );
+    const selectedChatId = parseAntigravitySelectedChatId(
+      workspaceValues['memento/antigravity.jetskiArtifactsEditor'],
+      summaries
+    ) ?? summaries[0]?.id;
+    const model = extractAntigravitySelectedModelName(
+      globalValues['antigravityUnifiedStateSync.modelPreferences'],
+      globalValues['antigravityUnifiedStateSync.userStatus']
+    );
+
+    return {
+      summaries,
+      selectedChatId,
+      model,
+      modelConfidence: model ? 'exact' : 'unknown',
+    };
   }
 
   private getCursorTranscriptRoots(workspacePaths: string[]): string[] {
@@ -1041,99 +1171,82 @@ async function findWorkspaceStorageDir(
   appName: 'Cursor' | 'Antigravity',
   workspacePaths: string[]
 ): Promise<string | undefined> {
-  const root = path.join(
-    os.homedir(),
-    'Library',
-    'Application Support',
-    appName,
-    'User',
-    'workspaceStorage'
-  );
+  const roots = buildAppStoragePathCandidates(appName, 'User', 'workspaceStorage');
 
-  const entries = await readDirSafe(root);
-  for (const entry of entries) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-
-    const workspaceJsonPath = path.join(root, entry.name, 'workspace.json');
-    const raw = await safeReadFile(workspaceJsonPath);
-    if (!raw) {
-      continue;
-    }
-
-    try {
-      const parsed = JSON.parse(raw) as { folder?: string };
-      const workspacePath = normalizeFsPath(fileUriToFsPath(parsed.folder ?? ''));
-      if (!workspacePath) {
+  for (const root of roots) {
+    const entries = await readDirSafe(root);
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
         continue;
       }
 
-      if (workspacePaths.some((candidate) => pathsEqual(candidate, workspacePath))) {
-        return path.join(root, entry.name);
+      const workspaceJsonPath = path.join(root, entry.name, 'workspace.json');
+      const raw = await safeReadFile(workspaceJsonPath);
+      if (!raw) {
+        continue;
       }
-    } catch {
-      // Ignore malformed workspace storage descriptors.
+
+      try {
+        const parsed = JSON.parse(raw) as { folder?: string };
+        const workspacePath = normalizeFsPath(fileUriToFsPath(parsed.folder ?? ''));
+        if (!workspacePath) {
+          continue;
+        }
+
+        if (workspacePaths.some((candidate) => pathsEqual(candidate, workspacePath))) {
+          return path.join(root, entry.name);
+        }
+      } catch {
+        // Ignore malformed workspace storage descriptors.
+      }
     }
   }
 
   return undefined;
 }
 
-async function readSqliteKeyMap(
-  dbPath: string,
-  keys: string[]
-): Promise<Record<string, string>> {
-  if (keys.length === 0) {
-    return {};
-  }
-
-  for (const candidatePath of [dbPath, `${dbPath}.backup`]) {
-    if (!(await pathExists(candidatePath))) {
-      continue;
-    }
-
-    const result = await querySqliteKeyMap(candidatePath, keys);
-    if (Object.keys(result).length > 0) {
-      return result;
-    }
-  }
-
-  return {};
+function buildSqliteWatchTargets(dbPath: string, label: string): WatchTarget[] {
+  const basePath = path.dirname(dbPath);
+  return [
+    {
+      basePath,
+      pattern: path.basename(dbPath),
+      label,
+    },
+    {
+      basePath,
+      pattern: `${path.basename(dbPath)}-wal`,
+      label,
+    },
+  ];
 }
 
-async function querySqliteKeyMap(
-  sourceDbPath: string,
-  keys: string[]
-): Promise<Record<string, string>> {
-  const tempDbPath = path.join(
-    os.tmpdir(),
-    `ai-agent-monitor-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.sqlite`
-  );
-
-  try {
-    await fs.copyFile(sourceDbPath, tempDbPath);
-    const sql = `SELECT key, value FROM ItemTable WHERE key IN (${keys.map(quoteSqliteString).join(', ')})`;
-    const { stdout } = await execFileAsync('sqlite3', ['-json', tempDbPath, sql], {
-      maxBuffer: 8 * 1024 * 1024,
-    });
-
-    const rows = JSON.parse(stdout || '[]') as Array<{ key: string; value: string }>;
-    const map: Record<string, string> = {};
-    for (const row of rows) {
-      map[row.key] = row.value;
-    }
-
-    return map;
-  } catch {
-    return {};
-  } finally {
-    await fs.rm(tempDbPath, { force: true }).catch(() => undefined);
-  }
+function buildRecursiveWatchTargets(targetPath: string, label: string): WatchTarget[] {
+  return [
+    {
+      basePath: targetPath,
+      pattern: '**/*',
+      label,
+    },
+    {
+      basePath: path.dirname(targetPath),
+      pattern: `${path.basename(targetPath)}/**/*`,
+      label,
+    },
+  ];
 }
 
-function quoteSqliteString(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
+function dedupeWatchTargets(targets: WatchTarget[]): WatchTarget[] {
+  const seen = new Set<string>();
+  return targets.filter((target) => {
+    const key = `${target.basePath}:${target.pattern}`;
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
 }
 
 function quoteJson(value: unknown): string {
@@ -1457,15 +1570,6 @@ function looksLikeEncodedBlob(value: string): boolean {
   return /^[A-Za-z0-9+/=]+$/.test(value) && !value.includes(' ') && value.length > 12;
 }
 
-async function pathExists(targetPath: string): Promise<boolean> {
-  try {
-    await fs.access(targetPath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function safeReadFile(filePath: string): Promise<string | undefined> {
   try {
     return await fs.readFile(filePath, 'utf8');
@@ -1488,8 +1592,4 @@ async function safeStat(targetPath: string): Promise<Stats | undefined> {
   } catch {
     return undefined;
   }
-}
-
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
