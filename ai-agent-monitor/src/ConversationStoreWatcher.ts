@@ -26,6 +26,7 @@ const MAX_CURSOR_TRANSCRIPTS = 240;
 const MAX_ANTIGRAVITY_CHATS = 240;
 const ANTIGRAVITY_NEW_CHAT_GRACE_MS = 35 * 24 * 60 * 60 * 1000;
 const REFRESH_DEBOUNCE_MS = 60;
+const ANTIGRAVITY_POLL_INTERVAL_MS = 3000;
 
 interface StoreWatcherCallbacks {
   onCollectionCaptured(collection: ConversationCollection): void;
@@ -66,6 +67,7 @@ interface AntigravityArtifactMetadata {
   artifactType?: string;
   summary?: string;
   updatedAt?: string;
+  version?: string;
 }
 
 interface AntigravityArtifact {
@@ -75,6 +77,8 @@ interface AntigravityArtifact {
   summary?: string;
   updatedAt: number;
   createdAt: number;
+  revision: number;
+  isCurrentRevision: boolean;
 }
 
 interface WatchTarget {
@@ -97,6 +101,7 @@ export class ConversationStoreWatcher implements vscode.Disposable {
   private readonly knownRoots = new Set<string>();
   private readonly fileWatchers: vscode.Disposable[] = [];
   private refreshHandle?: NodeJS.Timeout;
+  private pollHandle?: NodeJS.Timeout;
   private started = false;
   private watchTargetFingerprint = '';
   private baselineFingerprint = '';
@@ -121,6 +126,10 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     this.started = true;
     void this.syncWatchers();
     this.scheduleRefresh();
+
+    if (this.hostApp === 'antigravity') {
+      this.pollHandle = setInterval(() => this.scheduleRefresh(), ANTIGRAVITY_POLL_INTERVAL_MS);
+    }
   }
 
   resetBaseline(): void {
@@ -131,6 +140,10 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     if (this.refreshHandle) {
       clearTimeout(this.refreshHandle);
       this.refreshHandle = undefined;
+    }
+    if (this.pollHandle) {
+      clearInterval(this.pollHandle);
+      this.pollHandle = undefined;
     }
     this.watchTargetFingerprint = '';
 
@@ -256,9 +269,9 @@ export class ConversationStoreWatcher implements vscode.Disposable {
         targets.push(...buildSqliteWatchTargets(globalDbPath, 'Antigravity global state'));
       }
 
-      const workspaceStorageDir = await findWorkspaceStorageDir('Antigravity', workspacePaths);
-      if (workspaceStorageDir) {
-        targets.push(...buildSqliteWatchTargets(path.join(workspaceStorageDir, 'state.vscdb'), 'Antigravity workspace state'));
+      const workspaceDbPaths = await this.getAntigravityWorkspaceDbPaths(workspacePaths);
+      for (const workspaceDbPath of workspaceDbPaths) {
+        targets.push(...buildSqliteWatchTargets(workspaceDbPath, 'Antigravity workspace state'));
       }
 
       const brainRoot = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
@@ -356,21 +369,24 @@ export class ConversationStoreWatcher implements vscode.Disposable {
 
   private async collectAntigravityCollection(): Promise<ConversationCollection> {
     const workspacePaths = this.getWorkspacePaths();
-    if (workspacePaths.length === 0) {
-      return { chats: [] };
-    }
 
     const antigravityState = await this.readAntigravityState(workspacePaths);
     const summaries = new Map(antigravityState.summaries.map((summary) => [summary.id, summary]));
     const brainRoot = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
-    const chats = (await this.collectAntigravityBrainChats(brainRoot, summaries))
+    const chats = (await this.collectAntigravityBrainChats(brainRoot, summaries, antigravityState.selectedChatId))
       .map((chat) => ({
         ...chat,
         model: antigravityState.model ?? chat.model,
         modelConfidence: antigravityState.model
           ? antigravityState.modelConfidence ?? chat.modelConfidence ?? 'inferred'
           : chat.modelConfidence,
-      }));
+          }));
+
+    const resolvedSelectedChatId = resolveAntigravityActiveChatId(
+      chats,
+      antigravityState.selectedChatId,
+      summaries,
+    );
 
     if (chats.length === 0 && antigravityState.summaries.length > 0) {
       const fallbackChats = await Promise.all(
@@ -387,13 +403,17 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       );
       return {
         chats: fallbackChats,
-        selectedChatId: antigravityState.selectedChatId ?? fallbackChats[0]?.id,
+        selectedChatId: resolveAntigravityActiveChatId(
+          fallbackChats,
+          antigravityState.selectedChatId,
+          summaries,
+        ) ?? fallbackChats[0]?.id,
       };
     }
 
     return {
       chats,
-      selectedChatId: antigravityState.selectedChatId ?? chats[0]?.id,
+      selectedChatId: resolvedSelectedChatId ?? chats[0]?.id,
     };
   }
 
@@ -479,45 +499,64 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     const globalDbPath = await firstExistingPath(
       buildAppStoragePathCandidates('Antigravity', 'User', 'globalStorage', 'state.vscdb')
     );
-    const workspaceStorageDir = await findWorkspaceStorageDir('Antigravity', workspacePaths);
-    const workspaceDbPath = workspaceStorageDir
-      ? path.join(workspaceStorageDir, 'state.vscdb')
+    const preferredWorkspaceStorageDir = workspacePaths.length > 0
+      ? await findWorkspaceStorageDir('Antigravity', workspacePaths)
       : undefined;
+    const preferredWorkspaceDbPath = preferredWorkspaceStorageDir
+      ? path.join(preferredWorkspaceStorageDir, 'state.vscdb')
+      : undefined;
+    const workspaceDbPaths = await this.getAntigravityWorkspaceDbPaths(workspacePaths);
 
     if (globalDbPath) {
       this.logDiscoveredRoot(globalDbPath, 'Antigravity global state');
     }
-    if (workspaceDbPath) {
+    for (const workspaceDbPath of workspaceDbPaths) {
       this.logDiscoveredRoot(workspaceDbPath, 'Antigravity workspace state');
     }
 
     const globalValuesPromise: Promise<Record<string, string>> = globalDbPath
       ? readMergedSqliteKeyMap(globalDbPath, [
-          'antigravityUnifiedStateSync.trajectorySummaries',
-          'antigravityUnifiedStateSync.modelPreferences',
-          'antigravityUnifiedStateSync.userStatus',
-        ])
+        'antigravityUnifiedStateSync.trajectorySummaries',
+        'antigravityUnifiedStateSync.modelPreferences',
+        'antigravityUnifiedStateSync.userStatus',
+      ])
       : Promise.resolve({});
-    const workspaceValuesPromise: Promise<Record<string, string>> = workspaceDbPath
-      ? readMergedSqliteKeyMap(workspaceDbPath, ['memento/antigravity.jetskiArtifactsEditor'])
-      : Promise.resolve({});
+    const workspaceValuesPromise = Promise.all(
+      workspaceDbPaths.map(async (workspaceDbPath) => {
+        const values = await readMergedSqliteKeyMap(workspaceDbPath, ['memento/antigravity.jetskiArtifactsEditor']);
+        return {
+          dbPath: workspaceDbPath,
+          rawValue: values['memento/antigravity.jetskiArtifactsEditor'],
+          updatedAt: await latestSqliteWriteMs(workspaceDbPath),
+        };
+      })
+    );
 
-    const [globalValues, workspaceValues] = await Promise.all([
+    const [globalValues, workspaceSelections] = await Promise.all([
       globalValuesPromise,
       workspaceValuesPromise,
     ]);
+    const liveUserStatus = await getLiveAntigravityUserStatus();
+
+    const preferredWorkspaceSelection = workspaceSelections.find((selection) =>
+      Boolean(selection.rawValue)
+      && preferredWorkspaceDbPath
+      && pathsEqual(selection.dbPath, preferredWorkspaceDbPath)
+    );
+    const freshestWorkspaceSelection = workspaceSelections
+      .filter((selection) => Boolean(selection.rawValue))
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+    const jetskiRaw = preferredWorkspaceSelection?.rawValue ?? freshestWorkspaceSelection?.rawValue;
 
     const summaries = parseAntigravitySummaryEntries(
       globalValues['antigravityUnifiedStateSync.trajectorySummaries'],
       workspacePaths
     );
-    const selectedChatId = parseAntigravitySelectedChatId(
-      workspaceValues['memento/antigravity.jetskiArtifactsEditor'],
-      summaries
-    ) ?? summaries[0]?.id;
+    const selectedChatId = parseAntigravitySelectedChatId(jetskiRaw)
+      ?? summaries[0]?.id;
     const model = extractAntigravitySelectedModelName(
       globalValues['antigravityUnifiedStateSync.modelPreferences'],
-      globalValues['antigravityUnifiedStateSync.userStatus']
+      liveUserStatus ?? globalValues['antigravityUnifiedStateSync.userStatus']
     );
 
     return {
@@ -526,6 +565,54 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       model,
       modelConfidence: model ? 'exact' : 'unknown',
     };
+  }
+
+  private async getAntigravityWorkspaceDbPaths(workspacePaths: string[]): Promise<string[]> {
+    const orderedPaths: string[] = [];
+    const seen = new Set<string>();
+
+    const pushDbPath = (dbPath?: string) => {
+      if (!dbPath) {
+        return;
+      }
+
+      const normalized = normalizeFsPath(dbPath);
+      if (!normalized || seen.has(normalized)) {
+        return;
+      }
+
+      seen.add(normalized);
+      orderedPaths.push(normalized);
+    };
+
+    if (workspacePaths.length > 0) {
+      const matchedWorkspaceStorageDir = await findWorkspaceStorageDir('Antigravity', workspacePaths);
+      pushDbPath(matchedWorkspaceStorageDir
+        ? path.join(matchedWorkspaceStorageDir, 'state.vscdb')
+        : undefined);
+    }
+
+    const roots = buildAppStoragePathCandidates('Antigravity', 'User', 'workspaceStorage');
+
+    for (const root of roots) {
+      if (!(await pathExists(root))) {
+        continue;
+      }
+
+      const entries = await readDirSafe(root);
+      for (const entry of entries) {
+        if (!entry.isDirectory()) {
+          continue;
+        }
+
+        const dbPath = path.join(root, entry.name, 'state.vscdb');
+        if (await pathExists(dbPath)) {
+          pushDbPath(dbPath);
+        }
+      }
+    }
+
+    return orderedPaths;
   }
 
   private getCursorTranscriptRoots(workspacePaths: string[]): string[] {
@@ -714,7 +801,8 @@ export class ConversationStoreWatcher implements vscode.Disposable {
 
   private async collectAntigravityBrainChats(
     brainRoot: string,
-    summaries: ReadonlyMap<string, AntigravitySummaryEntry>
+    summaries: ReadonlyMap<string, AntigravitySummaryEntry>,
+    selectedChatId?: string
   ): Promise<ConversationChat[]> {
     if (!(await pathExists(brainRoot))) {
       return [];
@@ -740,6 +828,10 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     const summaryIds = new Set(summaries.keys());
     const included = candidates
       .filter((candidate) => {
+        if (selectedChatId && candidate.id === selectedChatId) {
+          return true;
+        }
+
         if (summaryIds.size === 0) {
           return true;
         }
@@ -777,28 +869,23 @@ export class ConversationStoreWatcher implements vscode.Disposable {
   ): Promise<ConversationChat | undefined> {
     const artifacts = await loadAntigravityArtifacts(dirPath);
     const directoryStats = await safeStat(dirPath);
-    const userArtifact = pickAntigravityArtifact(artifacts, 'user-input');
-    const thinkingArtifact = pickAntigravityArtifact(artifacts, 'agent-thinking');
-    const outputArtifact = pickAntigravityArtifact(artifacts, 'agent-output');
-
-    const userInput = normalizeBrainContent(userArtifact?.content);
-    const thinking = normalizeBrainContent(thinkingArtifact?.content);
-    const output = normalizeBrainContent(outputArtifact?.content);
-
     const artifactTimestamps = artifacts.map((artifact) => artifact.updatedAt);
-    const updatedAt = Math.max(
-      directoryStats?.mtimeMs ?? 0,
+    const updatedAtCandidates = [
+      directoryStats?.mtimeMs,
       ...artifactTimestamps,
-      Date.now() - index
-    );
+    ].filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+    const updatedAt = updatedAtCandidates.length > 0
+      ? Math.max(...updatedAtCandidates)
+      : Date.now() - index;
     const createdAtCandidates = [
       directoryStats?.birthtimeMs,
       directoryStats?.mtimeMs,
       ...artifacts.map((artifact) => artifact.createdAt),
     ].filter((value): value is number => typeof value === 'number');
     const createdAt = createdAtCandidates.length > 0 ? Math.min(...createdAtCandidates) : updatedAt;
+    const turns = this.buildAntigravityTurns(summary, artifacts);
 
-    if (!userInput && !thinking && !output) {
+    if (turns.length === 0) {
       return {
         id: summary.id,
         title: summary.title || 'New chat',
@@ -811,7 +898,65 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       };
     }
 
-    const turn = this.createTurn(
+    const latestTurn = turns[turns.length - 1];
+    const latestOutput = latestTurn?.blocks['agent-output'].content;
+    const latestThinking = latestTurn?.blocks['agent-thinking'].content;
+    const latestUserInput = latestTurn?.blocks['user-input'].content;
+
+    const title = normalizeTitle(summary.title)
+      || extractAntigravityTitle(latestUserInput)
+      || extractAntigravityTitle(latestOutput)
+      || artifacts.map((artifact) => artifact.summary).find((value): value is string => Boolean(normalizeTitle(value)))
+      || 'Untitled chat';
+    const subtitle = normalizeSubtitle(summary.subtitle)
+      || artifacts.map((artifact) => normalizeSubtitle(artifact.summary)).find((value): value is string => Boolean(value))
+      || snippetForSubtitle(latestOutput)
+      || snippetForSubtitle(latestThinking)
+      || snippetForSubtitle(latestUserInput);
+
+    return {
+      id: summary.id,
+      title,
+      subtitle,
+      createdAt: createdAt - index,
+      updatedAt: updatedAt - index,
+      turns,
+      sourceId: 'antigravity',
+      sourceLabel: 'Antigravity',
+    };
+  }
+
+  private buildAntigravityTurns(
+    summary: AntigravitySummaryEntry,
+    artifacts: AntigravityArtifact[]
+  ): ConversationTurn[] {
+    const userArtifact = pickAntigravityArtifact(artifacts, 'user-input');
+    const thinkingArtifact = pickAntigravityArtifact(artifacts, 'agent-thinking');
+    const outputArtifact = pickAntigravityArtifact(artifacts, 'agent-output');
+
+    const userInput = normalizeBrainContent(userArtifact?.content);
+    const thinking = normalizeBrainContent(thinkingArtifact?.content);
+    const output = normalizeBrainContent(outputArtifact?.content);
+
+    if (!userInput && !thinking && !output) {
+      return [];
+    }
+
+    const createdAtCandidates = [
+      userArtifact?.createdAt,
+      thinkingArtifact?.createdAt,
+      outputArtifact?.createdAt,
+    ].filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+    const updatedAt = Math.max(
+      userArtifact?.updatedAt ?? 0,
+      thinkingArtifact?.updatedAt ?? 0,
+      outputArtifact?.updatedAt ?? 0
+    );
+    const createdAt = createdAtCandidates.length > 0
+      ? Math.min(...createdAtCandidates)
+      : updatedAt;
+
+    return [this.createTurn(
       `${summary.id}:turn:1`,
       {
         'user-input': {
@@ -829,29 +974,7 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       },
       createdAt,
       updatedAt
-    );
-
-    const title = normalizeTitle(summary.title)
-      || extractAntigravityTitle(userInput)
-      || extractAntigravityTitle(output)
-      || artifacts.map((artifact) => artifact.summary).find((value): value is string => Boolean(normalizeTitle(value)))
-      || 'Untitled chat';
-    const subtitle = normalizeSubtitle(summary.subtitle)
-      || artifacts.map((artifact) => normalizeSubtitle(artifact.summary)).find((value): value is string => Boolean(value))
-      || snippetForSubtitle(output)
-      || snippetForSubtitle(thinking)
-      || snippetForSubtitle(userInput);
-
-    return {
-      id: summary.id,
-      title,
-      subtitle,
-      createdAt: createdAt - index,
-      updatedAt: updatedAt - index,
-      turns: [turn],
-      sourceId: 'antigravity',
-      sourceLabel: 'Antigravity',
-    };
+    )];
   }
 
   private createTurnFromMessages(
@@ -954,15 +1077,17 @@ function parseAntigravitySummaryEntries(
     const chunk = decoded.slice(start, end);
     const segments = extractReadableSegments(chunk);
 
-    const belongsToWorkspace = segments.some((segment) =>
-      workspaceNeedles.some((needle) => segment.includes(needle))
-    );
+    if (workspaceNeedles.length > 0) {
+      const belongsToWorkspace = segments.some((segment) =>
+        workspaceNeedles.some((needle) => segment.includes(needle))
+      );
 
-    if (!belongsToWorkspace) {
-      return;
+      if (!belongsToWorkspace) {
+        return;
+      }
     }
 
-    const title = pickAntigravityTitle(segments) ?? `Chat ${entries.length + 1}`;
+    const title = pickAntigravityTitle(segments) ?? 'New chat';
     const subtitle = pickAntigravitySubtitle(segments, title);
 
     entries.push({
@@ -973,21 +1098,17 @@ function parseAntigravitySummaryEntries(
     });
   });
 
+  if (entries.length === 0 && workspaceNeedles.length > 0) {
+    return parseAntigravitySummaryEntries(encodedValue, []);
+  }
+
   return entries;
 }
 
 function pickAntigravityTitle(segments: string[]): string | undefined {
   const candidates = segments
     .map((segment) => stripDecoration(segment))
-    .filter((segment) => {
-      return Boolean(segment) &&
-        segment.length <= 160 &&
-        /[A-Za-z]/.test(segment) &&
-        !looksLikeFileUri(segment) &&
-        !looksLikeUuid(segment) &&
-        !looksLikeInternalMarker(segment) &&
-        !looksLikeEncodedBlob(segment);
-    });
+    .filter(isPlausibleAntigravitySummaryText);
 
   return candidates.find((segment) => segment.length >= 4 || /\s/.test(segment))
     ?? candidates.find((segment) => segment.length >= 2);
@@ -1000,14 +1121,9 @@ function pickAntigravitySubtitle(
   const candidates = segments
     .map((segment) => stripDecoration(segment))
     .filter((segment) => {
-      return Boolean(segment) &&
+      return isPlausibleAntigravitySummaryText(segment) &&
         segment !== title &&
-        segment.length <= 180 &&
-        /[A-Za-z]/.test(segment) &&
-        !looksLikeFileUri(segment) &&
-        !looksLikeUuid(segment) &&
-        !looksLikeInternalMarker(segment) &&
-        !looksLikeEncodedBlob(segment);
+        segment.length <= 180;
     });
 
   return candidates.find((segment) => segment.length >= 10 || /\s/.test(segment))
@@ -1044,8 +1160,7 @@ function extractPrintableRuns(value: string): string[] {
 }
 
 function parseAntigravitySelectedChatId(
-  rawValue: string | undefined,
-  summaries: AntigravitySummaryEntry[]
+  rawValue: string | undefined
 ): string | undefined {
   if (!rawValue) {
     return undefined;
@@ -1065,7 +1180,7 @@ function parseAntigravitySelectedChatId(
       return undefined;
     }
 
-    return summaries.some((summary) => summary.id === match[1]) ? match[1] : undefined;
+    return match[1];
   } catch {
     return undefined;
   }
@@ -1320,21 +1435,30 @@ async function loadAntigravityArtifacts(dirPath: string): Promise<AntigravityArt
       const contentCandidates = await Promise.all(
         group.contentPaths.map(async (filePath) => ({
           filePath,
+          fileName: path.basename(filePath),
           stats: await safeStat(filePath),
         }))
       );
-      contentCandidates.sort((left, right) => (right.stats?.mtimeMs ?? 0) - (left.stats?.mtimeMs ?? 0));
+      const metadata = await loadAntigravityArtifactMetadata(group.metadataPath);
+      const currentRevision = resolveCurrentAntigravityArtifactRevision(contentCandidates, metadata);
+      const currentCandidates = contentCandidates
+        .filter((candidate) =>
+          resolveAntigravityArtifactRevision(candidate.fileName, metadata, currentRevision) === currentRevision
+        )
+        .sort((left, right) => {
+          const mtimeDiff = (right.stats?.mtimeMs ?? 0) - (left.stats?.mtimeMs ?? 0);
+          if (mtimeDiff !== 0) {
+            return mtimeDiff;
+          }
 
-      const latest = contentCandidates[0];
-      if (!latest) {
+          return antigravityResolvedVariantPriority(right.fileName) - antigravityResolvedVariantPriority(left.fileName);
+        });
+      const currentCandidate = currentCandidates[0];
+      if (!currentCandidate) {
         return undefined;
       }
 
-      const [content, metadata] = await Promise.all([
-        safeReadFile(latest.filePath),
-        loadAntigravityArtifactMetadata(group.metadataPath),
-      ]);
-
+      const content = await safeReadFile(currentCandidate.filePath);
       const normalizedContent = normalizeBrainContent(content);
       if (!normalizedContent && !normalizeSubtitle(metadata?.summary ?? '')) {
         return undefined;
@@ -1342,10 +1466,10 @@ async function loadAntigravityArtifacts(dirPath: string): Promise<AntigravityArt
 
       const metadataUpdatedAt = metadata?.updatedAt ? Date.parse(metadata.updatedAt) : NaN;
       const updatedAt = Math.max(
-        latest.stats?.mtimeMs ?? 0,
+        currentCandidate.stats?.mtimeMs ?? 0,
         Number.isFinite(metadataUpdatedAt) ? metadataUpdatedAt : 0
       );
-      const createdAt = latest.stats?.birthtimeMs ?? latest.stats?.mtimeMs ?? updatedAt;
+      const createdAt = currentCandidate.stats?.birthtimeMs ?? currentCandidate.stats?.mtimeMs ?? updatedAt;
 
       const artifact: AntigravityArtifact = {
         baseName,
@@ -1354,6 +1478,8 @@ async function loadAntigravityArtifacts(dirPath: string): Promise<AntigravityArt
         summary: normalizeSubtitle(metadata?.summary),
         updatedAt,
         createdAt,
+        revision: currentRevision,
+        isCurrentRevision: true,
       };
 
       return artifact;
@@ -1362,7 +1488,7 @@ async function loadAntigravityArtifacts(dirPath: string): Promise<AntigravityArt
 
   return loadedArtifacts
     .filter((artifact): artifact is AntigravityArtifact => Boolean(artifact))
-    .sort((left, right) => right.updatedAt - left.updatedAt);
+    .sort(compareAntigravityArtifactsChronologically);
 }
 
 async function loadAntigravityArtifactMetadata(
@@ -1387,12 +1513,11 @@ function pickAntigravityArtifact(
 ): AntigravityArtifact | undefined {
   const candidates = artifacts.filter((artifact) => artifact.kind === kind);
   candidates.sort((left, right) => {
-    const priorityDiff = antigravityArtifactPriority(kind, right.baseName) - antigravityArtifactPriority(kind, left.baseName);
-    if (priorityDiff !== 0) {
-      return priorityDiff;
+    if (right.updatedAt !== left.updatedAt) {
+      return right.updatedAt - left.updatedAt;
     }
 
-    return right.updatedAt - left.updatedAt;
+    return antigravityArtifactPriority(kind, right.baseName) - antigravityArtifactPriority(kind, left.baseName);
   });
   return candidates[0];
 }
@@ -1459,7 +1584,9 @@ function classifyAntigravityArtifact(
 }
 
 function isAntigravityArtifactStreaming(artifact?: AntigravityArtifact): boolean {
-  return Boolean(artifact?.content) && Date.now() - (artifact?.updatedAt ?? 0) < STREAMING_GRACE_MS;
+  return Boolean(artifact?.content)
+    && Boolean(artifact?.isCurrentRevision)
+    && Date.now() - (artifact?.updatedAt ?? 0) < STREAMING_GRACE_MS;
 }
 
 function extractAntigravityTitle(value?: string): string | undefined {
@@ -1482,6 +1609,79 @@ function isAntigravityTextBaseName(fileName: string): boolean {
 
 function toAntigravityArtifactBaseName(fileName: string): string {
   return fileName.replace(/\.resolved(?:\.\d+)?$/i, '');
+}
+
+function compareAntigravityArtifactsChronologically(
+  left: AntigravityArtifact,
+  right: AntigravityArtifact
+): number {
+  if (left.updatedAt !== right.updatedAt) {
+    return left.updatedAt - right.updatedAt;
+  }
+
+  if (left.revision !== right.revision) {
+    return left.revision - right.revision;
+  }
+
+  return left.baseName.localeCompare(right.baseName);
+}
+
+function resolveCurrentAntigravityArtifactRevision(
+  candidates: Array<{ fileName: string }>,
+  metadata?: AntigravityArtifactMetadata
+): number {
+  const explicitMetadataVersion = parseAntigravityArtifactVersion(metadata?.version);
+  if (explicitMetadataVersion !== undefined) {
+    return explicitMetadataVersion;
+  }
+
+  const explicitRevisions = candidates
+    .map((candidate) => extractAntigravityResolvedRevision(candidate.fileName))
+    .filter((value): value is number => value !== undefined);
+
+  return explicitRevisions.length > 0 ? Math.max(...explicitRevisions) : 0;
+}
+
+function resolveAntigravityArtifactRevision(
+  fileName: string,
+  metadata: AntigravityArtifactMetadata | undefined,
+  currentRevision: number
+): number {
+  const explicitRevision = extractAntigravityResolvedRevision(fileName);
+  if (explicitRevision !== undefined) {
+    return explicitRevision;
+  }
+
+  return parseAntigravityArtifactVersion(metadata?.version) ?? currentRevision;
+}
+
+function parseAntigravityArtifactVersion(value: string | undefined): number | undefined {
+  if (!value || !/^\d+$/.test(value)) {
+    return undefined;
+  }
+
+  return Number.parseInt(value, 10);
+}
+
+function extractAntigravityResolvedRevision(fileName: string): number | undefined {
+  const match = fileName.match(/\.resolved\.(\d+)$/i);
+  if (!match) {
+    return undefined;
+  }
+
+  return Number.parseInt(match[1], 10);
+}
+
+function antigravityResolvedVariantPriority(fileName: string): number {
+  if (/\.resolved\.\d+$/i.test(fileName)) {
+    return 3;
+  }
+
+  if (/\.resolved$/i.test(fileName)) {
+    return 2;
+  }
+
+  return 1;
 }
 
 async function pickArtifactFile(dirPath: string, preferredBaseNames: string[]): Promise<string | undefined> {
@@ -1570,6 +1770,86 @@ function looksLikeEncodedBlob(value: string): boolean {
   return /^[A-Za-z0-9+/=]+$/.test(value) && !value.includes(' ') && value.length > 12;
 }
 
+function isPlausibleAntigravitySummaryText(value: string): boolean {
+  if (!value || value.length > 160) {
+    return false;
+  }
+
+  if (
+    !/[A-Za-z]/.test(value)
+    || looksLikeFileUri(value)
+    || looksLikeUuid(value)
+    || looksLikeInternalMarker(value)
+    || looksLikeEncodedBlob(value)
+    || /[0-9a-f]{8}-[0-9a-f]{4}/i.test(value)
+  ) {
+    return false;
+  }
+
+  const letterCount = (value.match(/[A-Za-z]/g) ?? []).length;
+  const visibleCount = (value.match(/[A-Za-z0-9]/g) ?? []).length;
+  const punctuationCount = (value.match(/[^A-Za-z0-9\s]/g) ?? []).length;
+
+  if (letterCount < 3 || visibleCount === 0) {
+    return false;
+  }
+
+  return punctuationCount <= Math.ceil(value.length * 0.2);
+}
+
+function resolveAntigravityActiveChatId(
+  chats: ConversationChat[],
+  preferredChatId: string | undefined,
+  summaries: ReadonlyMap<string, AntigravitySummaryEntry>
+): string | undefined {
+  if (chats.length === 0) {
+    return preferredChatId;
+  }
+
+  const chatsById = new Map(chats.map((chat) => [chat.id, chat]));
+  const preferredChat = preferredChatId
+    ? chatsById.get(preferredChatId)
+    : undefined;
+
+  if (preferredChat) {
+    return preferredChat.id;
+  }
+
+  const summaryBackedChats = chats.filter((chat) => summaries.has(chat.id));
+  const freshestSummaryBackedChat = summaryBackedChats[0];
+  const freshNewChat = chats.find((chat) =>
+    chat.turns.length === 0
+    && Date.now() - chat.updatedAt < 2 * 60 * 60 * 1000
+  );
+  if (freshNewChat) {
+    if (!freshestSummaryBackedChat || freshNewChat.updatedAt >= freshestSummaryBackedChat.updatedAt) {
+      return freshNewChat.id;
+    }
+  }
+
+  if (freshestSummaryBackedChat) {
+    return freshestSummaryBackedChat.id;
+  }
+
+  return chats[0]?.id;
+}
+
+async function getLiveAntigravityUserStatus(): Promise<string | undefined> {
+  try {
+    const api = (vscode as typeof vscode & {
+      antigravityUnifiedStateSync?: {
+        UserStatus?: {
+          getUserStatus?: () => Promise<string | undefined>;
+        };
+      };
+    }).antigravityUnifiedStateSync;
+
+    return await api?.UserStatus?.getUserStatus?.();
+  } catch {
+    return undefined;
+  }
+}
+
 async function safeReadFile(filePath: string): Promise<string | undefined> {
   try {
     return await fs.readFile(filePath, 'utf8');
@@ -1592,4 +1872,16 @@ async function safeStat(targetPath: string): Promise<Stats | undefined> {
   } catch {
     return undefined;
   }
+}
+
+async function latestSqliteWriteMs(dbPath: string): Promise<number> {
+  const [dbStats, walStats] = await Promise.all([
+    safeStat(dbPath),
+    safeStat(`${dbPath}-wal`),
+  ]);
+
+  return Math.max(
+    dbStats?.mtimeMs ?? 0,
+    walStats?.mtimeMs ?? 0
+  );
 }

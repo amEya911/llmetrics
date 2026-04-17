@@ -68,8 +68,8 @@
     "build": "node esbuild.js",
     "watch": "node esbuild.js --watch",
     "lint": "tsc --noEmit",
-    "package": "npm run build && vsce package --no-dependencies --allow-missing-repository -o ai-agent-monitor.vsix",
-    "install:local": "npm run build && vsce package --no-dependencies --allow-missing-repository -o ai-agent-monitor.vsix && code --install-extension ai-agent-monitor.vsix --force"
+    "package": "npm run build && vsce package --no-dependencies --allow-missing-repository --allow-star-activation -o ai-agent-monitor.vsix",
+    "install:local": "npm run build && vsce package --no-dependencies --allow-missing-repository --allow-star-activation -o ai-agent-monitor.vsix && node scripts/install-local.js ai-agent-monitor.vsix"
   },
   "devDependencies": {
     "@types/vscode": "^1.85.0",

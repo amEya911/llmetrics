@@ -119,10 +119,11 @@ export class AgentMonitor implements vscode.Disposable {
     this.promptLibrary = loadPromptLibrary(context.globalState.get<unknown>(PROMPT_LIBRARY_KEY));
     this.budgets = sanitizeBudgetSettings(context.globalState.get<unknown>(BUDGET_SETTINGS_KEY));
 
-    this.startWatcher('cursor');
-    this.startWatcher('antigravity');
+    for (const sourceId of this.getEnabledSourceIds()) {
+      this.startWatcher(sourceId);
+    }
 
-    this.setStatus('monitoring', 'Tracking live AI usage across Cursor and Antigravity...');
+    this.setStatus('monitoring', describeTrackingStatus(this.hostApp));
   }
 
   pushMessage(message: MonitorMessage): ConversationTurn {
@@ -219,6 +220,17 @@ export class AgentMonitor implements vscode.Disposable {
     this._onSnapshotChanged.dispose();
     this._onStatusChanged.dispose();
     this.output.dispose();
+  }
+
+  private getEnabledSourceIds(): Array<'cursor' | 'antigravity'> {
+    switch (this.hostApp) {
+      case 'cursor':
+        return ['cursor'];
+      case 'antigravity':
+        return ['antigravity'];
+      default:
+        return ['cursor', 'antigravity'];
+    }
   }
 
   private startWatcher(sourceId: 'cursor' | 'antigravity'): void {
@@ -760,6 +772,17 @@ function detectHostApp(): { app: HostApp; label: string } {
   return { app: 'unknown', label: vscode.env.appName || 'VS Code' };
 }
 
+function describeTrackingStatus(hostApp: HostApp): string {
+  switch (hostApp) {
+    case 'cursor':
+      return 'Tracking live AI usage in Cursor...';
+    case 'antigravity':
+      return 'Tracking live AI usage in Antigravity...';
+    default:
+      return 'Tracking live AI usage across Cursor and Antigravity...';
+  }
+}
+
 function summarizeForTitle(value: string): string {
   const singleLine = value.replace(/\s+/g, ' ').trim();
   if (!singleLine) {
@@ -850,8 +873,25 @@ function extractCollectionAttention(
   sourceId: 'cursor' | 'antigravity',
   collection: ConversationCollection
 ): CollectionAttention | undefined {
-  const chat = collection.chats.find((candidate) => candidate.id === collection.selectedChatId)
-    ?? collection.chats[0];
+  const selectedChat = collection.chats.find((candidate) => candidate.id === collection.selectedChatId);
+  const freshestPromptChat = selectFreshPromptChat(collection.chats);
+  const selectedChatPromptUpdatedAt = selectedChat
+    ? latestPromptUpdatedAt(selectedChat)
+    : 0;
+
+  const chat = freshestPromptChat
+    && (
+      !selectedChat
+      || (
+        freshestPromptChat.id !== selectedChat.id
+        && freshestPromptChat.updatedAt > selectedChat.updatedAt
+        && freshestPromptChat.updatedAt > selectedChatPromptUpdatedAt
+        && Date.now() - freshestPromptChat.updatedAt < 15_000
+      )
+    )
+    ? freshestPromptChat
+    : selectedChat ?? collection.chats[0];
+
   if (!chat) {
     return undefined;
   }
@@ -877,6 +917,39 @@ function extractCollectionAttention(
       ? `${latestUserTurn.id}:${normalizeComparableText(latestUserTurn.blocks['user-input'].content).slice(0, 240)}`
       : undefined,
   };
+}
+
+function selectFreshPromptChat(chats: ConversationChat[]): ConversationChat | undefined {
+  let bestChat: ConversationChat | undefined;
+  let bestUpdatedAt = 0;
+
+  for (const chat of chats) {
+    const promptUpdatedAt = latestPromptUpdatedAt(chat);
+    if (promptUpdatedAt <= 0) {
+      continue;
+    }
+
+    if (!bestChat || promptUpdatedAt > bestUpdatedAt) {
+      bestChat = chat;
+      bestUpdatedAt = promptUpdatedAt;
+    }
+  }
+
+  return bestChat;
+}
+
+function latestPromptUpdatedAt(chat: ConversationChat): number {
+  let updatedAt = 0;
+
+  for (const turn of chat.turns) {
+    if (!turn.blocks['user-input'].content.trim()) {
+      continue;
+    }
+
+    updatedAt = Math.max(updatedAt, turn.updatedAt);
+  }
+
+  return updatedAt;
 }
 
 function snapshotContainsChat(sources: SourceSnapshot[], chatKey: string): boolean {
