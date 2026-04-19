@@ -24,6 +24,8 @@ interface DashboardBuildOptions {
   activeChatKey?: string;
   promptLibrary: SavedPrompt[];
   budgets: BudgetSettings;
+  hasGroqKey: boolean;
+  groqInsights?: CoachInsight[];
   now?: number;
 }
 
@@ -104,6 +106,9 @@ export function buildDashboardSnapshot(options: DashboardBuildOptions): MonitorS
     activeSuggestion,
     repeatedCounts
   );
+  if (options.groqInsights && options.groqInsights.length > 0) {
+    analytics.coach = [...options.groqInsights, ...analytics.coach];
+  }
   const alerts = computeBudgetAlerts(options.budgets, analytics, now);
 
   return {
@@ -116,6 +121,7 @@ export function buildDashboardSnapshot(options: DashboardBuildOptions): MonitorS
     promptLibrary,
     budgets: options.budgets,
     alerts,
+    hasGroqKey: options.hasGroqKey,
     generatedAt: now,
   };
 }
@@ -185,6 +191,19 @@ function enrichChat(chat: ConversationChat): ConversationChat {
     };
   }
 
+  const historyBloatRatio = sessionHistoryTokens > 0
+    ? sessionHistoryTokens / Math.max(1, sessionInputTokens + sessionHistoryTokens)
+    : 0;
+
+  let healthScore = 100;
+  if (historyBloatRatio > 0.5) {
+    healthScore -= (historyBloatRatio - 0.5) * 100; // Deduct up to 50 points based on bloat
+  }
+  if (turns.length > 8) {
+    healthScore -= (turns.length - 8) * 3; // Deduct 3 points for every turn over 8
+  }
+  healthScore = Math.max(0, Math.min(100, Math.round(healthScore)));
+
   const metrics = {
     inputTokens: sessionInputTokens,
     historyTokens: sessionHistoryTokens,
@@ -194,9 +213,8 @@ function enrichChat(chat: ConversationChat): ConversationChat {
     costUsd: sessionCostUsd,
     promptCount: turns.filter((turn) => Boolean(turn.blocks['user-input'].content.trim())).length,
     turnCount: turns.length,
-    historyBloatRatio: sessionHistoryTokens > 0
-      ? sessionHistoryTokens / Math.max(1, sessionInputTokens + sessionHistoryTokens)
-      : 0,
+    historyBloatRatio,
+    healthScore,
   };
 
   let contextWindowTokens = chat.contextWindowTokens;

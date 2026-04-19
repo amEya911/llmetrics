@@ -124,12 +124,32 @@ export async function queryMergedSqliteRows<T extends Record<string, unknown>>(
   try {
     const merged = await createMergedSqliteBuffer(dbPath);
     await fs.writeFile(tempDbPath, merged);
-    const { stdout } = await execFileAsync('sqlite3', ['-json', tempDbPath, sql], {
-      maxBuffer: 24 * 1024 * 1024,
-    });
 
-    return JSON.parse(stdout || '[]') as T[];
-  } catch {
+    // Try 'sqlite3' from PATH first, then fall back to full path.
+    // The extension host process may have a limited PATH that does not
+    // include /usr/bin, so the bare name can fail with ENOENT.
+    const sqlite3Candidates = process.platform === 'win32'
+      ? ['sqlite3']
+      : ['sqlite3', '/usr/bin/sqlite3'];
+    let lastError: unknown;
+
+    for (const bin of sqlite3Candidates) {
+      try {
+        const { stdout } = await execFileAsync(bin, ['-json', tempDbPath, sql], {
+          maxBuffer: 24 * 1024 * 1024,
+        });
+        return JSON.parse(stdout || '[]') as T[];
+      } catch (err) {
+        lastError = err;
+      }
+    }
+
+    // Log the failure so it shows in the output channel instead of
+    // being silently swallowed (the previous catch-all hid real errors).
+    console.debug('[ai-token-analytics] sqlite3 query failed:', lastError);
+    return [];
+  } catch (err) {
+    console.debug('[ai-token-analytics] createMergedSqliteBuffer failed:', err);
     return [];
   } finally {
     await fs.rm(tempDbPath, { force: true }).catch(() => undefined);

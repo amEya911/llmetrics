@@ -48,6 +48,7 @@ export interface SessionMetrics {
   promptCount: number;
   turnCount: number;
   historyBloatRatio: number;
+  healthScore?: number;
 }
 
 export interface ConversationTurn {
@@ -209,6 +210,7 @@ export interface MonitorSnapshot {
   promptLibrary: SavedPrompt[];
   budgets: BudgetSettings;
   alerts: BudgetAlert[];
+  hasGroqKey: boolean;
   generatedAt: number;
 }
 

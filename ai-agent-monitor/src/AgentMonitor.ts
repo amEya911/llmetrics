@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import { ConversationStoreWatcher } from './ConversationStoreWatcher';
+import { NetworkInterceptor } from './NetworkInterceptor';
 import { buildDashboardSnapshot, createDefaultBudgets } from './dashboard';
+import { analyzeChatWithGroq } from './groqClient';
 import {
   buildAppStoragePathCandidates,
   firstExistingPath,
@@ -13,6 +15,7 @@ import {
   cloneCollection,
   cloneSnapshot,
   cloneTurn,
+  CoachInsight,
   ConversationChat,
   ConversationCollection,
   ConversationSegment,
@@ -100,6 +103,14 @@ export class AgentMonitor implements vscode.Disposable {
   private activeChatEngagedAt = 0;
   private lastAlertIds = new Set<string>();
 
+  private networkInterceptor?: NetworkInterceptor;
+  private networkTurnId?: string;
+  private networkResponseBuffer = '';
+  private networkEmitHandle?: NodeJS.Timeout;
+
+  private currentGroqInsights: CoachInsight[] = [];
+  private groqDebounceHandle?: NodeJS.Timeout;
+
   private readonly _onSnapshotChanged = new vscode.EventEmitter<MonitorSnapshot>();
   readonly onSnapshotChanged = this._onSnapshotChanged.event;
 
@@ -121,6 +132,10 @@ export class AgentMonitor implements vscode.Disposable {
 
     for (const sourceId of this.getEnabledSourceIds()) {
       this.startWatcher(sourceId);
+    }
+
+    if (this.hostApp === 'antigravity' || this.hostApp === 'unknown') {
+      this.startNetworkInterceptor();
     }
 
     this.setStatus('monitoring', describeTrackingStatus(this.hostApp));
@@ -151,6 +166,7 @@ export class AgentMonitor implements vscode.Disposable {
     this.activeRuntimeTurnId = turn.id;
     this.activeChatKey = `manual:${chat.id}`;
     this.activeChatEngagedAt = Date.now();
+    this.triggerGroqAnalysis(chat);
     this.emitSnapshot();
     return cloneTurn(this.mustGetTurn(chat, turn.id));
   }
@@ -213,6 +229,8 @@ export class AgentMonitor implements vscode.Disposable {
   }
 
   dispose(): void {
+    this.flushNetworkEmit();
+
     for (const disposable of this.disposables) {
       disposable.dispose();
     }
@@ -255,6 +273,90 @@ export class AgentMonitor implements vscode.Disposable {
     watcher.start();
   }
 
+  private startNetworkInterceptor(): void {
+    const interceptor = new NetworkInterceptor();
+    this.networkInterceptor = interceptor;
+    this.disposables.push(interceptor);
+
+    interceptor.onUserMessage(({ content, source }) => {
+      this.output.appendLine(`[network] User prompt captured via ${source} (${content.length} chars)`);
+
+      const chatId = this.activeRuntimeChatId ?? this.createRuntimeChatId();
+      const chat = this.ensureRuntimeChat(chatId, {
+        title: `${source} session`,
+        sourceLabel: source,
+        model: source,
+      });
+
+      const turn = this.createRuntimeTurn(chat);
+      this.networkTurnId = turn.id;
+      this.networkResponseBuffer = '';
+
+      this.setBlockContent(chat, turn.id, 'user-input', content);
+
+      this.activeRuntimeChatId = chat.id;
+      this.activeRuntimeTurnId = turn.id;
+      this.activeChatKey = `manual:${chat.id}`;
+      this.activeChatEngagedAt = Date.now();
+
+      this.emitSnapshot();
+    });
+
+    interceptor.onAiResponseChunk(({ content }) => {
+      if (!this.networkTurnId || !this.activeRuntimeChatId) {
+        return;
+      }
+
+      this.networkResponseBuffer += content;
+
+      const chat = this.runtimeChats.get(this.activeRuntimeChatId);
+      if (!chat) {
+        return;
+      }
+
+      this.setBlockContent(chat, this.networkTurnId, 'agent-output', this.networkResponseBuffer);
+      this.scheduleNetworkEmit();
+    });
+
+    interceptor.onAiResponseEnd(() => {
+      this.flushNetworkEmit();
+
+      if (!this.networkTurnId || !this.activeRuntimeChatId) {
+        return;
+      }
+
+      const chat = this.runtimeChats.get(this.activeRuntimeChatId);
+      if (chat) {
+        this.finalizeTurn(chat, this.networkTurnId);
+        this.emitSnapshot();
+      }
+
+      this.networkTurnId = undefined;
+      this.networkResponseBuffer = '';
+    });
+
+    interceptor.start();
+    this.output.appendLine('[network] HTTP/HTTPS interceptor activated for real-time AI traffic capture.');
+  }
+
+  private scheduleNetworkEmit(): void {
+    if (this.networkEmitHandle) {
+      return;
+    }
+
+    this.networkEmitHandle = setTimeout(() => {
+      this.networkEmitHandle = undefined;
+      this.emitSnapshot();
+    }, 250);
+  }
+
+  private flushNetworkEmit(): void {
+    if (this.networkEmitHandle) {
+      clearTimeout(this.networkEmitHandle);
+      this.networkEmitHandle = undefined;
+    }
+  }
+
   private async handleSourceCollection(
     sourceId: 'cursor' | 'antigravity',
     collection: ConversationCollection
@@ -277,6 +379,12 @@ export class AgentMonitor implements vscode.Disposable {
 
     this.sourceCollections.set(sourceId, cloneCollection(decorated));
     this.updateActiveChatLock(sourceId, decorated);
+    
+    const activeChat = decorated.chats.find(c => c.id === decorated.selectedChatId);
+    if (activeChat) {
+      this.triggerGroqAnalysis(activeChat);
+    }
+
     this.emitSnapshot();
   }
 
@@ -309,6 +417,10 @@ export class AgentMonitor implements vscode.Disposable {
   }
 
   private buildSnapshot(): MonitorSnapshot {
+    const config = vscode.workspace.getConfiguration('aiAgentMonitor');
+    const groqKey = config.get<string>('groqApiKey', '');
+    const hasGroqKey = typeof groqKey === 'string' && groqKey.trim().length > 0;
+
     return buildDashboardSnapshot({
       app: this.hostApp,
       appLabel: this.appLabel,
@@ -316,7 +428,27 @@ export class AgentMonitor implements vscode.Disposable {
       activeChatKey: this.activeChatKey,
       promptLibrary: this.promptLibrary,
       budgets: this.budgets,
+      hasGroqKey,
+      groqInsights: this.currentGroqInsights,
     });
+  }
+
+  private triggerGroqAnalysis(chat: ConversationChat): void {
+    if (this.groqDebounceHandle) {
+      clearTimeout(this.groqDebounceHandle);
+    }
+
+    this.groqDebounceHandle = setTimeout(async () => {
+      try {
+        const insights = await analyzeChatWithGroq(chat);
+        if (insights.length > 0 || this.currentGroqInsights.length > 0) {
+          this.currentGroqInsights = insights;
+          this.emitSnapshot();
+        }
+      } catch (err) {
+        console.error('[Groq] Analysis error:', err);
+      }
+    }, 1500);
   }
 
   private buildSourceSnapshots(): SourceSnapshot[] {
@@ -875,11 +1007,11 @@ function extractCollectionAttention(
 ): CollectionAttention | undefined {
   const selectedChat = collection.chats.find((candidate) => candidate.id === collection.selectedChatId);
   const freshestPromptChat = selectFreshPromptChat(collection.chats);
+  const freshestUpdatedChat = selectFreshUpdatedChat(collection.chats);
   const selectedChatPromptUpdatedAt = selectedChat
     ? latestPromptUpdatedAt(selectedChat)
     : 0;
-
-  const chat = freshestPromptChat
+  const freshPromptOverride = freshestPromptChat
     && (
       !selectedChat
       || (
@@ -890,7 +1022,24 @@ function extractCollectionAttention(
       )
     )
     ? freshestPromptChat
-    : selectedChat ?? collection.chats[0];
+    : undefined;
+  const freshRealtimeOverride = sourceId === 'antigravity'
+    && freshestUpdatedChat
+    && (
+      !selectedChat
+      || (
+        freshestUpdatedChat.id !== selectedChat.id
+        && freshestUpdatedChat.updatedAt > selectedChat.updatedAt + 1_000
+        && Date.now() - freshestUpdatedChat.updatedAt < 10 * 60 * 1000
+      )
+    )
+    ? freshestUpdatedChat
+    : undefined;
+  const chat = freshPromptOverride
+    ?? freshRealtimeOverride
+    ?? selectedChat
+    ?? freshestUpdatedChat
+    ?? collection.chats[0];
 
   if (!chat) {
     return undefined;
@@ -932,6 +1081,18 @@ function selectFreshPromptChat(chats: ConversationChat[]): ConversationChat | un
     if (!bestChat || promptUpdatedAt > bestUpdatedAt) {
       bestChat = chat;
       bestUpdatedAt = promptUpdatedAt;
+    }
+  }
+
+  return bestChat;
+}
+
+function selectFreshUpdatedChat(chats: ConversationChat[]): ConversationChat | undefined {
+  let bestChat: ConversationChat | undefined;
+
+  for (const chat of chats) {
+    if (!bestChat || chat.updatedAt > bestChat.updatedAt) {
+      bestChat = chat;
     }
   }
 

@@ -62,7 +62,17 @@
         "key": "ctrl+shift+m",
         "mac": "cmd+shift+m"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "AI Token Analytics",
+      "properties": {
+        "aiAgentMonitor.groqApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Optional: Supply a free Groq API key to unlock the continuous LLaMA 3 AI Coach for prompt analysis."
+        }
+      }
+    }
   },
   "scripts": {
     "build": "node esbuild.js",

@@ -1,5 +1,5 @@
-import type { Dirent, Stats } from 'fs';
-import { promises as fs } from 'fs';
+import type { Dirent, FSWatcher, Stats } from 'fs';
+import { existsSync, promises as fs, watch as fsWatch } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
@@ -100,8 +100,10 @@ export class ConversationStoreWatcher implements vscode.Disposable {
   private readonly hostApp: HostApp;
   private readonly knownRoots = new Set<string>();
   private readonly fileWatchers: vscode.Disposable[] = [];
+  private readonly nativeWatchers: FSWatcher[] = [];
   private refreshHandle?: NodeJS.Timeout;
   private pollHandle?: NodeJS.Timeout;
+  private nativeRefreshHandle?: NodeJS.Timeout;
   private started = false;
   private watchTargetFingerprint = '';
   private baselineFingerprint = '';
@@ -129,6 +131,7 @@ export class ConversationStoreWatcher implements vscode.Disposable {
 
     if (this.hostApp === 'antigravity') {
       this.pollHandle = setInterval(() => this.scheduleRefresh(), ANTIGRAVITY_POLL_INTERVAL_MS);
+      this.startNativeStateWatchers();
     }
   }
 
@@ -145,10 +148,17 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       clearInterval(this.pollHandle);
       this.pollHandle = undefined;
     }
+    if (this.nativeRefreshHandle) {
+      clearTimeout(this.nativeRefreshHandle);
+      this.nativeRefreshHandle = undefined;
+    }
     this.watchTargetFingerprint = '';
 
     while (this.fileWatchers.length > 0) {
       this.fileWatchers.pop()?.dispose();
+    }
+    while (this.nativeWatchers.length > 0) {
+      this.nativeWatchers.pop()?.close();
     }
   }
 
@@ -161,6 +171,72 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       this.refreshHandle = undefined;
       void this.refresh();
     }, REFRESH_DEBOUNCE_MS);
+  }
+
+  /**
+   * Native fs.watch() file watchers on the Antigravity state directory.
+   * This replicates the exact pattern used by orbit-hub for real-time
+   * updates.  vscode.workspace.createFileSystemWatcher does not reliably
+   * fire for paths outside the workspace (e.g. ~/Library/Application
+   * Support/Antigravity/).  Node.js native fs.watch() on the directory
+   * detects writes to state.vscdb / state.vscdb-wal / state.vscdb-shm
+   * within milliseconds.
+   */
+  private startNativeStateWatchers(): void {
+    const candidates = buildAppStoragePathCandidates(
+      'Antigravity', 'User', 'globalStorage', 'state.vscdb'
+    );
+
+    for (const dbPath of candidates) {
+      const stateDir = path.dirname(dbPath);
+      if (!existsSync(stateDir)) {
+        continue;
+      }
+
+      const watchedFiles = new Set([
+        path.basename(dbPath),
+        path.basename(dbPath) + '-wal',
+        path.basename(dbPath) + '-shm',
+        path.basename(dbPath) + '-journal',
+      ]);
+
+      try {
+        const watcher = fsWatch(stateDir, (_eventType, filename) => {
+          if (!filename) { return; }
+          if (watchedFiles.has(filename.toString())) {
+            this.scheduleNativeRefresh();
+          }
+        });
+        this.nativeWatchers.push(watcher);
+        this.output.appendLine(`[stores] Native fs.watch() active on ${stateDir}`);
+      } catch {
+        // Directory watch failed; polling remains as fallback.
+      }
+    }
+
+    const brainRoot = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
+    if (existsSync(brainRoot)) {
+      try {
+        const watcher = fsWatch(brainRoot, { recursive: true }, () => {
+          this.scheduleNativeRefresh();
+        });
+        this.nativeWatchers.push(watcher);
+        this.output.appendLine(`[stores] Native fs.watch() active on ${brainRoot}`);
+      } catch {
+        // Brain directory watch failed; polling remains as fallback.
+      }
+    }
+  }
+
+  /** 300ms debounce for native fs.watch events — matches orbit-hub. */
+  private scheduleNativeRefresh(): void {
+    if (this.nativeRefreshHandle) {
+      clearTimeout(this.nativeRefreshHandle);
+    }
+    this.nativeRefreshHandle = setTimeout(() => {
+      this.nativeRefreshHandle = undefined;
+      void this.refresh();
+    }, 300);
   }
 
   private async syncWatchers(): Promise<void> {
@@ -552,8 +628,7 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       globalValues['antigravityUnifiedStateSync.trajectorySummaries'],
       workspacePaths
     );
-    const selectedChatId = parseAntigravitySelectedChatId(jetskiRaw)
-      ?? summaries[0]?.id;
+    const selectedChatId = parseAntigravitySelectedChatId(jetskiRaw);
     const model = extractAntigravitySelectedModelName(
       globalValues['antigravityUnifiedStateSync.modelPreferences'],
       liveUserStatus ?? globalValues['antigravityUnifiedStateSync.userStatus']
@@ -1083,7 +1158,8 @@ function parseAntigravitySummaryEntries(
       );
 
       if (!belongsToWorkspace) {
-        return;
+        // Still include the entry — brain artifacts show all conversations
+        // regardless of workspace, so the summaries should match.
       }
     }
 
@@ -1331,6 +1407,11 @@ function buildSqliteWatchTargets(dbPath: string, label: string): WatchTarget[] {
     {
       basePath,
       pattern: `${path.basename(dbPath)}-wal`,
+      label,
+    },
+    {
+      basePath,
+      pattern: `${path.basename(dbPath)}-journal`,
       label,
     },
   ];
@@ -1810,9 +1891,29 @@ function resolveAntigravityActiveChatId(
   const preferredChat = preferredChatId
     ? chatsById.get(preferredChatId)
     : undefined;
+  const freshestChat = [...chats]
+    .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+  const freshestPromptChat = chats
+    .filter((chat) => chat.turns.some((turn) => Boolean(turn.blocks['user-input'].content.trim())))
+    .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+  const freshestRecentChat = freshestPromptChat ?? freshestChat;
 
-  if (preferredChat) {
+  if (
+    preferredChat
+    && (
+      !freshestRecentChat
+      || preferredChat.id === freshestRecentChat.id
+      || preferredChat.updatedAt >= freshestRecentChat.updatedAt - 2_000
+    )
+  ) {
     return preferredChat.id;
+  }
+
+  if (
+    freshestRecentChat
+    && Date.now() - freshestRecentChat.updatedAt < 12 * 60 * 60 * 1000
+  ) {
+    return freshestRecentChat.id;
   }
 
   const summaryBackedChats = chats.filter((chat) => summaries.has(chat.id));

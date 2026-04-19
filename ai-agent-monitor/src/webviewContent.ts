@@ -912,20 +912,20 @@ export function getConversationWebviewHtml(
 
       <section class="card">
         <div class="card-head">
-          <div class="card-kicker">Aggregate Analytics</div>
-          <div class="card-title">Usage at a glance</div>
-          <div class="card-subtitle">Daily trend, source mix, and model efficiency in one pass.</div>
-        </div>
-        <div class="card-body" id="aggregate-analytics"></div>
-      </section>
-
-      <section class="card">
-        <div class="card-head">
           <div class="card-kicker">Efficiency Coach</div>
           <div class="card-title">Top 3 actions that matter</div>
           <div class="card-subtitle">Only the clearest things worth fixing right now.</div>
         </div>
         <div class="card-body" id="coach-panel"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <div class="card-kicker">Aggregate Analytics</div>
+          <div class="card-title">Usage at a glance</div>
+          <div class="card-subtitle">Daily trend, source mix, and model efficiency in one pass.</div>
+        </div>
+        <div class="card-body" id="aggregate-analytics"></div>
       </section>
 
       <section class="accordion-stack">
@@ -1154,14 +1154,21 @@ export function getConversationWebviewHtml(
         metrics.promptCount + ' prompts in session',
       ]);
 
+      const healthScoreNum = metrics.healthScore ?? 100;
+      const healthColor = healthScoreNum >= 80 ? 'green' : healthScoreNum >= 40 ? 'amber' : 'red';
+      const warningBanner = healthScoreNum < 40
+        ? '<div style="background: var(--red-soft); color: var(--red); padding: 12px; border-radius: 8px; margin-bottom: 16px; font-weight: 600;">⚠️ <strong>Start Fresh Recommendation:</strong> Context health is critically low (' + healthScoreNum + ' / 100). Continuing this chat is hurting reasoning and bloating cost. Start a new chat.</div>'
+        : '';
+
       liveSession.innerHTML = ''
         + '<div class="live-layout">'
         + '  <div class="live-overview">'
+        + warningBanner
         + '    <div>'
         + '      <div class="pill-row">'
         +          pill(chat.sourceLabel || 'Unknown agent', 'blue')
         +          pill(chat.model || 'Unknown model', 'green')
-        +          pill(formatPct(contextFill) + ' context', toneForContext(contextFill))
+        +          pill(healthScoreNum + ' Health', healthColor)
         + '      </div>'
         + '      <div style="margin-top:14px;" class="live-title">' + escapeHtml((chat.sourceLabel || 'Agent') + ' · ' + (chat.model || 'Unknown model')) + '</div>'
         + '      <div class="live-subtitle" style="margin-top:8px;">' + escapeHtml(chat.title || 'Untitled chat') + '</div>'
@@ -1295,6 +1302,16 @@ export function getConversationWebviewHtml(
     }
 
     function renderCoachPanel() {
+      if (!snapshot.hasGroqKey) {
+        coachPanel.innerHTML = ''
+          + '<div style="background: linear-gradient(145deg, rgba(23, 31, 44, 0.96), rgba(12, 19, 28, 0.98)); border: 1px solid var(--amber-soft); padding: 24px; border-radius: var(--radius); text-align: center;">'
+          + '  <div style="font-size: 18px; font-weight: 700; margin-bottom: 8px; color: var(--amber);">Unlock the LLaMA 3 AI Coach</div>'
+          + '  <div style="color: var(--muted-strong); margin-bottom: 16px; max-width: 600px; margin-left: auto; margin-right: auto;">Supply a free Groq API key to unlock real-time prompt analysis. The dashboard will run LLaMA 3 70B implicitly to detect error loops, highlight dead context, and provide actionable engineering advice without slowing down Cursor.</div>'
+          + '  <div style="color: var(--muted); margin-bottom: 8px; font-size: 12px;"><strong>To enable:</strong> Open Settings (Cmd+,), search for <em>aiAgentMonitor.groqApiKey</em>, and paste your free key from <a href="https://console.groq.com/keys" style="color: var(--blue); text-decoration: none;">console.groq.com</a>. Reload the window after saving.</div>'
+          + '</div>';
+        return;
+      }
+
       const insights = (snapshot.analytics && snapshot.analytics.coach) || [];
       if (insights.length === 0) {
         coachPanel.innerHTML = renderEmpty('Coach insights will appear once the dashboard has enough activity to compare.');
