@@ -21,6 +21,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       expensivePrompts: [],
       trend: [],
       coach: [],
+      patterns: {
+        summaries: [],
+        averageHealthTrend: [],
+        expensivePromptPatterns: [],
+        timeOfDay: [],
+      },
     },
     promptLibrary: [],
     budgets: {
@@ -30,6 +36,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       monthlyTokens: null,
     },
     alerts: [],
+    hasGroqKey: false,
+    sessionAnalysis: {
+      isGenerating: false,
+    },
     generatedAt: Date.now(),
   };
   private currentStatus: MonitorStatus = {

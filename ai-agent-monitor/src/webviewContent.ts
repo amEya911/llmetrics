@@ -16,39 +16,39 @@ export function getConversationWebviewHtml(
   <title>${title}</title>
   <style>
     :root {
-      --bg: #091018;
-      --bg-elevated: #0f1824;
-      --card: rgba(18, 27, 39, 0.92);
-      --card-strong: rgba(12, 20, 30, 0.98);
-      --card-soft: rgba(255, 255, 255, 0.035);
-      --border: rgba(134, 170, 214, 0.16);
-      --text: #edf3fb;
-      --muted: #8d9aab;
-      --muted-strong: #b8c5d7;
-      --blue: #65b8ff;
-      --blue-soft: rgba(101, 184, 255, 0.14);
-      --green: #5dd3a6;
-      --green-soft: rgba(93, 211, 166, 0.14);
-      --amber: #f0bc5a;
-      --amber-soft: rgba(240, 188, 90, 0.15);
-      --red: #ff7f81;
-      --red-soft: rgba(255, 127, 129, 0.14);
-      --shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
-      --radius: 22px;
+      --bg: #08121c;
+      --bg-soft: #0c1927;
+      --card: rgba(15, 27, 40, 0.94);
+      --card-strong: rgba(10, 18, 28, 0.98);
+      --line: rgba(138, 177, 222, 0.15);
+      --line-strong: rgba(138, 177, 222, 0.24);
+      --text: #eef5ff;
+      --muted: #8ea2ba;
+      --muted-strong: #bcc9d9;
+      --blue: #70baff;
+      --blue-soft: rgba(112, 186, 255, 0.16);
+      --green: #63d9ac;
+      --green-soft: rgba(99, 217, 172, 0.16);
+      --amber: #f3c46e;
+      --amber-soft: rgba(243, 196, 110, 0.16);
+      --red: #ff8f93;
+      --red-soft: rgba(255, 143, 147, 0.17);
+      --shadow: 0 28px 76px rgba(0, 0, 0, 0.34);
+      --radius: 24px;
     }
 
     * { box-sizing: border-box; }
 
     body {
       margin: 0;
-      background:
-        radial-gradient(circle at top left, rgba(101, 184, 255, 0.12), transparent 30%),
-        radial-gradient(circle at top right, rgba(93, 211, 166, 0.08), transparent 24%),
-        linear-gradient(180deg, #091018 0%, #070d14 100%);
       color: var(--text);
-      font-family: "Aptos", "Segoe UI Variable", "SF Pro Display", sans-serif;
+      font-family: "Aptos", "SF Pro Display", "Segoe UI Variable", sans-serif;
       font-size: 13px;
-      line-height: 1.45;
+      line-height: 1.5;
+      background:
+        radial-gradient(circle at top left, rgba(112, 186, 255, 0.14), transparent 28%),
+        radial-gradient(circle at top right, rgba(99, 217, 172, 0.1), transparent 24%),
+        linear-gradient(180deg, #08121c 0%, #050b12 100%);
     }
 
     button,
@@ -67,50 +67,56 @@ export function getConversationWebviewHtml(
       top: 0;
       z-index: 20;
       display: flex;
-      align-items: center;
       justify-content: space-between;
+      align-items: end;
       gap: 16px;
-      padding: 16px 20px;
+      padding: 18px 20px;
       backdrop-filter: blur(18px);
-      background: rgba(8, 13, 20, 0.82);
+      background: rgba(7, 12, 18, 0.84);
       border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-    }
-
-    .topbar-copy {
-      min-width: 0;
     }
 
     .eyebrow {
       color: var(--muted);
       font-size: 11px;
       font-weight: 700;
-      letter-spacing: 0.1em;
+      letter-spacing: 0.12em;
       text-transform: uppercase;
     }
 
     .title {
-      margin-top: 5px;
-      font-size: 21px;
+      margin-top: 6px;
+      font-size: 24px;
       font-weight: 800;
-      letter-spacing: -0.03em;
+      letter-spacing: -0.05em;
     }
 
     .subtitle {
-      margin-top: 5px;
+      margin-top: 6px;
       color: var(--muted);
-      max-width: 60ch;
+      max-width: 62ch;
+    }
+
+    .status-pill,
+    .chip,
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
     }
 
     .status-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
-      padding: 10px 12px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: rgba(255, 255, 255, 0.03);
+      background: rgba(255, 255, 255, 0.04);
+      border-color: var(--line);
+      color: var(--muted-strong);
       white-space: nowrap;
-      min-width: 0;
     }
 
     .status-dot {
@@ -118,60 +124,51 @@ export function getConversationWebviewHtml(
       height: 10px;
       border-radius: 999px;
       background: var(--green);
-      flex: 0 0 auto;
     }
 
-    .status-dot.monitoring {
-      background: var(--amber);
-    }
-
-    .status-dot.disconnected {
-      background: var(--red);
-    }
-
-    .status-text {
-      color: var(--muted-strong);
-      max-width: 320px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
+    .status-dot.monitoring { background: var(--amber); }
+    .status-dot.disconnected { background: var(--red); }
 
     main {
-      padding: 18px 20px 28px;
+      display: grid;
+      gap: 18px;
+      padding: 18px 20px 30px;
+    }
+
+    .tier {
       display: grid;
       gap: 18px;
     }
 
-    .card {
-      border: 1px solid var(--border);
+    .above-fold {
+      grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.9fr);
+      align-items: start;
+    }
+
+    .card,
+    .accordion {
       border-radius: var(--radius);
-      background: linear-gradient(180deg, rgba(18, 27, 39, 0.96), rgba(12, 19, 28, 0.98));
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, rgba(15, 27, 40, 0.96), rgba(9, 17, 27, 0.98));
       box-shadow: var(--shadow);
       overflow: hidden;
     }
 
-    .card-head {
-      padding: 18px 20px 12px;
+    .card-head,
+    .accordion > summary {
+      padding: 18px 20px 14px;
       border-bottom: 1px solid rgba(255, 255, 255, 0.05);
     }
 
-    .card-kicker {
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-    }
-
     .card-title {
-      margin-top: 5px;
+      margin-top: 6px;
       font-size: 18px;
       font-weight: 800;
       letter-spacing: -0.03em;
     }
 
     .card-subtitle {
-      margin-top: 5px;
+      margin-top: 6px;
       color: var(--muted);
     }
 
@@ -179,120 +176,117 @@ export function getConversationWebviewHtml(
       padding: 18px 20px 20px;
     }
 
-    .sticky-live {
-      position: sticky;
-      top: 82px;
-      z-index: 15;
+    .live-grid,
+    .summary-grid,
+    .pattern-grid,
+    .model-list,
+    .timeline-list,
+    .library-list,
+    .alert-list,
+    .accordion-stack {
+      display: grid;
+      gap: 12px;
     }
 
-    .live-layout {
-      display: grid;
+    .live-grid {
+      grid-template-columns: minmax(0, 1.05fr) minmax(220px, 0.95fr);
       gap: 18px;
-      grid-template-columns: minmax(280px, 0.96fr) minmax(0, 1.24fr);
       align-items: stretch;
     }
 
-    .live-overview {
-      display: grid;
-      gap: 14px;
-      align-content: space-between;
-    }
-
-    .pill-row,
-    .meta-row,
-    .actions-row,
-    .inline-tags {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      align-items: center;
-    }
-
-    .pill,
-    .tag {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 6px 10px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
-      background: rgba(255, 255, 255, 0.06);
-      color: var(--muted-strong);
-    }
-
-    .pill.blue { background: var(--blue-soft); color: #d4ebff; }
-    .pill.green { background: var(--green-soft); color: #ccf6e8; }
-    .pill.amber { background: var(--amber-soft); color: #ffe9bf; }
-    .pill.red { background: var(--red-soft); color: #ffd0d1; }
-
-    .tag {
-      text-transform: none;
-      letter-spacing: 0;
-    }
-
     .live-title {
-      font-size: 28px;
+      margin-top: 12px;
+      font-size: 30px;
+      line-height: 1.02;
       font-weight: 800;
-      letter-spacing: -0.05em;
-      line-height: 1.05;
+      letter-spacing: -0.06em;
     }
 
     .live-subtitle {
+      margin-top: 8px;
       color: var(--muted);
-      font-size: 13px;
     }
 
-    .hero-metric {
+    .chip,
+    .badge {
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--muted-strong);
+    }
+
+    .chip.blue,
+    .badge.blue { background: var(--blue-soft); color: #d9eeff; }
+    .chip.green,
+    .badge.green { background: var(--green-soft); color: #dafef0; }
+    .chip.amber,
+    .badge.amber { background: var(--amber-soft); color: #ffebc5; }
+    .chip.red,
+    .badge.red { background: var(--red-soft); color: #ffd7d8; }
+
+    .metric-hero,
+    .insight-panel,
+    .summary-card,
+    .mini-card,
+    .timeline-item,
+    .model-row,
+    .prompt-card,
+    .budget-card,
+    .alert-card,
+    .pattern-card {
+      border-radius: 18px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .metric-hero,
+    .insight-panel,
+    .summary-card,
+    .mini-card,
+    .model-row,
+    .prompt-card,
+    .budget-card,
+    .alert-card,
+    .pattern-card {
       padding: 16px;
-      border-radius: 20px;
-      background: linear-gradient(180deg, rgba(101, 184, 255, 0.12), rgba(255, 255, 255, 0.03));
-      border: 1px solid rgba(101, 184, 255, 0.14);
     }
 
     .hero-value {
+      margin-top: 8px;
       font-size: 38px;
       line-height: 1;
       font-weight: 800;
       letter-spacing: -0.06em;
     }
 
-    .hero-context {
+    .hero-context,
+    .support-copy,
+    .detail-copy,
+    .mini-copy {
       margin-top: 8px;
       color: var(--muted-strong);
-      font-size: 13px;
     }
 
-    .context-progress {
-      margin-top: 12px;
+    .progress {
+      margin-top: 14px;
       height: 12px;
-      border-radius: 999px;
-      background: rgba(255, 255, 255, 0.08);
       overflow: hidden;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.07);
     }
 
-    .context-progress-fill {
+    .progress-fill {
       height: 100%;
       border-radius: inherit;
-      background: linear-gradient(90deg, var(--blue), #8fd0ff);
     }
 
-    .mini-stats {
+    .mini-grid {
       display: grid;
       gap: 10px;
       grid-template-columns: repeat(3, minmax(0, 1fr));
+      margin-top: 14px;
     }
 
-    .mini-stat {
-      padding: 12px;
-      border-radius: 18px;
-      background: var(--card-soft);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-    }
-
-    .mini-stat-label {
+    .mini-label,
+    .section-label {
       color: var(--muted);
       font-size: 11px;
       font-weight: 700;
@@ -300,66 +294,123 @@ export function getConversationWebviewHtml(
       text-transform: uppercase;
     }
 
-    .mini-stat-value {
+    .mini-value {
       margin-top: 6px;
-      font-size: 20px;
+      font-size: 22px;
       font-weight: 800;
       letter-spacing: -0.04em;
     }
 
-    .mini-stat-context {
-      margin-top: 4px;
-      color: var(--muted);
-      font-size: 12px;
+    .button-row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-top: 14px;
     }
 
-    .live-timeline-wrap {
-      border-radius: 20px;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-      display: grid;
-      grid-template-rows: auto minmax(0, 1fr) auto;
-      min-height: 420px;
-      max-height: 520px;
+    .button,
+    .ghost-button,
+    .timeline-button {
+      border-radius: 999px;
+      padding: 9px 14px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: transform 120ms ease, opacity 120ms ease, border-color 120ms ease;
     }
 
-    .timeline-head,
-    .timeline-footer {
-      padding: 14px 16px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-    }
-
-    .timeline-footer {
-      border-bottom: 0;
-      border-top: 1px solid rgba(255, 255, 255, 0.05);
-      background: rgba(255, 255, 255, 0.03);
-    }
-
-    .timeline-title {
-      font-size: 14px;
+    .button {
+      background: var(--blue);
+      color: #06111b;
       font-weight: 800;
     }
 
-    .timeline-subtitle {
-      margin-top: 4px;
-      color: var(--muted);
-      font-size: 12px;
+    .button[disabled] {
+      cursor: default;
+      opacity: 0.5;
     }
 
-    .timeline-scroll {
-      overflow: auto;
-      padding: 10px 12px 12px;
+    .ghost-button,
+    .timeline-button {
+      background: transparent;
+      color: var(--muted-strong);
+      border-color: rgba(255, 255, 255, 0.08);
+    }
+
+    .button:hover:not([disabled]),
+    .ghost-button:hover,
+    .timeline-button:hover {
+      transform: translateY(-1px);
+      opacity: 0.95;
+    }
+
+    .coach-shell {
       display: grid;
-      gap: 10px;
+      gap: 12px;
     }
 
-    .exchange {
-      padding: 12px;
-      border-radius: 18px;
-      background: rgba(0, 0, 0, 0.14);
-      border: 1px solid rgba(255, 255, 255, 0.04);
+    .insight-panel {
+      min-height: 100%;
+      display: grid;
+      gap: 12px;
+      border-left: 4px solid var(--blue);
+    }
+
+    .insight-panel.info { border-left-color: var(--blue); }
+    .insight-panel.warn { border-left-color: var(--amber); }
+    .insight-panel.danger { border-left-color: var(--red); }
+
+    .insight-title {
+      font-size: 22px;
+      line-height: 1.15;
+      font-weight: 800;
+      letter-spacing: -0.04em;
+    }
+
+    .summary-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .summary-value {
+      margin-top: 8px;
+      font-size: 30px;
+      line-height: 1;
+      font-weight: 800;
+      letter-spacing: -0.05em;
+    }
+
+    .trend-chart {
+      min-height: 180px;
       display: grid;
       gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(16px, 1fr));
+      align-items: end;
+      margin-top: 16px;
+    }
+
+    .trend-bar {
+      display: grid;
+      gap: 8px;
+      justify-items: stretch;
+      align-items: end;
+    }
+
+    .trend-bar-fill {
+      width: 100%;
+      min-height: 8px;
+      border-radius: 12px 12px 6px 6px;
+      background: linear-gradient(180deg, #8fd0ff, #2a77bc);
+    }
+
+    .trend-label {
+      color: var(--muted);
+      font-size: 10px;
+      text-align: center;
+    }
+
+    .timeline-item {
+      display: grid;
+      gap: 10px;
     }
 
     .timeline-row {
@@ -367,18 +418,13 @@ export function getConversationWebviewHtml(
       grid-template-columns: auto minmax(0, 1fr) auto;
       gap: 10px;
       align-items: center;
-      padding: 10px 11px;
+      padding: 12px;
       border-radius: 14px;
-      background: rgba(255, 255, 255, 0.03);
+      background: rgba(0, 0, 0, 0.16);
     }
 
-    .timeline-row.user {
-      border-left: 3px solid var(--blue);
-    }
-
-    .timeline-row.agent {
-      border-left: 3px solid var(--green);
-    }
+    .timeline-row.user { border-left: 3px solid var(--blue); }
+    .timeline-row.agent { border-left: 3px solid var(--green); }
 
     .timeline-role {
       font-size: 11px;
@@ -390,17 +436,16 @@ export function getConversationWebviewHtml(
 
     .timeline-snippet {
       min-width: 0;
+      color: var(--muted-strong);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      color: var(--muted-strong);
     }
 
     .timeline-meta {
-      color: var(--text);
-      font-weight: 700;
       text-align: right;
       white-space: nowrap;
+      font-weight: 700;
     }
 
     .timeline-meta-sub {
@@ -409,284 +454,17 @@ export function getConversationWebviewHtml(
       font-weight: 600;
     }
 
-    .timeline-save {
-      justify-self: end;
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      background: transparent;
-      color: var(--muted-strong);
-      border-radius: 999px;
-      padding: 7px 11px;
-      cursor: pointer;
-    }
-
-    .session-total {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: center;
-      font-weight: 700;
-    }
-
-    .session-total strong {
-      font-size: 20px;
-      letter-spacing: -0.03em;
-    }
-
-    .stats-grid {
-      display: grid;
-      gap: 12px;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-
-    .stat-card {
-      padding: 16px;
-      border-radius: 18px;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-    }
-
-    .stat-label {
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-    }
-
-    .stat-value {
-      margin-top: 7px;
-      font-size: 32px;
-      line-height: 1;
-      font-weight: 800;
-      letter-spacing: -0.05em;
-    }
-
-    .stat-context {
-      margin-top: 8px;
-      color: var(--muted-strong);
-    }
-
-    .stat-secondary {
-      margin-top: 8px;
-      color: var(--muted-strong);
-      font-size: 13px;
-      font-weight: 700;
-    }
-
-    .analytics-grid {
-      display: grid;
-      gap: 12px;
-      grid-template-columns: minmax(260px, 1.1fr) minmax(280px, 0.9fr);
-      margin-top: 14px;
-    }
-
-    .subcard {
-      padding: 16px;
-      border-radius: 18px;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-    }
-
-    .subcard-title {
-      font-size: 14px;
-      font-weight: 800;
-    }
-
-    .subcard-note {
-      margin-top: 4px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-
-    .sparkline {
-      margin-top: 14px;
-      min-height: 150px;
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(14px, 1fr));
-      gap: 8px;
-      align-items: end;
-    }
-
-    .spark-bar {
-      display: grid;
-      gap: 7px;
-      align-items: end;
-      justify-items: stretch;
-    }
-
-    .spark-bar-fill {
-      width: 100%;
-      min-height: 8px;
-      border-radius: 12px 12px 6px 6px;
-      background: linear-gradient(180deg, #86ccff, #2b78bc);
-    }
-
-    .spark-label {
-      color: var(--muted);
-      font-size: 10px;
-      text-align: center;
-    }
-
-    .split-card {
-      display: grid;
-      gap: 16px;
-    }
-
-    .split-wrap {
-      display: grid;
-      gap: 10px;
-    }
-
-    .split-bar {
-      height: 14px;
-      border-radius: 999px;
-      overflow: hidden;
-      display: flex;
-      background: rgba(255, 255, 255, 0.07);
-    }
-
-    .split-segment {
-      height: 100%;
-    }
-
-    .split-segment:nth-child(1) { background: linear-gradient(90deg, #65b8ff, #8fd0ff); }
-    .split-segment:nth-child(2) { background: linear-gradient(90deg, #5dd3a6, #93f0ca); }
-    .split-segment:nth-child(3) { background: linear-gradient(90deg, #f0bc5a, #ffd98f); }
-
-    .split-legend {
-      display: grid;
-      gap: 8px;
-    }
-
-    .legend-row,
-    .model-row,
-    .prompt-row,
-    .alert-row {
-      display: grid;
-      gap: 8px;
-    }
-
-    .legend-row {
-      grid-template-columns: auto minmax(0, 1fr) auto;
-      align-items: center;
-    }
-
-    .legend-dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 999px;
-      background: var(--blue);
-    }
-
-    .legend-row:nth-child(2) .legend-dot { background: var(--green); }
-    .legend-row:nth-child(3) .legend-dot { background: var(--amber); }
-
-    .legend-label {
-      min-width: 0;
-      color: var(--muted-strong);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .legend-meta {
-      color: var(--muted);
-      white-space: nowrap;
-    }
-
-    .model-list {
-      display: grid;
-      gap: 10px;
-    }
-
-    .model-row {
-      padding: 12px;
-      border-radius: 16px;
-      background: rgba(0, 0, 0, 0.12);
-      border: 1px solid rgba(255, 255, 255, 0.04);
-    }
-
-    .model-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-    }
-
-    .model-name {
-      font-weight: 700;
-      min-width: 0;
-    }
-
-    .model-metrics {
-      color: var(--muted);
-      font-size: 12px;
-    }
-
-    .meter {
-      margin-top: 10px;
-      height: 8px;
-      border-radius: 999px;
-      background: rgba(255, 255, 255, 0.06);
-      overflow: hidden;
-    }
-
-    .meter-fill {
-      height: 100%;
-      border-radius: inherit;
-      background: linear-gradient(90deg, var(--green), #9af1d0);
-    }
-
-    .coach-grid {
-      display: grid;
-      gap: 12px;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-
-    .coach-item {
-      padding: 16px;
-      border-radius: 18px;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-      display: grid;
-      gap: 10px;
-      border-left: 4px solid var(--blue);
-    }
-
-    .coach-item.success { border-left-color: var(--green); }
-    .coach-item.warn { border-left-color: var(--amber); }
-    .coach-item.danger { border-left-color: var(--red); }
-
-    .coach-title {
-      font-size: 15px;
-      font-weight: 800;
-      line-height: 1.25;
-    }
-
-    .coach-detail {
-      color: var(--muted-strong);
-    }
-
     .accordion-stack {
-      display: grid;
       gap: 12px;
-    }
-
-    .accordion {
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      background: linear-gradient(180deg, rgba(15, 24, 36, 0.96), rgba(11, 18, 27, 0.98));
-      overflow: hidden;
     }
 
     .accordion > summary {
       list-style: none;
       cursor: pointer;
       display: flex;
-      align-items: center;
       justify-content: space-between;
+      align-items: center;
       gap: 12px;
-      padding: 16px 18px;
       font-weight: 800;
       letter-spacing: -0.02em;
     }
@@ -707,82 +485,12 @@ export function getConversationWebviewHtml(
     }
 
     .accordion-body {
-      padding: 0 18px 18px;
-      border-top: 1px solid rgba(255, 255, 255, 0.05);
-    }
-
-    .search {
-      width: 100%;
-      margin-top: 14px;
-      padding: 11px 13px;
-      border-radius: 14px;
-      border: 1px solid rgba(255, 255, 255, 0.09);
-      background: rgba(255, 255, 255, 0.03);
-      color: var(--text);
-      outline: none;
-    }
-
-    .search:focus,
-    .field input:focus {
-      border-color: rgba(101, 184, 255, 0.45);
-      box-shadow: 0 0 0 1px rgba(101, 184, 255, 0.15);
-    }
-
-    .library-list,
-    .budget-grid,
-    .alert-list {
-      display: grid;
-      gap: 10px;
-      margin-top: 14px;
-    }
-
-    .prompt-card,
-    .budget-card,
-    .alert-card {
-      padding: 14px;
-      border-radius: 16px;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-    }
-
-    .prompt-head,
-    .budget-head,
-    .alert-head {
-      display: flex;
-      align-items: start;
-      justify-content: space-between;
-      gap: 10px;
-    }
-
-    .prompt-title,
-    .alert-title {
-      font-weight: 800;
-    }
-
-    .prompt-meta,
-    .alert-detail,
-    .budget-note {
-      color: var(--muted);
-      font-size: 12px;
-      margin-top: 4px;
-    }
-
-    .prompt-preview {
-      margin-top: 10px;
-      color: var(--muted-strong);
-      background: rgba(0, 0, 0, 0.14);
-      border-radius: 14px;
-      padding: 11px 12px;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
-      font-size: 12px;
-      line-height: 1.5;
+      padding: 18px 20px 20px;
     }
 
     .field-grid {
       display: grid;
-      gap: 10px;
+      gap: 12px;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       margin-top: 14px;
     }
@@ -798,49 +506,84 @@ export function getConversationWebviewHtml(
       font-weight: 700;
     }
 
-    .field input {
+    .field input,
+    .search {
       width: 100%;
-      padding: 11px 12px;
       border-radius: 14px;
       border: 1px solid rgba(255, 255, 255, 0.09);
       background: rgba(255, 255, 255, 0.03);
       color: var(--text);
       outline: none;
+      padding: 11px 12px;
     }
 
-    .button-row {
+    .field input:focus,
+    .search:focus {
+      border-color: rgba(112, 186, 255, 0.46);
+      box-shadow: 0 0 0 1px rgba(112, 186, 255, 0.12);
+    }
+
+    .model-row,
+    .pattern-card {
+      display: grid;
+      gap: 10px;
+    }
+
+    .row-head {
       display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      margin-top: 12px;
+      align-items: start;
+      justify-content: space-between;
+      gap: 10px;
     }
 
-    .button,
-    .ghost-button {
-      border-radius: 999px;
-      padding: 8px 12px;
-      border: 1px solid transparent;
-      cursor: pointer;
-      transition: transform 120ms ease, border-color 120ms ease, opacity 120ms ease;
-    }
-
-    .button {
-      background: var(--blue);
-      color: #04101b;
+    .row-title {
       font-weight: 800;
     }
 
-    .ghost-button {
-      background: transparent;
-      color: var(--muted-strong);
-      border-color: rgba(255, 255, 255, 0.08);
+    .meter {
+      height: 8px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.07);
     }
 
-    .button:hover,
-    .ghost-button:hover,
-    .timeline-save:hover {
-      transform: translateY(-1px);
-      opacity: 0.95;
+    .meter-fill {
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--green), #9af1d0);
+    }
+
+    .tag-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--muted-strong);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .search {
+      margin-bottom: 14px;
+    }
+
+    .prompt-preview {
+      padding: 12px;
+      border-radius: 14px;
+      background: rgba(0, 0, 0, 0.16);
+      color: var(--muted-strong);
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+      font-size: 12px;
+      line-height: 1.52;
     }
 
     .empty {
@@ -853,13 +596,9 @@ export function getConversationWebviewHtml(
     }
 
     @media (max-width: 1120px) {
-      .sticky-live {
-        position: static;
-      }
-
-      .live-layout,
-      .analytics-grid,
-      .coach-grid {
+      .above-fold,
+      .live-grid,
+      .summary-grid {
         grid-template-columns: 1fr;
       }
     }
@@ -870,9 +609,9 @@ export function getConversationWebviewHtml(
         align-items: stretch;
       }
 
-      .stats-grid,
-      .mini-stats,
-      .field-grid {
+      .mini-grid,
+      .field-grid,
+      .summary-grid {
         grid-template-columns: 1fr;
       }
 
@@ -889,53 +628,87 @@ export function getConversationWebviewHtml(
 <body>
   <div class="shell">
     <header class="topbar">
-      <div class="topbar-copy">
+      <div>
         <div class="eyebrow">${title}</div>
-        <div class="title" id="hero-title">Universal AI Token Analytics</div>
-        <div class="subtitle" id="hero-subtitle">One calm view of active AI usage, spend, and waste.</div>
+        <div class="title" id="hero-title">AI Token Analytics</div>
+        <div class="subtitle" id="hero-subtitle">Real-time session quality, spend, and context waste in one view.</div>
       </div>
       <div class="status-pill">
         <div id="status-dot" class="status-dot monitoring"></div>
-        <div id="status-text" class="status-text">Stabilizing the active session...</div>
+        <div id="status-text">Stabilizing live usage capture...</div>
       </div>
     </header>
 
     <main>
-      <section class="card sticky-live">
-        <div class="card-head">
-          <div class="card-kicker">Live Session</div>
-          <div class="card-title">Current active chat</div>
-          <div class="card-subtitle">Locked to the latest real user activity. No stale snap-backs.</div>
-        </div>
-        <div class="card-body" id="live-session"></div>
+      <section class="tier above-fold">
+        <article class="card">
+          <div class="card-head">
+            <div class="eyebrow">Live Session</div>
+            <div class="card-title">Current active chat</div>
+            <div class="card-subtitle">Always pinned to the session that is actually consuming tokens right now.</div>
+          </div>
+          <div class="card-body" id="live-session"></div>
+        </article>
+
+        <article class="card">
+          <div class="card-head">
+            <div class="eyebrow">Groq AI Coach</div>
+            <div class="card-title">Most urgent active insight</div>
+            <div class="card-subtitle">One recommendation at a time, prioritized by wasted spend and context risk.</div>
+          </div>
+          <div class="card-body" id="coach-panel"></div>
+        </article>
       </section>
 
-      <section class="card">
-        <div class="card-head">
-          <div class="card-kicker">Efficiency Coach</div>
-          <div class="card-title">Top 3 actions that matter</div>
-          <div class="card-subtitle">Only the clearest things worth fixing right now.</div>
-        </div>
-        <div class="card-body" id="coach-panel"></div>
-      </section>
+      <section class="tier">
+        <article class="card">
+          <div class="card-head">
+            <div class="eyebrow">Per-Message Timeline</div>
+            <div class="card-title">Prompt-by-prompt cost flow</div>
+            <div class="card-subtitle">Each exchange separated so you can see what the current session is actually paying for.</div>
+          </div>
+          <div class="card-body" id="timeline-panel"></div>
+        </article>
 
-      <section class="card">
-        <div class="card-head">
-          <div class="card-kicker">Aggregate Analytics</div>
-          <div class="card-title">Usage at a glance</div>
-          <div class="card-subtitle">Daily trend, source mix, and model efficiency in one pass.</div>
-        </div>
-        <div class="card-body" id="aggregate-analytics"></div>
+        <article class="card">
+          <div class="card-head">
+            <div class="eyebrow">Spend Summary</div>
+            <div class="card-title">Daily, weekly, and monthly spend</div>
+            <div class="card-subtitle">Visible below the fold, but still first-class.</div>
+          </div>
+          <div class="card-body" id="summary-panel"></div>
+        </article>
+
+        <article class="card">
+          <div class="card-head">
+            <div class="eyebrow">Spend Trend</div>
+            <div class="card-title">Daily spend trend</div>
+            <div class="card-subtitle">Estimated cost per day across all tracked sessions.</div>
+          </div>
+          <div class="card-body" id="trend-panel"></div>
+        </article>
       </section>
 
       <section class="accordion-stack">
         <details class="accordion">
-          <summary>Prompt Library</summary>
-          <div class="accordion-body" id="prompt-library"></div>
+          <summary>Model Efficiency Score</summary>
+          <div class="accordion-body" id="model-panel"></div>
         </details>
         <details class="accordion">
-          <summary>Budgets And Alerts</summary>
+          <summary>Agent Mix Breakdown</summary>
+          <div class="accordion-body" id="agent-panel"></div>
+        </details>
+        <details class="accordion">
+          <summary>Your Patterns</summary>
+          <div class="accordion-body" id="patterns-panel"></div>
+        </details>
+        <details class="accordion">
+          <summary>Budget Settings</summary>
           <div class="accordion-body" id="budget-panel"></div>
+        </details>
+        <details class="accordion">
+          <summary>Prompt Library</summary>
+          <div class="accordion-body" id="prompt-library"></div>
         </details>
       </section>
     </main>
@@ -943,6 +716,13 @@ export function getConversationWebviewHtml(
 
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
+
+    const emptyPatterns = {
+      summaries: [],
+      averageHealthTrend: [],
+      expensivePromptPatterns: [],
+      timeOfDay: [],
+    };
 
     const emptyAnalytics = {
       today: { tokens: 0, costUsd: 0, prompts: 0, sessions: 0 },
@@ -954,6 +734,7 @@ export function getConversationWebviewHtml(
       expensivePrompts: [],
       trend: [],
       coach: [],
+      patterns: emptyPatterns,
     };
 
     let snapshot = {
@@ -969,8 +750,13 @@ export function getConversationWebviewHtml(
         monthlyTokens: null,
       },
       alerts: [],
+      hasGroqKey: false,
+      sessionAnalysis: {
+        isGenerating: false,
+      },
       generatedAt: Date.now(),
     };
+
     let libraryQuery = '';
 
     const heroTitle = document.getElementById('hero-title');
@@ -978,10 +764,15 @@ export function getConversationWebviewHtml(
     const statusDot = document.getElementById('status-dot');
     const statusText = document.getElementById('status-text');
     const liveSession = document.getElementById('live-session');
-    const aggregateAnalytics = document.getElementById('aggregate-analytics');
     const coachPanel = document.getElementById('coach-panel');
-    const promptLibraryPanel = document.getElementById('prompt-library');
+    const timelinePanel = document.getElementById('timeline-panel');
+    const summaryPanel = document.getElementById('summary-panel');
+    const trendPanel = document.getElementById('trend-panel');
+    const modelPanel = document.getElementById('model-panel');
+    const agentPanel = document.getElementById('agent-panel');
+    const patternsPanel = document.getElementById('patterns-panel');
     const budgetPanel = document.getElementById('budget-panel');
+    const promptLibraryPanel = document.getElementById('prompt-library');
 
     function escapeHtml(value) {
       return String(value ?? '')
@@ -996,11 +787,24 @@ export function getConversationWebviewHtml(
       return Math.min(max, Math.max(min, value));
     }
 
+    function renderEmpty(message) {
+      return '<div class="empty">' + escapeHtml(message) + '</div>';
+    }
+
+    function summarizeText(value, limit) {
+      const text = String(value || '').replace(/\\s+/g, ' ').trim();
+      if (!text) {
+        return '';
+      }
+
+      return text.length <= limit ? text : text.slice(0, limit - 3).trimEnd() + '...';
+    }
+
     function formatTokens(value) {
       return Math.round(value || 0).toLocaleString() + ' tokens';
     }
 
-    function formatTokenFigure(value) {
+    function formatTokenCompact(value) {
       return Math.round(value || 0).toLocaleString() + ' tok';
     }
 
@@ -1012,119 +816,59 @@ export function getConversationWebviewHtml(
       return Math.round(value || 0) + '%';
     }
 
-    function formatCompactLine(parts) {
+    function compact(parts) {
       return parts.filter(Boolean).join(' · ');
     }
 
-    function renderEmpty(message) {
-      return '<div class="empty">' + escapeHtml(message) + '</div>';
-    }
-
-    function pill(label, tone) {
-      return '<span class="pill ' + escapeHtml(tone || '') + '">' + escapeHtml(label) + '</span>';
-    }
-
-    function detailLabel(label, value, context) {
-      return ''
-        + '<div class="mini-stat">'
-        + '  <div class="mini-stat-label">' + escapeHtml(label) + '</div>'
-        + '  <div class="mini-stat-value">' + escapeHtml(value) + '</div>'
-        + '  <div class="mini-stat-context">' + escapeHtml(context) + '</div>'
-        + '</div>';
-    }
-
-    function summarizeText(value, limit) {
-      const text = String(value || '').replace(/\\s+/g, ' ').trim();
-      if (!text) {
-        return '';
+    function toneForScore(score) {
+      if ((score || 0) >= 85) {
+        return 'green';
       }
-      return text.length <= limit ? text : text.slice(0, limit - 3).trimEnd() + '...';
+      if ((score || 0) >= 65) {
+        return 'blue';
+      }
+      if ((score || 0) >= 45) {
+        return 'amber';
+      }
+      return 'red';
     }
 
     function toneForContext(fill) {
-      if ((fill || 0) >= 90) {
+      if ((fill || 0) >= 92) {
         return 'red';
       }
-      if ((fill || 0) >= 72) {
+      if ((fill || 0) >= 76) {
         return 'amber';
       }
       return 'green';
     }
 
-    function toneForHistory(ratio) {
-      if ((ratio || 0) >= 0.5) {
-        return 'red';
-      }
-      if ((ratio || 0) >= 0.3) {
-        return 'amber';
-      }
-      return 'green';
-    }
-
-    function contextFillStyle(fill) {
+    function progressStyle(fill) {
       const tone = toneForContext(fill);
       const gradient = tone === 'red'
-        ? 'linear-gradient(90deg, #ff7f81, #ffb1b2)'
+        ? 'linear-gradient(90deg, #ff8f93, #ffc0c3)'
         : tone === 'amber'
-          ? 'linear-gradient(90deg, #f0bc5a, #ffd98f)'
-          : 'linear-gradient(90deg, #65b8ff, #8fd0ff)';
+          ? 'linear-gradient(90deg, #f3c46e, #ffe09f)'
+          : 'linear-gradient(90deg, #70baff, #9ad6ff)';
 
       return 'width:' + clamp(fill, 0, 100) + '%;background:' + gradient + ';';
     }
 
-    function renderTimeline(chat) {
-      const turns = (chat.turns || []).slice().sort(function(left, right) {
-        return (right.updatedAt || 0) - (left.updatedAt || 0);
-      });
+    function chip(label, tone) {
+      return '<span class="chip ' + escapeHtml(tone || '') + '">' + escapeHtml(label) + '</span>';
+    }
 
-      if (turns.length === 0) {
-        return renderEmpty('No turns captured yet for this chat.');
-      }
+    function badgeLabel(level) {
+      return level === 'danger' ? 'Critical' : level === 'warn' ? 'Warning' : 'Info';
+    }
 
-      return turns.map(function(turn) {
-        const metrics = turn.metrics || {
-          inputTokens: 0,
-          historyTokens: 0,
-          thinkingTokens: 0,
-          outputTokens: 0,
-          inputCostUsd: 0,
-          historyCostUsd: 0,
-          thinkingCostUsd: 0,
-          outputCostUsd: 0,
-          costUsd: 0,
-        };
-        const userPreview = summarizeText(turn.blocks['user-input'].content, 92) || 'Prompt captured';
-        const agentPreview = summarizeText(turn.blocks['agent-output'].content || turn.blocks['agent-thinking'].content, 92) || 'Waiting for response';
-        const userMeta = formatCompactLine([
-          metrics.inputTokens > 0 ? formatTokenFigure(metrics.inputTokens) + ' new' : 'Prompt captured',
-          metrics.historyTokens > 0 ? formatTokenFigure(metrics.historyTokens) + ' history' : '',
-          formatUsd((metrics.inputCostUsd || 0) + (metrics.historyCostUsd || 0)),
-        ]);
-        const agentMeta = formatCompactLine([
-          metrics.outputTokens > 0 ? formatTokenFigure(metrics.outputTokens) + ' output' : 'Waiting',
-          metrics.thinkingTokens > 0 ? formatTokenFigure(metrics.thinkingTokens) + ' thinking' : '',
-          formatUsd((metrics.outputCostUsd || 0) + (metrics.thinkingCostUsd || 0)),
-        ]);
-
-        return ''
-          + '<div class="exchange">'
-          + '  <div class="timeline-row user">'
-          + '    <div class="timeline-role">User</div>'
-          + '    <div class="timeline-snippet">' + escapeHtml(userPreview) + '</div>'
-          + '    <div class="timeline-meta">'
-          +        escapeHtml(userMeta)
-          + '    </div>'
-          + '  </div>'
-          + '  <div class="timeline-row agent">'
-          + '    <div class="timeline-role">Agent</div>'
-          + '    <div class="timeline-snippet">' + escapeHtml(agentPreview) + '</div>'
-          + '    <div class="timeline-meta">'
-          +        escapeHtml(agentMeta)
-          + '    </div>'
-          + '  </div>'
-          + '  <button class="timeline-save" data-action="save-prompt" data-source-id="' + escapeHtml(chat.sourceId) + '" data-chat-id="' + escapeHtml(chat.id) + '" data-turn-id="' + escapeHtml(turn.id) + '">Save prompt</button>'
-          + '</div>';
-      }).join('');
+    function renderMini(label, value, copy) {
+      return ''
+        + '<div class="mini-card">'
+        + '  <div class="mini-label">' + escapeHtml(label) + '</div>'
+        + '  <div class="mini-value">' + escapeHtml(value) + '</div>'
+        + '  <div class="mini-copy">' + escapeHtml(copy) + '</div>'
+        + '</div>';
     }
 
     function renderLiveSession() {
@@ -1138,194 +882,324 @@ export function getConversationWebviewHtml(
         totalTokens: 0,
         costUsd: 0,
         promptCount: 0,
-        historyTokens: 0,
+        inputTokens: 0,
         outputTokens: 0,
+        historyTokens: 0,
         historyBloatRatio: 0,
+        healthScore: 100,
       };
-      const contextFill = chat.contextUsagePercent || 0;
-      const heroContext = formatCompactLine([
-        formatTokens(metrics.totalTokens),
-        formatUsd(metrics.costUsd),
-        formatPct(contextFill) + ' of context used',
-      ]);
-      const footerContext = formatCompactLine([
-        formatTokens(metrics.totalTokens),
-        formatUsd(metrics.costUsd),
-        metrics.promptCount + ' prompts in session',
-      ]);
-
-      const healthScoreNum = metrics.healthScore ?? 100;
-      const healthColor = healthScoreNum >= 80 ? 'green' : healthScoreNum >= 40 ? 'amber' : 'red';
-      const warningBanner = healthScoreNum < 40
-        ? '<div style="background: var(--red-soft); color: var(--red); padding: 12px; border-radius: 8px; margin-bottom: 16px; font-weight: 600;">⚠️ <strong>Start Fresh Recommendation:</strong> Context health is critically low (' + healthScoreNum + ' / 100). Continuing this chat is hurting reasoning and bloating cost. Start a new chat.</div>'
-        : '';
+      const contextHealth = chat.contextHealth || {
+        deadReferences: [],
+        deadWeightTokensPerTurn: 0,
+      };
+      const healthScore = metrics.healthScore ?? 100;
+      const isGenerating = Boolean(snapshot.sessionAnalysis && snapshot.sessionAnalysis.isGenerating && snapshot.sessionAnalysis.activeChatId === chat.id);
+      const disabled = !snapshot.hasGroqKey || isGenerating;
+      const startFresh = healthScore <= 40;
+      const analysisButtonLabel = isGenerating ? 'Generating Analysis...' : 'Full Session Analysis';
+      const analysisNote = !snapshot.hasGroqKey
+        ? 'Set aiAgentMonitor.groqApiKey in Settings to unlock the browser report.'
+        : snapshot.sessionAnalysis && snapshot.sessionAnalysis.lastError
+          ? snapshot.sessionAnalysis.lastError
+          : 'Streams a premium HTML report to your browser.';
 
       liveSession.innerHTML = ''
-        + '<div class="live-layout">'
-        + '  <div class="live-overview">'
-        + warningBanner
-        + '    <div>'
-        + '      <div class="pill-row">'
-        +          pill(chat.sourceLabel || 'Unknown agent', 'blue')
-        +          pill(chat.model || 'Unknown model', 'green')
-        +          pill(healthScoreNum + ' Health', healthColor)
-        + '      </div>'
-        + '      <div style="margin-top:14px;" class="live-title">' + escapeHtml((chat.sourceLabel || 'Agent') + ' · ' + (chat.model || 'Unknown model')) + '</div>'
-        + '      <div class="live-subtitle" style="margin-top:8px;">' + escapeHtml(chat.title || 'Untitled chat') + '</div>'
+        + (startFresh
+          ? '<div class="alert-card" style="margin-bottom:16px;border-left:4px solid var(--red);background:var(--red-soft);">'
+            + '<div class="row-title">Start Fresh Recommended</div>'
+            + '<div class="detail-copy">Context health is down to ' + escapeHtml(String(healthScore)) + ' / 100. Continuing this chat is likely dragging old tokens and lowering reasoning quality.</div>'
+            + '</div>'
+          : '')
+        + '<div class="live-grid">'
+        + '  <div>'
+        + '    <div class="tag-row">'
+        +        chip(chat.sourceLabel || 'Unknown source', 'blue')
+        +        chip(chat.model || 'Unknown model', 'green')
+        +        chip('Health ' + healthScore, toneForScore(healthScore))
         + '    </div>'
-        + '    <div class="hero-metric">'
-        + '      <div class="hero-value">' + escapeHtml(Math.round(metrics.totalTokens || 0).toLocaleString()) + '</div>'
-        + '      <div class="hero-context">' + escapeHtml(heroContext) + '</div>'
-        + '      <div class="context-progress"><div class="context-progress-fill" style="' + contextFillStyle(contextFill) + '"></div></div>'
+        + '    <div class="live-title">' + escapeHtml(chat.title || 'Untitled chat') + '</div>'
+        + '    <div class="live-subtitle">' + escapeHtml(compact([
+               formatUsd(metrics.costUsd),
+               formatTokens(metrics.totalTokens),
+               (chat.contextUsagePercent || 0) > 0 ? formatPct(chat.contextUsagePercent) + ' context used' : '',
+             ])) + '</div>'
+        + '    <div class="button-row">'
+        + '      <button class="button" data-action="generate-session-analysis" ' + (disabled ? 'disabled' : '') + '>' + escapeHtml(analysisButtonLabel) + '</button>'
         + '    </div>'
-        + '    <div class="mini-stats">'
-        +        detailLabel('Prompts', String(metrics.promptCount || 0), formatCompactLine([formatTokens(metrics.inputTokens || 0), formatUsd(metrics.costUsd)]))
-        +        detailLabel('History Replay', formatPct((metrics.historyBloatRatio || 0) * 100), formatCompactLine([formatTokens(metrics.historyTokens || 0), toneForHistory(metrics.historyBloatRatio) === 'red' ? 'Actively wasteful' : toneForHistory(metrics.historyBloatRatio) === 'amber' ? 'Worth trimming' : 'Under control']))
-        +        detailLabel('Output', formatTokens(metrics.outputTokens || 0), formatCompactLine([chat.contextWindowTokens ? '~' + Math.round(chat.contextWindowTokens).toLocaleString() + ' window' : '', snapshot.activeSuggestion ? '"' + snapshot.activeSuggestion.title + '" reusable' : 'No saved prompt match']))
-        + '    </div>'
+        + '    <div class="support-copy">' + escapeHtml(analysisNote) + '</div>'
         + '  </div>'
-        + '  <div class="live-timeline-wrap">'
-        + '    <div class="timeline-head">'
-        + '      <div class="timeline-title">Per-message timeline</div>'
-        + '      <div class="timeline-subtitle">Compact rows for prompt cost, response cost, and thinking overhead.</div>'
-        + '    </div>'
-        + '    <div class="timeline-scroll">' + renderTimeline(chat) + '</div>'
-        + '    <div class="timeline-footer">'
-        + '      <div class="session-total">'
-        + '        <span>Running session total</span>'
-        + '        <strong>' + escapeHtml(footerContext) + '</strong>'
-        + '      </div>'
-        + '    </div>'
-        + '  </div>'
-        + '</div>';
-    }
-
-    function renderStatCard(label, bucket) {
-      return ''
-        + '<div class="stat-card">'
-        + '  <div class="stat-label">' + escapeHtml(label) + '</div>'
-        + '  <div class="stat-value">' + escapeHtml(formatUsd(bucket.costUsd)) + '</div>'
-        + '  <div class="stat-secondary">' + escapeHtml(formatTokens(bucket.tokens)) + '</div>'
-        + '  <div class="stat-context">' + escapeHtml(formatCompactLine([bucket.prompts + ' prompts', bucket.sessions + ' sessions'])) + '</div>'
-        + '</div>';
-    }
-
-    function renderTrend(points) {
-      if (!points || points.length === 0) {
-        return renderEmpty('Daily spend trend will appear here as usage accumulates.');
-      }
-
-      const maxCost = Math.max.apply(null, points.map(function(point) {
-        return point.costUsd || 0;
-      }).concat([1]));
-
-      return '<div class="sparkline">' + points.map(function(point) {
-        const height = Math.max(8, Math.round(((point.costUsd || 0) / maxCost) * 126));
-        return ''
-          + '<div class="spark-bar" title="' + escapeHtml(formatCompactLine([point.label, formatUsd(point.costUsd), formatTokens(point.tokens)])) + '">'
-          + '  <div class="spark-bar-fill" style="height:' + height + 'px;"></div>'
-          + '  <div class="spark-label">' + escapeHtml(point.label) + '</div>'
-          + '</div>';
-      }).join('') + '</div>';
-    }
-
-    function renderAgentSplit(rows) {
-      if (!rows || rows.length === 0) {
-        return renderEmpty('Agent comparison will appear once more than one source is active.');
-      }
-
-      const segments = rows.slice(0, 3).map(function(row) {
-        return '<div class="split-segment" style="width:' + clamp((row.costShare || 0) * 100, 0, 100) + '%;"></div>';
-      }).join('');
-
-      const legend = rows.slice(0, 3).map(function(row) {
-        return ''
-          + '<div class="legend-row">'
-          + '  <div class="legend-dot"></div>'
-          + '  <div class="legend-label">' + escapeHtml(row.label) + '</div>'
-          + '  <div class="legend-meta">' + escapeHtml(formatPct((row.costShare || 0) * 100) + ' · ' + formatUsd(row.costUsd)) + '</div>'
-          + '</div>';
-      }).join('');
-
-      return ''
-        + '<div class="split-wrap">'
-        + '  <div class="split-bar">' + segments + '</div>'
-        + '  <div class="split-legend">' + legend + '</div>'
-        + '</div>';
-    }
-
-    function renderModelBreakdown(rows) {
-      if (!rows || rows.length === 0) {
-        return renderEmpty('Model efficiency will appear once model-tagged usage is captured.');
-      }
-
-      return '<div class="model-list">' + rows.slice(0, 5).map(function(row) {
-        return ''
-          + '<div class="model-row">'
-          + '  <div class="model-head">'
-          + '    <div class="model-name">' + escapeHtml(row.label) + '</div>'
-          + '    <div class="pill green">Score ' + escapeHtml(String(row.efficiencyScore || 0)) + '</div>'
-          + '  </div>'
-          + '  <div class="model-metrics">' + escapeHtml(formatCompactLine([formatUsd(row.costPer1kTokens) + ' / 1k tokens', formatPct((row.costShare || 0) * 100) + ' of spend', Math.round(row.outputPerDollar || 0).toLocaleString() + ' output / $'])) + '</div>'
-          + '  <div class="meter"><div class="meter-fill" style="width:' + clamp(row.efficiencyScore || 0, 0, 100) + '%;"></div></div>'
-          + '</div>';
-      }).join('') + '</div>';
-    }
-
-    function renderAggregateAnalytics() {
-      const analytics = snapshot.analytics || emptyAnalytics;
-      aggregateAnalytics.innerHTML = ''
-        + '<div class="stats-grid">'
-        + renderStatCard('Today', analytics.today || emptyAnalytics.today)
-        + renderStatCard('This Week', analytics.week || emptyAnalytics.week)
-        + renderStatCard('This Month', analytics.month || emptyAnalytics.month)
-        + '</div>'
-        + '<div class="analytics-grid">'
-        + '  <div class="subcard">'
-        + '    <div class="subcard-title">Daily spend trend</div>'
-        + '    <div class="subcard-note">Estimated cost per day across every tracked source.</div>'
-        +        renderTrend(analytics.trend || [])
-        + '  </div>'
-        + '  <div class="split-card subcard">'
-        + '    <div>'
-        + '      <div class="subcard-title">Agent mix</div>'
-        + '      <div class="subcard-note">Who is taking the budget right now.</div>'
-        +        renderAgentSplit(analytics.byAgent || [])
-        + '    </div>'
-        + '    <div>'
-        + '      <div class="subcard-title">Model efficiency</div>'
-        + '      <div class="subcard-note">Cost per token and output-per-dollar score.</div>'
-        +        renderModelBreakdown(analytics.byModel || [])
+        + '  <div class="metric-hero">'
+        + '    <div class="mini-label">Live token burn</div>'
+        + '    <div class="hero-value">' + escapeHtml(Math.round(metrics.totalTokens || 0).toLocaleString()) + '</div>'
+        + '    <div class="hero-context">' + escapeHtml(compact([
+               formatUsd(metrics.costUsd || 0),
+               formatTokens(metrics.historyTokens || 0) + ' replayed',
+               formatTokens(metrics.outputTokens || 0) + ' output',
+             ])) + '</div>'
+        + '    <div class="progress"><div class="progress-fill" style="' + progressStyle(chat.contextUsagePercent || 0) + '"></div></div>'
+        + '    <div class="mini-grid">'
+        +        renderMini('Prompts', String(metrics.promptCount || 0), compact([formatTokens(metrics.inputTokens || 0), formatUsd(metrics.costUsd || 0)]))
+        +        renderMini('Replay', formatPct((metrics.historyBloatRatio || 0) * 100), formatTokens(metrics.historyTokens || 0))
+        +        renderMini('Dead Context', contextHealth.deadReferences.length ? String(contextHealth.deadReferences.length) + ' refs' : '0 refs', contextHealth.deadReferences.length ? formatTokens(contextHealth.deadWeightTokensPerTurn || 0) + ' / turn' : 'No unused @ mentions detected')
         + '    </div>'
         + '  </div>'
         + '</div>';
     }
 
     function renderCoachPanel() {
-      if (!snapshot.hasGroqKey) {
+      const insight = snapshot.analytics && snapshot.analytics.primaryCoachInsight;
+
+      if (!insight) {
         coachPanel.innerHTML = ''
-          + '<div style="background: linear-gradient(145deg, rgba(23, 31, 44, 0.96), rgba(12, 19, 28, 0.98)); border: 1px solid var(--amber-soft); padding: 24px; border-radius: var(--radius); text-align: center;">'
-          + '  <div style="font-size: 18px; font-weight: 700; margin-bottom: 8px; color: var(--amber);">Unlock the LLaMA 3 AI Coach</div>'
-          + '  <div style="color: var(--muted-strong); margin-bottom: 16px; max-width: 600px; margin-left: auto; margin-right: auto;">Supply a free Groq API key to unlock real-time prompt analysis. The dashboard will run LLaMA 3 70B implicitly to detect error loops, highlight dead context, and provide actionable engineering advice without slowing down Cursor.</div>'
-          + '  <div style="color: var(--muted); margin-bottom: 8px; font-size: 12px;"><strong>To enable:</strong> Open Settings (Cmd+,), search for <em>aiAgentMonitor.groqApiKey</em>, and paste your free key from <a href="https://console.groq.com/keys" style="color: var(--blue); text-decoration: none;">console.groq.com</a>. Reload the window after saving.</div>'
+          + '<div class="coach-shell">'
+          + '  <div class="insight-panel info">'
+          + '    <div class="badge blue">Info</div>'
+          + '    <div class="insight-title">Session looks healthy</div>'
+          + '    <div class="detail-copy">No urgent context, spend, or model-fit problems are active right now.</div>'
+          + (!snapshot.hasGroqKey
+            ? '<div class="support-copy">Add a Groq API key to unlock deeper narrative coaching and the full browser analysis report.</div>'
+            : '')
+          + '  </div>'
           + '</div>';
         return;
       }
 
-      const insights = (snapshot.analytics && snapshot.analytics.coach) || [];
-      if (insights.length === 0) {
-        coachPanel.innerHTML = renderEmpty('Coach insights will appear once the dashboard has enough activity to compare.');
+      coachPanel.innerHTML = ''
+        + '<div class="coach-shell">'
+        + '  <div class="insight-panel ' + escapeHtml(insight.level) + '">'
+        + '    <div class="badge ' + escapeHtml(insight.level === 'danger' ? 'red' : insight.level === 'warn' ? 'amber' : 'blue') + '">' + escapeHtml(badgeLabel(insight.level)) + '</div>'
+        + '    <div class="insight-title">' + escapeHtml(insight.title) + '</div>'
+        + '    <div class="detail-copy">' + escapeHtml(insight.detail) + '</div>'
+        + '  </div>'
+        + '</div>';
+    }
+
+    function renderTimelinePanel() {
+      const chat = snapshot.activeChat;
+      if (!chat || !chat.turns || chat.turns.length === 0) {
+        timelinePanel.innerHTML = renderEmpty('A turn-by-turn timeline will appear once prompts start flowing.');
         return;
       }
 
-      coachPanel.innerHTML = '<div class="coach-grid">' + insights.slice(0, 3).map(function(insight) {
+      const turns = chat.turns.slice().sort(function(left, right) {
+        return (right.updatedAt || 0) - (left.updatedAt || 0);
+      });
+
+      timelinePanel.innerHTML = '<div class="timeline-list">' + turns.map(function(turn) {
+        const metrics = turn.metrics || {
+          inputTokens: 0,
+          historyTokens: 0,
+          thinkingTokens: 0,
+          outputTokens: 0,
+          inputCostUsd: 0,
+          historyCostUsd: 0,
+          thinkingCostUsd: 0,
+          outputCostUsd: 0,
+          costUsd: 0,
+        };
+        const userPreview = summarizeText(turn.blocks['user-input'].content, 110) || 'Prompt captured';
+        const agentPreview = summarizeText(turn.blocks['agent-output'].content || turn.blocks['agent-thinking'].content, 110) || 'Waiting for response';
+
         return ''
-          + '<div class="coach-item ' + escapeHtml(insight.level) + '">'
-          + '  <div class="pill-row">' + pill(insight.level === 'danger' ? 'Actively wasteful' : insight.level === 'warn' ? 'Worth fixing' : 'Fine', insight.level === 'danger' ? 'red' : insight.level === 'warn' ? 'amber' : 'green') + '</div>'
-          + '  <div class="coach-title">' + escapeHtml(insight.title) + '</div>'
-          + '  <div class="coach-detail">' + escapeHtml(insight.detail) + '</div>'
+          + '<div class="timeline-item">'
+          + '  <div class="timeline-row user">'
+          + '    <div class="timeline-role">User</div>'
+          + '    <div class="timeline-snippet">' + escapeHtml(userPreview) + '</div>'
+          + '    <div class="timeline-meta">'
+          +        escapeHtml(compact([
+                   metrics.inputTokens > 0 ? formatTokenCompact(metrics.inputTokens) + ' new' : 'Prompt captured',
+                   metrics.historyTokens > 0 ? formatTokenCompact(metrics.historyTokens) + ' history' : '',
+                   formatUsd((metrics.inputCostUsd || 0) + (metrics.historyCostUsd || 0)),
+                 ]))
+          + '    </div>'
+          + '  </div>'
+          + '  <div class="timeline-row agent">'
+          + '    <div class="timeline-role">Agent</div>'
+          + '    <div class="timeline-snippet">' + escapeHtml(agentPreview) + '</div>'
+          + '    <div class="timeline-meta">'
+          +        escapeHtml(compact([
+                   metrics.outputTokens > 0 ? formatTokenCompact(metrics.outputTokens) + ' output' : 'Waiting',
+                   metrics.thinkingTokens > 0 ? formatTokenCompact(metrics.thinkingTokens) + ' thinking' : '',
+                   formatUsd((metrics.outputCostUsd || 0) + (metrics.thinkingCostUsd || 0)),
+                 ]))
+          + '    </div>'
+          + '  </div>'
+          + '  <button class="timeline-button" data-action="save-prompt" data-source-id="' + escapeHtml(chat.sourceId) + '" data-chat-id="' + escapeHtml(chat.id) + '" data-turn-id="' + escapeHtml(turn.id) + '">Save prompt</button>'
           + '</div>';
       }).join('') + '</div>';
+    }
+
+    function renderSummaryPanel() {
+      const analytics = snapshot.analytics || emptyAnalytics;
+      summaryPanel.innerHTML = ''
+        + '<div class="summary-grid">'
+        + renderSummaryCard('Today', analytics.today)
+        + renderSummaryCard('This Week', analytics.week)
+        + renderSummaryCard('This Month', analytics.month)
+        + '</div>';
+    }
+
+    function renderSummaryCard(label, bucket) {
+      return ''
+        + '<div class="summary-card">'
+        + '  <div class="mini-label">' + escapeHtml(label) + '</div>'
+        + '  <div class="summary-value">' + escapeHtml(formatUsd(bucket.costUsd)) + '</div>'
+        + '  <div class="detail-copy">' + escapeHtml(formatTokens(bucket.tokens)) + '</div>'
+        + '  <div class="support-copy">' + escapeHtml(compact([bucket.prompts + ' prompts', bucket.sessions + ' sessions'])) + '</div>'
+        + '</div>';
+    }
+
+    function renderTrendPanel() {
+      const points = (snapshot.analytics && snapshot.analytics.trend) || [];
+      if (!points.length) {
+        trendPanel.innerHTML = renderEmpty('Daily trend data will appear as sessions accumulate.');
+        return;
+      }
+
+      const maxCost = Math.max.apply(null, points.map(function(point) {
+        return point.costUsd || 0;
+      }).concat([1]));
+
+      trendPanel.innerHTML = '<div class="trend-chart">' + points.map(function(point) {
+        const height = Math.max(8, Math.round(((point.costUsd || 0) / maxCost) * 150));
+        return ''
+          + '<div class="trend-bar" title="' + escapeHtml(compact([point.label, formatUsd(point.costUsd), formatTokens(point.tokens)])) + '">'
+          + '  <div class="trend-bar-fill" style="height:' + height + 'px;"></div>'
+          + '  <div class="trend-label">' + escapeHtml(point.label) + '</div>'
+          + '</div>';
+      }).join('') + '</div>';
+    }
+
+    function renderModelPanel() {
+      const rows = (snapshot.analytics && snapshot.analytics.byModel) || [];
+      if (!rows.length) {
+        modelPanel.innerHTML = renderEmpty('Model efficiency appears here once model-tagged usage is captured.');
+        return;
+      }
+
+      modelPanel.innerHTML = '<div class="model-list">' + rows.slice(0, 6).map(function(row) {
+        return ''
+          + '<div class="model-row">'
+          + '  <div class="row-head">'
+          + '    <div>'
+          + '      <div class="row-title">' + escapeHtml(row.label) + '</div>'
+          + '      <div class="detail-copy">' + escapeHtml(compact([
+                   formatUsd(row.costPer1kTokens) + ' / 1k tokens',
+                   formatPct((row.costShare || 0) * 100) + ' of spend',
+                   Math.round(row.outputPerDollar || 0).toLocaleString() + ' output / $',
+                 ])) + '</div>'
+          + '    </div>'
+          + '    <div class="chip green">Score ' + escapeHtml(String(row.efficiencyScore || 0)) + '</div>'
+          + '  </div>'
+          + '  <div class="meter"><div class="meter-fill" style="width:' + clamp(row.efficiencyScore || 0, 0, 100) + '%;"></div></div>'
+          + '</div>';
+      }).join('') + '</div>';
+    }
+
+    function renderAgentPanel() {
+      const rows = (snapshot.analytics && snapshot.analytics.byAgent) || [];
+      if (!rows.length) {
+        agentPanel.innerHTML = renderEmpty('Agent mix will appear once multiple tracked sources are active.');
+        return;
+      }
+
+      agentPanel.innerHTML = '<div class="model-list">' + rows.map(function(row) {
+        return ''
+          + '<div class="model-row">'
+          + '  <div class="row-head">'
+          + '    <div>'
+          + '      <div class="row-title">' + escapeHtml(row.label) + '</div>'
+          + '      <div class="detail-copy">' + escapeHtml(compact([
+                   formatUsd(row.costUsd),
+                   formatTokens(row.tokens),
+                   row.sessions + ' sessions',
+                 ])) + '</div>'
+          + '    </div>'
+          + '    <div class="chip blue">' + escapeHtml(formatPct((row.costShare || 0) * 100)) + '</div>'
+          + '  </div>'
+          + '  <div class="meter"><div class="meter-fill" style="width:' + clamp((row.costShare || 0) * 100, 0, 100) + '%;background:linear-gradient(90deg, var(--blue), #9ad6ff);"></div></div>'
+          + '</div>';
+      }).join('') + '</div>';
+    }
+
+    function renderPatternsPanel() {
+      const patterns = (snapshot.analytics && snapshot.analytics.patterns) || emptyPatterns;
+      if (!patterns.summaries || !patterns.summaries.length) {
+        patternsPanel.innerHTML = renderEmpty('Patterns appear after you complete and switch between sessions.');
+        return;
+      }
+
+      const bestSession = patterns.bestSession;
+      const worstSession = patterns.worstSession;
+      const topPeriod = patterns.timeOfDay && patterns.timeOfDay[0];
+
+      patternsPanel.innerHTML = ''
+        + '<div class="pattern-grid">'
+        + '  <div class="pattern-card">'
+        + '    <div class="section-label">Average Health Trend</div>'
+        + '    <div class="detail-copy">' + escapeHtml(patterns.averageHealthTrend.map(function(point) {
+               return point.label + ' ' + Math.round(point.healthScore);
+             }).join(' · ')) + '</div>'
+        + '  </div>'
+        + '  <div class="pattern-card">'
+        + '    <div class="section-label">Best Vs Worst</div>'
+        + '    <div class="detail-copy">' + escapeHtml(bestSession ? bestSession.title + ' (' + Math.round(bestSession.efficiencyScore) + ')' : 'No best session yet') + '</div>'
+        + '    <div class="support-copy">' + escapeHtml(worstSession ? worstSession.title + ' (' + Math.round(worstSession.efficiencyScore) + ')' : 'No worst session yet') + '</div>'
+        + '  </div>'
+        + '  <div class="pattern-card">'
+        + '    <div class="section-label">Time Of Day Efficiency</div>'
+        + '    <div class="detail-copy">' + escapeHtml(topPeriod ? topPeriod.label + ' averages ' + Math.round(topPeriod.averageEfficiencyScore) + ' / 100 efficiency' : 'Not enough sessions yet') + '</div>'
+        + '  </div>'
+        + '</div>'
+        + '<div class="model-list" style="margin-top:14px;">'
+        + ((patterns.expensivePromptPatterns || []).length
+          ? patterns.expensivePromptPatterns.map(function(pattern) {
+              return ''
+                + '<div class="pattern-card">'
+                + '  <div class="row-head">'
+                + '    <div>'
+                + '      <div class="row-title">' + escapeHtml(pattern.label) + '</div>'
+                + '      <div class="detail-copy">' + escapeHtml(compact([
+                         formatUsd(pattern.averageCostUsd) + ' avg',
+                         formatUsd(pattern.totalCostUsd) + ' total',
+                         pattern.sessions + ' sessions',
+                       ])) + '</div>'
+                + '    </div>'
+                + '    <div class="chip amber">' + escapeHtml(pattern.prompts + ' prompts') + '</div>'
+                + '  </div>'
+                + '</div>';
+            }).join('')
+          : renderEmpty('No expensive prompt patterns have formed yet.'))
+        + '</div>';
+    }
+
+    function renderBudgetPanel() {
+      const alerts = snapshot.alerts || [];
+      const alertMarkup = alerts.length
+        ? '<div class="alert-list">' + alerts.map(function(alert) {
+            return ''
+              + '<div class="alert-card">'
+              + '  <div class="row-head">'
+              + '    <div>'
+              + '      <div class="row-title">' + escapeHtml(alert.title) + '</div>'
+              + '      <div class="detail-copy">' + escapeHtml(alert.detail) + '</div>'
+              + '    </div>'
+              + '    <div class="chip ' + escapeHtml(alert.level === 'critical' ? 'red' : alert.level === 'warn' ? 'amber' : 'blue') + '">' + escapeHtml(formatPct((alert.progress || 0) * 100)) + '</div>'
+              + '  </div>'
+              + '</div>';
+          }).join('') + '</div>'
+        : renderEmpty('No active alerts yet. Set budgets here and the dashboard will watch your runway.');
+
+      budgetPanel.innerHTML = ''
+        + '<div class="detail-copy">Secondary controls stay tucked away here so the primary dashboard can stay focused.</div>'
+        + '<div class="field-grid">'
+        + '  <div class="field"><label for="daily-cost-budget">Daily cost budget (USD)</label><input id="daily-cost-budget" type="number" min="0" step="0.01" value="' + escapeHtml(snapshot.budgets.dailyCostUsd ?? '') + '"></div>'
+        + '  <div class="field"><label for="monthly-cost-budget">Monthly cost budget (USD)</label><input id="monthly-cost-budget" type="number" min="0" step="0.01" value="' + escapeHtml(snapshot.budgets.monthlyCostUsd ?? '') + '"></div>'
+        + '  <div class="field"><label for="daily-token-budget">Daily token budget</label><input id="daily-token-budget" type="number" min="0" step="1" value="' + escapeHtml(snapshot.budgets.dailyTokens ?? '') + '"></div>'
+        + '  <div class="field"><label for="monthly-token-budget">Monthly token budget</label><input id="monthly-token-budget" type="number" min="0" step="1" value="' + escapeHtml(snapshot.budgets.monthlyTokens ?? '') + '"></div>'
+        + '</div>'
+        + '<div class="button-row"><button class="button" data-action="save-budgets">Save budgets</button></div>'
+        + alertMarkup;
     }
 
     function renderPromptLibrary() {
@@ -1333,101 +1207,64 @@ export function getConversationWebviewHtml(
         if (!libraryQuery) {
           return true;
         }
+
         const haystack = [prompt.title, prompt.content].concat(prompt.tags || []).join(' ').toLowerCase();
         return haystack.includes(libraryQuery);
       });
 
-      const list = prompts.length === 0
-        ? renderEmpty(libraryQuery ? 'No saved prompts match this search.' : 'Save a strong prompt from the live session and it will show up here.')
-        : '<div class="library-list">' + prompts.map(function(prompt) {
+      const list = prompts.length
+        ? '<div class="library-list">' + prompts.map(function(prompt) {
             return ''
               + '<div class="prompt-card">'
-              + '  <div class="prompt-head">'
+              + '  <div class="row-head">'
               + '    <div>'
-              + '      <div class="prompt-title">' + escapeHtml(prompt.title) + '</div>'
-              + '      <div class="prompt-meta">' + escapeHtml(formatCompactLine([prompt.model || prompt.sourceLabel || 'Saved prompt', 'Used ' + (prompt.useCount || 0) + ' times'])) + '</div>'
+              + '      <div class="row-title">' + escapeHtml(prompt.title) + '</div>'
+              + '      <div class="detail-copy">' + escapeHtml(compact([
+                       prompt.model || prompt.sourceLabel || 'Saved prompt',
+                       'Used ' + (prompt.useCount || 0) + ' times',
+                     ])) + '</div>'
               + '    </div>'
-              + '    <div class="inline-tags">' + (prompt.tags || []).map(function(tag) {
-                  return '<span class="tag">' + escapeHtml(tag) + '</span>';
-                }).join('') + '</div>'
+              + '    <div class="tag-row">' + (prompt.tags || []).map(function(tag) {
+                       return '<span class="tag">' + escapeHtml(tag) + '</span>';
+                     }).join('') + '</div>'
               + '  </div>'
-              + '  <div class="prompt-preview">' + escapeHtml(prompt.content.length > 220 ? prompt.content.slice(0, 217).trimEnd() + '...' : prompt.content) + '</div>'
+              + '  <div class="prompt-preview">' + escapeHtml(prompt.content.length > 280 ? prompt.content.slice(0, 277).trimEnd() + '...' : prompt.content) + '</div>'
               + '  <div class="button-row">'
               + '    <button class="button" data-action="copy-prompt" data-prompt-id="' + escapeHtml(prompt.id) + '">Copy</button>'
               + '    <button class="ghost-button" data-action="delete-prompt" data-prompt-id="' + escapeHtml(prompt.id) + '">Delete</button>'
               + '  </div>'
               + '</div>';
-          }).join('') + '</div>';
+          }).join('') + '</div>'
+        : renderEmpty(libraryQuery ? 'No saved prompts match this search.' : 'Save a strong prompt from the timeline and it will appear here.');
 
       promptLibraryPanel.innerHTML = ''
         + '<input id="library-search" class="search" type="search" placeholder="Search saved prompts or tags..." value="' + escapeHtml(libraryQuery) + '">'
         + list;
     }
 
-    function renderBudgetPanel() {
-      const alerts = snapshot.alerts || [];
-      const alertList = alerts.length === 0
-        ? renderEmpty('No active alerts yet. Set a token or cost budget to start tracking runway.')
-        : '<div class="alert-list">' + alerts.map(function(alert) {
-            return ''
-              + '<div class="alert-card">'
-              + '  <div class="alert-head">'
-              + '    <div>'
-              + '      <div class="alert-title">' + escapeHtml(alert.title) + '</div>'
-              + '      <div class="alert-detail">' + escapeHtml(alert.detail) + '</div>'
-              + '    </div>'
-              + '    <div>' + pill(formatPct((alert.progress || 0) * 100), alert.level === 'critical' ? 'red' : alert.level === 'warn' ? 'amber' : 'green') + '</div>'
-              + '  </div>'
-              + '</div>';
-          }).join('') + '</div>';
-
-      budgetPanel.innerHTML = ''
-        + '<div class="budget-note">Secondary controls stay tucked away here so the main dashboard can stay calm.</div>'
-        + '<div class="field-grid">'
-        + '  <div class="field"><label for="daily-cost-budget">Daily cost budget (USD)</label><input id="daily-cost-budget" type="number" min="0" step="0.01" value="' + escapeHtml(snapshot.budgets.dailyCostUsd ?? '') + '"></div>'
-        + '  <div class="field"><label for="monthly-cost-budget">Monthly cost budget (USD)</label><input id="monthly-cost-budget" type="number" min="0" step="0.01" value="' + escapeHtml(snapshot.budgets.monthlyCostUsd ?? '') + '"></div>'
-        + '  <div class="field"><label for="daily-token-budget">Daily token budget</label><input id="daily-token-budget" type="number" min="0" step="1" value="' + escapeHtml(snapshot.budgets.dailyTokens ?? '') + '"></div>'
-        + '  <div class="field"><label for="monthly-token-budget">Monthly token budget</label><input id="monthly-token-budget" type="number" min="0" step="1" value="' + escapeHtml(snapshot.budgets.monthlyTokens ?? '') + '"></div>'
-        + '</div>'
-        + '<div class="button-row">'
-        + '  <button class="button" data-action="save-budgets">Save budgets</button>'
-        + '</div>'
-        + alertList;
-    }
-
     function applySnapshot(nextSnapshot) {
-      snapshot = nextSnapshot || {
-        app: 'unknown',
-        appLabel: 'VS Code',
-        sources: [],
-        analytics: emptyAnalytics,
-        promptLibrary: [],
-        budgets: {
-          dailyCostUsd: null,
-          monthlyCostUsd: null,
-          dailyTokens: null,
-          monthlyTokens: null,
-        },
-        alerts: [],
-        generatedAt: Date.now(),
-      };
-
+      snapshot = nextSnapshot || snapshot;
       heroTitle.textContent = (snapshot.appLabel || 'VS Code') + ' AI Token Analytics';
-      heroSubtitle.textContent = 'Tracking ' + (((snapshot.sources || []).length) || 0) + ' active source' + ((((snapshot.sources || []).length) || 0) === 1 ? '' : 's') + ' in one paid-product style dashboard.';
+      heroSubtitle.textContent = 'Tracking ' + (((snapshot.sources || []).length) || 0) + ' active source' + ((((snapshot.sources || []).length) || 0) === 1 ? '' : 's') + ' with live context and spend guidance.';
       render();
     }
 
     function updateStatus(status, text) {
       statusDot.className = 'status-dot ' + (status || 'monitoring');
-      statusText.textContent = text || 'Monitoring AI usage...';
+      statusText.textContent = text || 'Tracking AI usage...';
     }
 
     function render() {
       renderLiveSession();
-      renderAggregateAnalytics();
       renderCoachPanel();
-      renderPromptLibrary();
+      renderTimelinePanel();
+      renderSummaryPanel();
+      renderTrendPanel();
+      renderModelPanel();
+      renderAgentPanel();
+      renderPatternsPanel();
       renderBudgetPanel();
+      renderPromptLibrary();
     }
 
     document.addEventListener('click', function(event) {
@@ -1438,6 +1275,11 @@ export function getConversationWebviewHtml(
 
       const action = target.dataset.action;
       if (!action) {
+        return;
+      }
+
+      if (action === 'generate-session-analysis') {
+        vscode.postMessage({ command: 'generateSessionAnalysis' });
         return;
       }
 
@@ -1470,11 +1312,7 @@ export function getConversationWebviewHtml(
       if (action === 'save-budgets') {
         const parseField = function(id) {
           const element = document.getElementById(id);
-          if (!(element instanceof HTMLInputElement)) {
-            return null;
-          }
-
-          if (!element.value) {
+          if (!(element instanceof HTMLInputElement) || !element.value) {
             return null;
           }
 
@@ -1521,6 +1359,8 @@ export function getConversationWebviewHtml(
             promptLibrary: snapshot.promptLibrary,
             budgets: snapshot.budgets,
             alerts: [],
+            hasGroqKey: snapshot.hasGroqKey,
+            sessionAnalysis: snapshot.sessionAnalysis,
             generatedAt: Date.now(),
           });
           break;

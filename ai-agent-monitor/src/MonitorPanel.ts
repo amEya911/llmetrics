@@ -17,6 +17,12 @@ function createEmptySnapshot(): MonitorSnapshot {
       expensivePrompts: [],
       trend: [],
       coach: [],
+      patterns: {
+        summaries: [],
+        averageHealthTrend: [],
+        expensivePromptPatterns: [],
+        timeOfDay: [],
+      },
     },
     promptLibrary: [],
     budgets: {
@@ -26,6 +32,10 @@ function createEmptySnapshot(): MonitorSnapshot {
       monthlyTokens: null,
     },
     alerts: [],
+    hasGroqKey: false,
+    sessionAnalysis: {
+      isGenerating: false,
+    },
     generatedAt: Date.now(),
   };
 }

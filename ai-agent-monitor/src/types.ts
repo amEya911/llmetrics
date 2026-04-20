@@ -4,6 +4,10 @@ export type AgentSourceId = 'cursor' | 'antigravity' | 'manual';
 
 export type BlockType = 'user-input' | 'agent-thinking' | 'agent-output';
 
+export type CoachInsightLevel = 'danger' | 'warn' | 'info';
+
+export type PromptComplexity = 'trivial' | 'moderate' | 'complex' | 'reasoning-heavy';
+
 export const BLOCK_TYPES: readonly BlockType[] = [
   'user-input',
   'agent-thinking',
@@ -31,10 +35,37 @@ export interface TokenEstimate {
   isEstimated: boolean;
 }
 
+export interface ContextReference {
+  type: 'file' | 'folder' | 'selection' | 'terminal' | 'documentation';
+  name: string;
+  uri?: string;
+  tokenCountEstimate: number;
+  mentionCount: number;
+  referencedInResponse: boolean;
+}
+
+export interface ContextHealthScore {
+  score: number;
+  historyBloatRatio: number;
+  deadReferences: ContextReference[];
+  warnings: string[];
+  deadWeightTokensPerTurn: number;
+}
+
+export interface ModelRecommendation {
+  complexity: PromptComplexity;
+  currentModel: string;
+  recommendedModel: string;
+  reason: string;
+  estimatedOverspendUsd: number;
+  estimatedOverspendPct: number;
+}
+
 export interface PromptAssessment {
   score: number;
   repeatedCount: number;
   notes: string[];
+  complexity?: PromptComplexity;
   similarSavedPromptId?: string;
 }
 
@@ -61,6 +92,7 @@ export interface ConversationTurn {
   modelConfidence?: ModelConfidence;
   metrics?: TokenEstimate;
   assessment?: PromptAssessment;
+  modelRecommendation?: ModelRecommendation;
 }
 
 export interface ConversationChat {
@@ -77,6 +109,7 @@ export interface ConversationChat {
   modelConfidence?: ModelConfidence;
   contextUsagePercent?: number;
   contextWindowTokens?: number;
+  contextHealth?: ContextHealthScore;
   metrics?: SessionMetrics;
 }
 
@@ -146,9 +179,71 @@ export interface TrendPoint {
 
 export interface CoachInsight {
   id: string;
-  level: 'danger' | 'warn' | 'success';
+  level: CoachInsightLevel;
   title: string;
   detail: string;
+}
+
+export interface SessionPromptSummary {
+  promptText: string;
+  promptPreview: string;
+  promptSignature: string;
+  inputTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  promptScore: number;
+  complexity: PromptComplexity;
+}
+
+export interface PersistedSessionSummary {
+  id: string;
+  sourceId: AgentSourceId;
+  sourceLabel: string;
+  chatId: string;
+  title: string;
+  model: string;
+  startedAt: number;
+  endedAt: number;
+  healthScore: number;
+  efficiencyScore: number;
+  averagePromptScore: number;
+  costUsd: number;
+  totalTokens: number;
+  promptCount: number;
+  historyBloatRatio: number;
+  prompts: SessionPromptSummary[];
+}
+
+export interface SessionHealthTrendPoint {
+  timestamp: number;
+  label: string;
+  healthScore: number;
+  efficiencyScore: number;
+}
+
+export interface PromptPatternInsight {
+  label: string;
+  averageCostUsd: number;
+  totalCostUsd: number;
+  prompts: number;
+  sessions: number;
+}
+
+export interface TimeOfDayPattern {
+  label: string;
+  averageHealthScore: number;
+  averageEfficiencyScore: number;
+  averageCostUsd: number;
+  sessions: number;
+}
+
+export interface CrossSessionPatterns {
+  summaries: PersistedSessionSummary[];
+  averageHealthTrend: SessionHealthTrendPoint[];
+  expensivePromptPatterns: PromptPatternInsight[];
+  bestSession?: PersistedSessionSummary;
+  worstSession?: PersistedSessionSummary;
+  timeOfDay: TimeOfDayPattern[];
 }
 
 export interface SavedPrompt {
@@ -197,7 +292,16 @@ export interface DashboardAnalytics {
   expensivePrompts: RankedPrompt[];
   trend: TrendPoint[];
   bestValueModel?: BreakdownRow;
+  primaryCoachInsight?: CoachInsight;
   coach: CoachInsight[];
+  patterns: CrossSessionPatterns;
+}
+
+export interface SessionAnalysisState {
+  isGenerating: boolean;
+  activeChatId?: string;
+  lastGeneratedAt?: number;
+  lastError?: string;
 }
 
 export interface MonitorSnapshot {
@@ -211,6 +315,7 @@ export interface MonitorSnapshot {
   budgets: BudgetSettings;
   alerts: BudgetAlert[];
   hasGroqKey: boolean;
+  sessionAnalysis: SessionAnalysisState;
   generatedAt: number;
 }
 
@@ -233,7 +338,8 @@ export interface WebviewIncoming {
     | 'copyPrompt'
     | 'deletePrompt'
     | 'markPromptUsed'
-    | 'updateBudgets';
+    | 'updateBudgets'
+    | 'generateSessionAnalysis';
   promptId?: string;
   sourceId?: AgentSourceId;
   chatId?: string;

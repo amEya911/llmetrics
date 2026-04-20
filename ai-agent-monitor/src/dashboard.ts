@@ -4,18 +4,25 @@ import {
   BudgetAlert,
   BudgetSettings,
   CoachInsight,
+  CrossSessionPatterns,
   ConversationChat,
   ConversationTurn,
   DashboardAnalytics,
   MonitorSnapshot,
+  PersistedSessionSummary,
+  PromptComplexity,
   PromptSuggestion,
   RankedPrompt,
   RankedSession,
   SavedPrompt,
+  SessionAnalysisState,
+  SessionHealthTrendPoint,
   SourceSnapshot,
+  TimeOfDayPattern,
   TimeboxMetrics,
   TrendPoint,
 } from './types';
+import { analyzeChatContext } from './CursorContextAnalyzer';
 
 interface DashboardBuildOptions {
   app: MonitorSnapshot['app'];
@@ -26,6 +33,9 @@ interface DashboardBuildOptions {
   budgets: BudgetSettings;
   hasGroqKey: boolean;
   groqInsights?: CoachInsight[];
+  persistedSessions?: PersistedSessionSummary[];
+  sessionAnalysis?: SessionAnalysisState;
+  workspacePaths?: string[];
   now?: number;
 }
 
@@ -46,6 +56,10 @@ interface PromptRecord {
   words: Set<string>;
   turn: ConversationTurn;
   chat: ConversationChat;
+}
+
+interface CoachCandidate extends CoachInsight {
+  weight: number;
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -80,6 +94,16 @@ export function createEmptyAnalytics(): DashboardAnalytics {
     expensivePrompts: [],
     trend: [],
     coach: [],
+    patterns: createEmptyCrossSessionPatterns(),
+  };
+}
+
+function createEmptyCrossSessionPatterns(): CrossSessionPatterns {
+  return {
+    summaries: [],
+    averageHealthTrend: [],
+    expensivePromptPatterns: [],
+    timeOfDay: [],
   };
 }
 
@@ -88,7 +112,7 @@ export function buildDashboardSnapshot(options: DashboardBuildOptions): MonitorS
   const promptLibrary = [...options.promptLibrary]
     .sort((left, right) => right.updatedAt - left.updatedAt);
 
-  const sources = options.sources.map((source) => enrichSource(source));
+  const sources = options.sources.map((source) => enrichSource(source, options.workspacePaths ?? []));
   const promptRecords = collectPromptRecords(sources);
   const repeatedCounts = computeRepeatedPromptCounts(promptRecords);
   applyPromptAssessments(sources, promptRecords, repeatedCounts, promptLibrary);
@@ -104,11 +128,10 @@ export function buildDashboardSnapshot(options: DashboardBuildOptions): MonitorS
     now,
     activeChat,
     activeSuggestion,
-    repeatedCounts
+    repeatedCounts,
+    options.groqInsights,
+    options.persistedSessions ?? []
   );
-  if (options.groqInsights && options.groqInsights.length > 0) {
-    analytics.coach = [...options.groqInsights, ...analytics.coach];
-  }
   const alerts = computeBudgetAlerts(options.budgets, analytics, now);
 
   return {
@@ -122,20 +145,70 @@ export function buildDashboardSnapshot(options: DashboardBuildOptions): MonitorS
     budgets: options.budgets,
     alerts,
     hasGroqKey: options.hasGroqKey,
+    sessionAnalysis: options.sessionAnalysis ?? { isGenerating: false },
     generatedAt: now,
   };
 }
 
-function enrichSource(source: SourceSnapshot): SourceSnapshot {
+export function createPersistedSessionSummary(chat: ConversationChat): PersistedSessionSummary | undefined {
+  const metrics = chat.metrics;
+  if (!metrics || metrics.promptCount <= 0) {
+    return undefined;
+  }
+
+  const promptSummaries = chat.turns
+    .filter((turn) => Boolean(turn.blocks['user-input'].content.trim()))
+    .map((turn) => {
+      const promptText = turn.blocks['user-input'].content.trim();
+      return {
+        promptText,
+        promptPreview: summarizePrompt(promptText),
+        promptSignature: createPromptSignature(promptText),
+        inputTokens: turn.metrics?.inputTokens ?? estimateTokens(promptText),
+        totalTokens: turn.metrics?.totalTokens ?? estimateTokens(promptText),
+        costUsd: turn.metrics?.costUsd ?? 0,
+        promptScore: turn.assessment?.score ?? 50,
+        complexity: turn.assessment?.complexity ?? classifyPromptComplexity(
+          promptText,
+          turn.metrics?.inputTokens ?? estimateTokens(promptText)
+        ),
+      };
+    });
+  const averagePromptScore = promptSummaries.length > 0
+    ? promptSummaries.reduce((sum, prompt) => sum + prompt.promptScore, 0) / promptSummaries.length
+    : 0;
+  const healthScore = metrics.healthScore ?? 100;
+
+  return {
+    id: `${chat.sourceId}:${chat.id}:${chat.updatedAt}`,
+    sourceId: chat.sourceId,
+    sourceLabel: chat.sourceLabel,
+    chatId: chat.id,
+    title: chat.title || 'Untitled session',
+    model: chat.model ?? 'Unknown model',
+    startedAt: chat.createdAt,
+    endedAt: chat.updatedAt,
+    healthScore,
+    efficiencyScore: computeSessionEfficiencyScore(healthScore, averagePromptScore, metrics.historyBloatRatio),
+    averagePromptScore,
+    costUsd: metrics.costUsd,
+    totalTokens: metrics.totalTokens,
+    promptCount: metrics.promptCount,
+    historyBloatRatio: metrics.historyBloatRatio,
+    prompts: promptSummaries,
+  };
+}
+
+function enrichSource(source: SourceSnapshot, workspacePaths: string[]): SourceSnapshot {
   return {
     ...source,
     chats: source.chats
-      .map((chat) => enrichChat(chat))
+      .map((chat) => enrichChat(chat, workspacePaths))
       .sort((left, right) => right.updatedAt - left.updatedAt),
   };
 }
 
-function enrichChat(chat: ConversationChat): ConversationChat {
+function enrichChat(chat: ConversationChat, workspacePaths: string[]): ConversationChat {
   const model = normalizeModelLabel(chat.model, chat.sourceId);
   const profile = resolveModelProfile(model, chat.sourceId);
   const turns = [...chat.turns]
@@ -195,15 +268,6 @@ function enrichChat(chat: ConversationChat): ConversationChat {
     ? sessionHistoryTokens / Math.max(1, sessionInputTokens + sessionHistoryTokens)
     : 0;
 
-  let healthScore = 100;
-  if (historyBloatRatio > 0.5) {
-    healthScore -= (historyBloatRatio - 0.5) * 100; // Deduct up to 50 points based on bloat
-  }
-  if (turns.length > 8) {
-    healthScore -= (turns.length - 8) * 3; // Deduct 3 points for every turn over 8
-  }
-  healthScore = Math.max(0, Math.min(100, Math.round(healthScore)));
-
   const metrics = {
     inputTokens: sessionInputTokens,
     historyTokens: sessionHistoryTokens,
@@ -214,7 +278,7 @@ function enrichChat(chat: ConversationChat): ConversationChat {
     promptCount: turns.filter((turn) => Boolean(turn.blocks['user-input'].content.trim())).length,
     turnCount: turns.length,
     historyBloatRatio,
-    healthScore,
+    healthScore: 100, // Will be overridden by rigorous analyzeChatContext below
   };
 
   let contextWindowTokens = chat.contextWindowTokens;
@@ -228,7 +292,7 @@ function enrichChat(chat: ConversationChat): ConversationChat {
     }
   }
 
-  return {
+  const enrichedChat = {
     ...chat,
     model,
     modelConfidence: chat.modelConfidence ?? (chat.model ? 'inferred' : 'unknown'),
@@ -236,6 +300,13 @@ function enrichChat(chat: ConversationChat): ConversationChat {
     metrics,
     turns,
   };
+
+  const contextHealth = analyzeChatContext(enrichedChat, workspacePaths);
+  enrichedChat.contextHealth = contextHealth;
+  enrichedChat.metrics.healthScore = contextHealth.score;
+  enrichedChat.metrics.historyBloatRatio = contextHealth.historyBloatRatio;
+
+  return enrichedChat;
 }
 
 function collectPromptRecords(sources: SourceSnapshot[]): PromptRecord[] {
@@ -312,6 +383,7 @@ function applyPromptAssessments(
         let score = 100;
         const wordCount = record.words.size;
         const tokenCount = turn.metrics?.inputTokens ?? estimateTokens(text);
+        const complexity = classifyPromptComplexity(text, tokenCount);
 
         if (wordCount < 6) {
           notes.push('Very little task detail.');
@@ -339,6 +411,12 @@ function applyPromptAssessments(
           score -= 12;
         }
 
+        if (complexity === 'reasoning-heavy') {
+          notes.push('This is a high-reasoning task, so precision in constraints matters.');
+        } else if (complexity === 'trivial') {
+          notes.push('Simple enough that a cheaper fast model would probably handle it.');
+        }
+
         const suggestion = findSavedPromptSuggestion(text, promptLibrary);
         if (suggestion) {
           notes.push(`Saved prompt "${suggestion.title}" is close to this task.`);
@@ -349,8 +427,16 @@ function applyPromptAssessments(
           score: clamp(Math.round(score), 25, 100),
           repeatedCount,
           notes,
+          complexity,
           similarSavedPromptId: suggestion?.promptId,
         };
+        turn.modelRecommendation = buildModelRecommendation(
+          text,
+          turn.model ?? chat.model ?? 'Unknown model',
+          chat.sourceId,
+          tokenCount,
+          turn.metrics?.outputTokens ?? 0
+        );
       }
     }
   }
@@ -389,7 +475,9 @@ function computeAnalytics(
   now: number,
   activeChat: ConversationChat | undefined,
   activeSuggestion: PromptSuggestion | undefined,
-  repeatedCounts: Map<string, number>
+  repeatedCounts: Map<string, number>,
+  groqInsights: CoachInsight[] | undefined,
+  persistedSessions: PersistedSessionSummary[]
 ): DashboardAnalytics {
   const dayStart = startOfLocalDay(now);
   const weekStart = startOfLocalDay(now - ((new Date(now).getDay() + 6) % 7) * DAY_MS);
@@ -479,10 +567,17 @@ function computeAnalytics(
 
   const byAgentRows = finalizeBreakdown(byAgent);
   const byModelRows = finalizeBreakdown(byModel);
-  const coach = computeCoachInsights(promptRecords, activeChat, activeSuggestion, repeatedCounts);
+  const coach = computeCoachInsights(
+    promptRecords,
+    activeChat,
+    activeSuggestion,
+    repeatedCounts,
+    groqInsights
+  );
   const bestValueModel = [...byModelRows]
     .filter((row) => row.costUsd > 0)
     .sort((left, right) => right.outputPerDollar - left.outputPerDollar)[0];
+  const patterns = computeCrossSessionPatterns(persistedSessions);
 
   return {
     today,
@@ -498,7 +593,9 @@ function computeAnalytics(
       .slice(0, MAX_TOP_ITEMS),
     trend: buildTrendSeries(trend, trendStart, now),
     bestValueModel,
+    primaryCoachInsight: coach[0],
     coach,
+    patterns,
   };
 }
 
@@ -541,9 +638,10 @@ function computeCoachInsights(
   promptRecords: PromptRecord[],
   activeChat: ConversationChat | undefined,
   activeSuggestion: PromptSuggestion | undefined,
-  repeatedCounts: Map<string, number>
+  repeatedCounts: Map<string, number>,
+  groqInsights: CoachInsight[] | undefined
 ): CoachInsight[] {
-  const candidates: Array<CoachInsight & { weight: number }> = [];
+  const candidates: CoachCandidate[] = [];
 
   if (activeChat?.contextUsagePercent !== undefined && activeChat.contextUsagePercent >= 82) {
     candidates.push({
@@ -552,6 +650,18 @@ function computeCoachInsights(
       title: `"${activeChat.title}" is nearly full`,
       detail: `${Math.round(activeChat.contextUsagePercent)}% of context is already used. The next turn will likely drag ~${formatTokenCount(activeChat.metrics?.historyTokens ?? 0)} history tokens back in.`,
       weight: activeChat.contextUsagePercent >= 92 ? 98 : 82,
+    });
+  }
+
+  const deadReferences = activeChat?.contextHealth?.deadReferences ?? [];
+  if (deadReferences.length > 0 && activeChat?.contextHealth) {
+    const heaviestDeadWeight = deadReferences[0];
+    candidates.push({
+      id: 'dead-context',
+      level: activeChat.contextHealth.deadWeightTokensPerTurn >= 1800 ? 'danger' : 'warn',
+      title: `Dead context detected: @${heaviestDeadWeight.name}`,
+      detail: `${deadReferences.length} attached reference${deadReferences.length === 1 ? '' : 's'} never showed up in the assistant response path, likely replaying about ${formatTokenCount(activeChat.contextHealth.deadWeightTokensPerTurn)} tokens every turn.`,
+      weight: activeChat.contextHealth.deadWeightTokensPerTurn >= 1800 ? 97 : 80,
     });
   }
 
@@ -564,6 +674,25 @@ function computeCoachInsights(
       title: `"${activeChat.title}" is paying for old context`,
       detail: `${ratio}% of this session’s input spend is history replay, or about ${formatTokenCount(historyTokens)} tokens.`,
       weight: activeChat.metrics.historyBloatRatio >= 0.5 ? 96 : 78,
+    });
+  }
+
+  const latestPromptWithRecommendation = activeChat?.turns
+    .slice()
+    .reverse()
+    .find((turn) => Boolean(turn.blocks['user-input'].content.trim()) && turn.modelRecommendation);
+
+  if (
+    latestPromptWithRecommendation?.modelRecommendation
+    && latestPromptWithRecommendation.modelRecommendation.estimatedOverspendUsd >= 0.003
+  ) {
+    const recommendation = latestPromptWithRecommendation.modelRecommendation;
+    candidates.push({
+      id: 'model-fit',
+      level: recommendation.complexity === 'trivial' ? 'danger' : 'warn',
+      title: `Model mismatch for a ${recommendation.complexity} task`,
+      detail: `This prompt looks ${recommendation.complexity}, but it is using ${recommendation.currentModel}. ${recommendation.reason} Estimated overspend: ${formatUsd(recommendation.estimatedOverspendUsd)} (${recommendation.estimatedOverspendPct}% above a better-fit option).`,
+      weight: recommendation.complexity === 'trivial' ? 94 : 72,
     });
   }
 
@@ -606,7 +735,7 @@ function computeCoachInsights(
   if (activeSuggestion) {
     candidates.push({
       id: 'saved-prompt-match',
-      level: 'success',
+      level: 'info',
       title: `Saved prompt match: "${activeSuggestion.title}"`,
       detail: `${Math.round(activeSuggestion.similarity * 100)}% similar to the current task. Reusing it would cut prompt setup time immediately.`,
       weight: 48,
@@ -623,9 +752,21 @@ function computeCoachInsights(
     });
   }
 
+  for (const insight of groqInsights ?? []) {
+    candidates.push({
+      ...insight,
+      level: insight.level === 'info' ? 'info' : insight.level,
+      weight: insight.level === 'danger'
+        ? 88
+        : insight.level === 'warn'
+          ? 68
+          : 40,
+    });
+  }
+
   return candidates
     .sort((left, right) => right.weight - left.weight)
-    .slice(0, 3)
+    .slice(0, 5)
     .map(({ weight: _weight, ...insight }) => insight);
 }
 
@@ -769,6 +910,145 @@ function resolveModelProfile(model: string | undefined, sourceId: AgentSourceId)
   };
 }
 
+function classifyPromptComplexity(value: string, tokenCount: number): PromptComplexity {
+  const normalized = value.toLowerCase();
+
+  if (
+    /(root cause|why is|diagnose|architecture|system design|trade[- ]?off|reason about|investigate|full session|full project|entire project|every single file|compare approaches|migration plan|debug this deeply)/i.test(normalized)
+    || tokenCount >= 260
+  ) {
+    return 'reasoning-heavy';
+  }
+
+  if (
+    /(implement|refactor|restructure|build|feature|multi[- ]step|end[- ]to[- ]end|database|authentication|streaming|analytics|dashboard|report|persist|cross[- ]session|monitor|integration|keyboard shortcut)/i.test(normalized)
+    || tokenCount >= 140
+  ) {
+    return 'complex';
+  }
+
+  if (
+    /(fix|update|explain|summarize|review|optimize|clean up|write tests|add tests|rename|convert|transform|format)/i.test(normalized)
+    || tokenCount >= 55
+  ) {
+    return 'moderate';
+  }
+
+  return 'trivial';
+}
+
+function buildModelRecommendation(
+  promptText: string,
+  currentModel: string,
+  sourceId: AgentSourceId,
+  inputTokens: number,
+  outputTokens: number
+) {
+  const complexity = classifyPromptComplexity(promptText, inputTokens);
+  const currentTier = resolveModelTier(currentModel);
+  const recommendation = getRecommendedModelTarget(complexity, sourceId);
+
+  if (currentTier <= recommendation.maxTier) {
+    return undefined;
+  }
+
+  const currentProfile = resolveModelProfile(currentModel, sourceId);
+  const estimatedOutputTokens = outputTokens > 0
+    ? outputTokens
+    : Math.max(
+        120,
+        Math.round(
+          inputTokens * (
+            complexity === 'trivial'
+              ? 1.4
+              : complexity === 'moderate'
+                ? 2.1
+                : complexity === 'complex'
+                  ? 3.1
+                  : 4.2
+          )
+        )
+      );
+  const currentCost = estimateProjectedTurnCost(currentProfile, inputTokens, estimatedOutputTokens);
+  const recommendedCost = estimateProjectedTurnCost(
+    recommendation.profile,
+    inputTokens,
+    estimatedOutputTokens
+  );
+  const overspendUsd = Math.max(0, currentCost - recommendedCost);
+  const overspendPct = recommendedCost > 0
+    ? Math.round((overspendUsd / recommendedCost) * 100)
+    : 0;
+
+  return {
+    complexity,
+    currentModel,
+    recommendedModel: recommendation.label,
+    reason: recommendation.reason,
+    estimatedOverspendUsd: overspendUsd,
+    estimatedOverspendPct: overspendPct,
+  };
+}
+
+function estimateProjectedTurnCost(
+  profile: ModelProfile,
+  inputTokens: number,
+  outputTokens: number
+): number {
+  return ((inputTokens * profile.inputRateUsdPer1k) + (outputTokens * profile.outputRateUsdPer1k)) / 1000;
+}
+
+function resolveModelTier(model: string): number {
+  const normalized = model.toLowerCase();
+
+  if (/(flash|haiku|mini|nano)/i.test(normalized)) {
+    return 0;
+  }
+
+  if (/(opus|gpt-5|gpt 5|o1|o3|gemini 2\.5 pro|gemini-2\.5-pro)/i.test(normalized)) {
+    return 3;
+  }
+
+  if (/(sonnet|gpt-4o|gpt 4o|gpt-4\.1|gpt 4\.1|codex|cursor auto|auto|gemini)/i.test(normalized)) {
+    return 1;
+  }
+
+  return 1;
+}
+
+function getRecommendedModelTarget(complexity: PromptComplexity, sourceId: AgentSourceId) {
+  switch (complexity) {
+    case 'trivial':
+      return {
+        label: 'Gemini Flash or Claude Haiku',
+        maxTier: 0,
+        profile: resolveModelProfile(sourceId === 'antigravity' ? 'Gemini Flash' : 'Claude Haiku', sourceId),
+        reason: 'This looks like a light transformation task, so a fast low-cost model should be enough.',
+      };
+    case 'moderate':
+      return {
+        label: 'Claude Sonnet or GPT-4.1',
+        maxTier: 1,
+        profile: resolveModelProfile('Claude Sonnet', sourceId),
+        reason: 'This task needs solid coding reliability, but not top-tier reasoning spend.',
+      };
+    case 'complex':
+      return {
+        label: 'Claude Sonnet, Codex, or Cursor Auto',
+        maxTier: 1,
+        profile: resolveModelProfile('Claude Sonnet', sourceId),
+        reason: 'A strong coding model is warranted here, but premium reasoning pricing is probably unnecessary.',
+      };
+    case 'reasoning-heavy':
+      return {
+        label: 'Claude Opus, GPT-5, or Gemini 2.5 Pro',
+        maxTier: 3,
+        profile: resolveModelProfile('Claude Opus', sourceId),
+        reason: 'This prompt is genuinely high-context or high-reasoning.',
+      };
+  }
+}
+
 function promptSimilarity(left: Set<string>, right: Set<string>): number {
   if (left.size === 0 || right.size === 0) {
     return 0;
@@ -782,6 +1062,15 @@ function promptSimilarity(left: Set<string>, right: Set<string>): number {
   }
 
   return intersection / Math.max(left.size, right.size);
+}
+
+function createPromptSignature(value: string): string {
+  const tokens = [...tokenizePrompt(value)].slice(0, 6);
+  if (tokens.length > 0) {
+    return tokens.join(' ');
+  }
+
+  return summarizePrompt(value).toLowerCase();
 }
 
 function tokenizePrompt(value: string): Set<string> {
@@ -808,6 +1097,22 @@ function summarizePrompt(value: string): string {
   return singleLine.length <= 96
     ? singleLine
     : `${singleLine.slice(0, 93).trimEnd()}...`;
+}
+
+function computeSessionEfficiencyScore(
+  healthScore: number,
+  averagePromptScore: number,
+  historyBloatRatio: number
+): number {
+  return clamp(
+    Math.round(
+      (healthScore * 0.5)
+      + (averagePromptScore * 0.35)
+      + ((1 - Math.min(1, historyBloatRatio)) * 100 * 0.15)
+    ),
+    0,
+    100
+  );
 }
 
 function startOfLocalDay(timestamp: number): number {
@@ -929,6 +1234,121 @@ function buildTrendSeries(
   return points;
 }
 
+function computeCrossSessionPatterns(
+  summaries: PersistedSessionSummary[]
+): CrossSessionPatterns {
+  const recent = [...summaries]
+    .sort((left, right) => right.endedAt - left.endedAt)
+    .slice(0, 10);
+
+  if (recent.length === 0) {
+    return createEmptyCrossSessionPatterns();
+  }
+
+  const averageHealthTrend: SessionHealthTrendPoint[] = [...recent]
+    .sort((left, right) => left.endedAt - right.endedAt)
+    .map((summary) => ({
+      timestamp: summary.endedAt,
+      label: formatTrendLabel(summary.endedAt),
+      healthScore: summary.healthScore,
+      efficiencyScore: summary.efficiencyScore,
+    }));
+
+  const promptPatterns = new Map<string, {
+    label: string;
+    totalCostUsd: number;
+    prompts: number;
+    sessions: Set<string>;
+  }>();
+  const timeOfDay = new Map<string, {
+    label: string;
+    totalHealthScore: number;
+    totalEfficiencyScore: number;
+    totalCostUsd: number;
+    sessions: number;
+  }>();
+
+  for (const summary of recent) {
+    for (const prompt of summary.prompts) {
+      const pattern = promptPatterns.get(prompt.promptSignature) ?? {
+        label: prompt.promptPreview,
+        totalCostUsd: 0,
+        prompts: 0,
+        sessions: new Set<string>(),
+      };
+      pattern.totalCostUsd += prompt.costUsd;
+      pattern.prompts += 1;
+      pattern.sessions.add(summary.id);
+      promptPatterns.set(prompt.promptSignature, pattern);
+    }
+
+    const bucketLabel = timeOfDayLabel(summary.startedAt);
+    const bucket = timeOfDay.get(bucketLabel) ?? {
+      label: bucketLabel,
+      totalHealthScore: 0,
+      totalEfficiencyScore: 0,
+      totalCostUsd: 0,
+      sessions: 0,
+    };
+    bucket.totalHealthScore += summary.healthScore;
+    bucket.totalEfficiencyScore += summary.efficiencyScore;
+    bucket.totalCostUsd += summary.costUsd;
+    bucket.sessions += 1;
+    timeOfDay.set(bucketLabel, bucket);
+  }
+
+  const expensivePromptPatterns = [...promptPatterns.values()]
+    .map((pattern) => ({
+      label: pattern.label,
+      averageCostUsd: pattern.prompts > 0 ? pattern.totalCostUsd / pattern.prompts : 0,
+      totalCostUsd: pattern.totalCostUsd,
+      prompts: pattern.prompts,
+      sessions: pattern.sessions.size,
+    }))
+    .sort((left, right) => right.totalCostUsd - left.totalCostUsd)
+    .slice(0, 5);
+
+  const timeOfDayRows: TimeOfDayPattern[] = [...timeOfDay.values()]
+    .map((bucket) => ({
+      label: bucket.label,
+      averageHealthScore: bucket.sessions > 0 ? bucket.totalHealthScore / bucket.sessions : 0,
+      averageEfficiencyScore: bucket.sessions > 0 ? bucket.totalEfficiencyScore / bucket.sessions : 0,
+      averageCostUsd: bucket.sessions > 0 ? bucket.totalCostUsd / bucket.sessions : 0,
+      sessions: bucket.sessions,
+    }))
+    .sort((left, right) => right.averageEfficiencyScore - left.averageEfficiencyScore);
+
+  const byEfficiency = [...recent]
+    .sort((left, right) => right.efficiencyScore - left.efficiencyScore);
+
+  return {
+    summaries: recent,
+    averageHealthTrend,
+    expensivePromptPatterns,
+    bestSession: byEfficiency[0],
+    worstSession: byEfficiency[byEfficiency.length - 1],
+    timeOfDay: timeOfDayRows,
+  };
+}
+
+function timeOfDayLabel(timestamp: number): string {
+  const hour = new Date(timestamp).getHours();
+
+  if (hour >= 5 && hour < 10) {
+    return 'Morning';
+  }
+  if (hour >= 10 && hour < 14) {
+    return 'Late Morning';
+  }
+  if (hour >= 14 && hour < 18) {
+    return 'Afternoon';
+  }
+  if (hour >= 18 && hour < 23) {
+    return 'Evening';
+  }
+  return 'Late Night';
+}
+
 function pushBudgetAlert(
   alerts: BudgetAlert[],
   id: string,
@@ -970,4 +1390,8 @@ function clamp(value: number, min: number, max: number): number {
 
 function formatTokenCount(value: number): string {
   return Math.round(value).toLocaleString();
+}
+
+function formatUsd(value: number): string {
+  return `$${value.toFixed(value >= 0.1 ? 2 : 4)}`;
 }

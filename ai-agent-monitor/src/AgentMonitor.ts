@@ -1,8 +1,19 @@
 import * as vscode from 'vscode';
+import { promises as fs } from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { ConversationStoreWatcher } from './ConversationStoreWatcher';
 import { NetworkInterceptor } from './NetworkInterceptor';
-import { buildDashboardSnapshot, createDefaultBudgets } from './dashboard';
-import { analyzeChatWithGroq } from './groqClient';
+import {
+  buildDashboardSnapshot,
+  createDefaultBudgets,
+  createPersistedSessionSummary,
+} from './dashboard';
+import {
+  analyzeChatWithGroq,
+  generateFullSessionAnalysis,
+  renderFullSessionAnalysisHtml,
+} from './groqClient';
 import {
   buildAppStoragePathCandidates,
   firstExistingPath,
@@ -23,15 +34,18 @@ import {
   HostApp,
   ModelConfidence,
   MonitorMessage,
-  MonitorSnapshot,
-  MonitorStatus,
-  SavedPrompt,
-  SourceSnapshot,
-  WebviewIncoming,
-} from './types';
+    MonitorSnapshot,
+    MonitorStatus,
+    PersistedSessionSummary,
+    SavedPrompt,
+    SessionAnalysisState,
+    SourceSnapshot,
+    WebviewIncoming,
+  } from './types';
 
 const PROMPT_LIBRARY_KEY = 'aiAgentMonitor.promptLibrary';
 const BUDGET_SETTINGS_KEY = 'aiAgentMonitor.budgetSettings';
+const SESSION_SUMMARIES_KEY = 'aiAgentMonitor.sessionSummaries';
 const CURSOR_APP_STATE_KEY = 'src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser';
 
 const SOURCE_LABELS: Record<'cursor' | 'antigravity' | 'manual', string> = {
@@ -94,6 +108,7 @@ export class AgentMonitor implements vscode.Disposable {
   };
 
   private promptLibrary: SavedPrompt[];
+  private sessionSummaries: PersistedSessionSummary[];
   private budgets = createDefaultBudgets();
   private chatCounter = 0;
   private turnCounter = 0;
@@ -109,7 +124,12 @@ export class AgentMonitor implements vscode.Disposable {
   private networkEmitHandle?: NodeJS.Timeout;
 
   private currentGroqInsights: CoachInsight[] = [];
+  private groqInsightChatKey?: string;
   private groqDebounceHandle?: NodeJS.Timeout;
+  private sessionAnalysisState: SessionAnalysisState = {
+    isGenerating: false,
+  };
+  private lastSnapshot?: MonitorSnapshot;
 
   private readonly _onSnapshotChanged = new vscode.EventEmitter<MonitorSnapshot>();
   readonly onSnapshotChanged = this._onSnapshotChanged.event;
@@ -128,6 +148,7 @@ export class AgentMonitor implements vscode.Disposable {
     this.output.appendLine(`[host] Running inside ${this.appLabel}.`);
 
     this.promptLibrary = loadPromptLibrary(context.globalState.get<unknown>(PROMPT_LIBRARY_KEY));
+    this.sessionSummaries = loadSessionSummaries(context.globalState.get<unknown>(SESSION_SUMMARIES_KEY));
     this.budgets = sanitizeBudgetSettings(context.globalState.get<unknown>(BUDGET_SETTINGS_KEY));
 
     for (const sourceId of this.getEnabledSourceIds()) {
@@ -180,6 +201,8 @@ export class AgentMonitor implements vscode.Disposable {
     this.activeRuntimeTurnId = undefined;
     this.activeChatKey = undefined;
     this.activeChatEngagedAt = 0;
+    this.currentGroqInsights = [];
+    this.groqInsightChatKey = undefined;
 
     for (const sourceId of ['cursor', 'antigravity'] as const) {
       const previous = this.sourceAttention.get(sourceId);
@@ -206,6 +229,88 @@ export class AgentMonitor implements vscode.Disposable {
     return { ...this.status };
   }
 
+  async generateSessionAnalysisReport(): Promise<void> {
+    if (this.sessionAnalysisState.isGenerating) {
+      return;
+    }
+
+    const snapshot = this.buildSnapshot();
+    const activeChat = snapshot.activeChat;
+    if (!activeChat) {
+      void vscode.window.showInformationMessage('No active chat is available to analyze yet.');
+      return;
+    }
+
+    if (!snapshot.hasGroqKey) {
+      const selection = await vscode.window.showInformationMessage(
+        'Set a Groq API key to enable full session analysis.',
+        'Open Settings'
+      );
+      if (selection === 'Open Settings') {
+        void vscode.commands.executeCommand('workbench.action.openSettings', 'aiAgentMonitor.groqApiKey');
+      }
+      return;
+    }
+
+    this.sessionAnalysisState = {
+      isGenerating: true,
+      activeChatId: activeChat.id,
+      lastGeneratedAt: this.sessionAnalysisState.lastGeneratedAt,
+    };
+    this.emitSnapshot();
+
+    try {
+      const report = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Generating full session analysis',
+        },
+        async () => {
+          return generateFullSessionAnalysis(
+            activeChat,
+            snapshot.analytics.patterns,
+            this.sessionSummaries
+          );
+        }
+      );
+      const html = renderFullSessionAnalysisHtml(
+        activeChat,
+        report,
+        snapshot.analytics.patterns
+      );
+
+      const panel = vscode.window.createWebviewPanel(
+        'aiAgentMonitor.fullSessionAnalysis',
+        `Analysis: ${activeChat.title || 'Session'}`,
+        vscode.ViewColumn.Active,
+        { enableScripts: true, retainContextWhenHidden: true }
+      );
+      panel.webview.html = html;
+
+      // Pop it out into a standalone, detached floating window using VS Code's native floating windows
+      setTimeout(() => {
+        void vscode.commands.executeCommand('workbench.action.moveEditorToNewWindow');
+      }, 100);
+
+      this.sessionAnalysisState = {
+        isGenerating: false,
+        activeChatId: activeChat.id,
+        lastGeneratedAt: Date.now(),
+      };
+      this.emitSnapshot();
+    } catch (error) {
+      const detail = formatError(error);
+      this.sessionAnalysisState = {
+        isGenerating: false,
+        activeChatId: activeChat.id,
+        lastGeneratedAt: this.sessionAnalysisState.lastGeneratedAt,
+        lastError: detail,
+      };
+      this.emitSnapshot();
+      void vscode.window.showErrorMessage(`Failed to generate session analysis: ${detail}`);
+    }
+  }
+
   handleWebviewMessage(message: WebviewIncoming): void {
     switch (message.command) {
       case 'ready':
@@ -225,11 +330,22 @@ export class AgentMonitor implements vscode.Disposable {
       case 'updateBudgets':
         this.updateBudgets(message.budgets);
         return;
+      case 'generateSessionAnalysis':
+        void this.generateSessionAnalysisReport();
+        return;
     }
   }
 
   dispose(): void {
     this.flushNetworkEmit();
+    const finalSnapshot = this.lastSnapshot ?? this.buildSnapshot();
+    this.persistCompletedSessionIfNeeded(
+      this.lastSnapshot,
+      {
+        ...finalSnapshot,
+        activeChat: undefined,
+      }
+    );
 
     for (const disposable of this.disposables) {
       disposable.dispose();
@@ -427,9 +543,12 @@ export class AgentMonitor implements vscode.Disposable {
       sources: this.buildSourceSnapshots(),
       activeChatKey: this.activeChatKey,
       promptLibrary: this.promptLibrary,
+      persistedSessions: this.sessionSummaries,
       budgets: this.budgets,
       hasGroqKey,
-      groqInsights: this.currentGroqInsights,
+      groqInsights: this.groqInsightChatKey === this.activeChatKey ? this.currentGroqInsights : [],
+      sessionAnalysis: this.sessionAnalysisState,
+      workspacePaths: this.getWorkspacePaths(),
     });
   }
 
@@ -438,11 +557,17 @@ export class AgentMonitor implements vscode.Disposable {
       clearTimeout(this.groqDebounceHandle);
     }
 
+    const chatKey = `${chat.sourceId}:${chat.id}`;
     this.groqDebounceHandle = setTimeout(async () => {
       try {
         const insights = await analyzeChatWithGroq(chat);
+        if (this.activeChatKey !== chatKey) {
+          return;
+        }
+
         if (insights.length > 0 || this.currentGroqInsights.length > 0) {
           this.currentGroqInsights = insights;
+          this.groqInsightChatKey = chatKey;
           this.emitSnapshot();
         }
       } catch (err) {
@@ -717,10 +842,55 @@ export class AgentMonitor implements vscode.Disposable {
     chat.updatedAt = turn.updatedAt;
   }
 
+  private persistCompletedSessionIfNeeded(
+    previousSnapshot: MonitorSnapshot | undefined,
+    nextSnapshot: MonitorSnapshot
+  ): void {
+    const previousChat = previousSnapshot?.activeChat;
+    if (!previousChat) {
+      return;
+    }
+
+    const previousKey = `${previousChat.sourceId}:${previousChat.id}`;
+    const nextKey = nextSnapshot.activeChat
+      ? `${nextSnapshot.activeChat.sourceId}:${nextSnapshot.activeChat.id}`
+      : undefined;
+
+    if (previousKey === nextKey) {
+      return;
+    }
+
+    const summary = createPersistedSessionSummary(previousChat);
+    if (!summary) {
+      return;
+    }
+
+    if (this.sessionSummaries.some((candidate) => candidate.id === summary.id)) {
+      return;
+    }
+
+    this.sessionSummaries = [
+      summary,
+      ...this.sessionSummaries.filter((candidate) => candidate.id !== summary.id),
+    ]
+      .sort((left, right) => right.endedAt - left.endedAt)
+      .slice(0, 10);
+
+    void this.extensionContext.globalState.update(SESSION_SUMMARIES_KEY, this.sessionSummaries);
+  }
+
+  private getWorkspacePaths(): string[] {
+    return (vscode.workspace.workspaceFolders ?? [])
+      .map((folder) => folder.uri.fsPath)
+      .filter((value): value is string => Boolean(value));
+  }
+
   private emitSnapshot(): void {
-    const snapshot = this.getSnapshot();
+    const snapshot = this.buildSnapshot();
+    this.persistCompletedSessionIfNeeded(this.lastSnapshot, snapshot);
+    this.lastSnapshot = cloneSnapshot(snapshot);
     this.notifyBudgetAlerts(snapshot);
-    this._onSnapshotChanged.fire(snapshot);
+    this._onSnapshotChanged.fire(cloneSnapshot(snapshot));
   }
 
   private notifyBudgetAlerts(snapshot: MonitorSnapshot): void {
@@ -969,6 +1139,80 @@ function loadPromptLibrary(rawValue: unknown): SavedPrompt[] {
       efficiencyScore: toFiniteNumber(prompt.efficiencyScore),
     }];
   });
+}
+
+function loadSessionSummaries(rawValue: unknown): PersistedSessionSummary[] {
+  if (!Array.isArray(rawValue)) {
+    return [];
+  }
+
+  return rawValue.flatMap((candidate) => {
+    if (!candidate || typeof candidate !== 'object') {
+      return [];
+    }
+
+    const summary = candidate as Partial<PersistedSessionSummary>;
+    if (
+      typeof summary.id !== 'string'
+      || typeof summary.chatId !== 'string'
+      || typeof summary.title !== 'string'
+      || typeof summary.sourceLabel !== 'string'
+    ) {
+      return [];
+    }
+
+    return [{
+      id: summary.id,
+      sourceId: summary.sourceId === 'cursor' || summary.sourceId === 'antigravity' || summary.sourceId === 'manual'
+        ? summary.sourceId
+        : 'manual',
+      sourceLabel: summary.sourceLabel,
+      chatId: summary.chatId,
+      title: summary.title,
+      model: typeof summary.model === 'string' ? summary.model : 'Unknown model',
+      startedAt: toFiniteNumber(summary.startedAt) ?? Date.now(),
+      endedAt: toFiniteNumber(summary.endedAt) ?? Date.now(),
+      healthScore: toFiniteNumber(summary.healthScore) ?? 0,
+      efficiencyScore: toFiniteNumber(summary.efficiencyScore) ?? 0,
+      averagePromptScore: toFiniteNumber(summary.averagePromptScore) ?? 0,
+      costUsd: toFiniteNumber(summary.costUsd) ?? 0,
+      totalTokens: toFiniteNumber(summary.totalTokens) ?? 0,
+      promptCount: toFiniteNumber(summary.promptCount) ?? 0,
+      historyBloatRatio: toFiniteNumber(summary.historyBloatRatio) ?? 0,
+      prompts: Array.isArray(summary.prompts)
+        ? summary.prompts.flatMap((promptCandidate) => {
+            if (!promptCandidate || typeof promptCandidate !== 'object') {
+              return [];
+            }
+
+            const prompt = promptCandidate as PersistedSessionSummary['prompts'][number];
+            if (typeof prompt.promptText !== 'string' || typeof prompt.promptPreview !== 'string') {
+              return [];
+            }
+
+            return [{
+              promptText: prompt.promptText,
+              promptPreview: prompt.promptPreview,
+              promptSignature: typeof prompt.promptSignature === 'string'
+                ? prompt.promptSignature
+                : prompt.promptPreview.toLowerCase(),
+              inputTokens: toFiniteNumber(prompt.inputTokens) ?? 0,
+              totalTokens: toFiniteNumber(prompt.totalTokens) ?? 0,
+              costUsd: toFiniteNumber(prompt.costUsd) ?? 0,
+              promptScore: toFiniteNumber(prompt.promptScore) ?? 0,
+              complexity: prompt.complexity === 'trivial'
+                || prompt.complexity === 'moderate'
+                || prompt.complexity === 'complex'
+                || prompt.complexity === 'reasoning-heavy'
+                ? prompt.complexity
+                : 'moderate',
+            }];
+          })
+        : [],
+    }];
+  })
+    .sort((left, right) => right.endedAt - left.endedAt)
+    .slice(0, 10);
 }
 
 function sanitizeBudgetSettings(rawValue: unknown) {

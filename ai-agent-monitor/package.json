@@ -54,6 +54,10 @@
       {
         "command": "aiAgentMonitor.clear",
         "title": "AI Agent Monitor: Clear History"
+      },
+      {
+        "command": "aiAgentMonitor.fullSessionAnalysis",
+        "title": "AI Token Analytics: Full Session Analysis"
       }
     ],
     "keybindings": [
@@ -61,6 +65,11 @@
         "command": "aiAgentMonitor.openSidebar",
         "key": "ctrl+shift+m",
         "mac": "cmd+shift+m"
+      },
+      {
+        "command": "aiAgentMonitor.fullSessionAnalysis",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
       }
     ],
     "configuration": {

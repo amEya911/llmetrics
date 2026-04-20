@@ -46,6 +46,12 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('aiAgentMonitor.fullSessionAnalysis', () => {
+      return monitor!.generateSessionAnalysisReport();
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand(
       'aiAgentMonitor.pushMessage',
       (type?: BlockType, content?: string) => {
