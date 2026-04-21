@@ -2,6 +2,10 @@ import * as vscode from 'vscode';
 import * as https from 'https';
 import { IncomingMessage } from 'http';
 import {
+  NETWORK_INTERCEPTOR_IGNORE_HEADER,
+  NETWORK_INTERCEPTOR_IGNORE_VALUE,
+} from './NetworkInterceptor';
+import {
   CoachInsight,
   ConversationChat,
   CrossSessionPatterns,
@@ -623,6 +627,7 @@ async function requestGroqText(
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(requestBody),
+        [NETWORK_INTERCEPTOR_IGNORE_HEADER]: NETWORK_INTERCEPTOR_IGNORE_VALUE,
       },
     }, (res) => {
       if (!stream) {

@@ -3,7 +3,7 @@ import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { ConversationStoreWatcher } from './ConversationStoreWatcher';
-import { NetworkInterceptor } from './NetworkInterceptor';
+import { AntigravityLanguageServerCollector } from './AntigravityLanguageServerCollector';
 import {
   buildDashboardSnapshot,
   createDefaultBudgets,
@@ -23,6 +23,7 @@ import {
 import {
   BLOCK_TYPES,
   BlockType,
+  cloneChat,
   cloneCollection,
   cloneSnapshot,
   cloneTurn,
@@ -90,6 +91,11 @@ interface CollectionAttention {
   latestUserTurnSignature?: string;
 }
 
+interface AntigravityRequestBinding {
+  chatId: string;
+  turnId: string;
+}
+
 export class AgentMonitor implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly output: vscode.OutputChannel;
@@ -99,6 +105,8 @@ export class AgentMonitor implements vscode.Disposable {
   private readonly appLabel: string;
 
   private readonly runtimeChats = new Map<string, ConversationChat>();
+  private readonly antigravityLiveChats = new Map<string, ConversationChat>();
+  private readonly antigravityRequestBindings = new Map<string, AntigravityRequestBinding>();
   private readonly sourceCollections = new Map<'cursor' | 'antigravity', ConversationCollection>();
   private readonly sourceAttention = new Map<'cursor' | 'antigravity', SourceAttentionState>();
 
@@ -117,10 +125,9 @@ export class AgentMonitor implements vscode.Disposable {
   private activeChatKey?: string;
   private activeChatEngagedAt = 0;
   private lastAlertIds = new Set<string>();
+  private antigravitySelectedChatId?: string;
 
-  private networkInterceptor?: NetworkInterceptor;
-  private networkTurnId?: string;
-  private networkResponseBuffer = '';
+  private antigravityCollector?: AntigravityLanguageServerCollector;
   private networkEmitHandle?: NodeJS.Timeout;
 
   private currentGroqInsights: CoachInsight[] = [];
@@ -155,8 +162,8 @@ export class AgentMonitor implements vscode.Disposable {
       this.startWatcher(sourceId);
     }
 
-    if (this.hostApp === 'antigravity' || this.hostApp === 'unknown') {
-      this.startNetworkInterceptor();
+    if (this.hostApp === 'antigravity') {
+      this.startAntigravityCollector();
     }
 
     this.setStatus('monitoring', describeTrackingStatus(this.hostApp));
@@ -193,7 +200,10 @@ export class AgentMonitor implements vscode.Disposable {
   }
 
   clearBlocks(): void {
+    this.flushNetworkEmit();
     this.runtimeChats.clear();
+    this.antigravityLiveChats.clear();
+    this.antigravityRequestBindings.clear();
     this.sourceCollections.clear();
     this.chatCounter = 0;
     this.turnCounter = 0;
@@ -203,6 +213,7 @@ export class AgentMonitor implements vscode.Disposable {
     this.activeChatEngagedAt = 0;
     this.currentGroqInsights = [];
     this.groqInsightChatKey = undefined;
+    this.antigravitySelectedChatId = undefined;
 
     for (const sourceId of ['cursor', 'antigravity'] as const) {
       const previous = this.sourceAttention.get(sourceId);
@@ -389,70 +400,136 @@ export class AgentMonitor implements vscode.Disposable {
     watcher.start();
   }
 
-  private startNetworkInterceptor(): void {
-    const interceptor = new NetworkInterceptor();
-    this.networkInterceptor = interceptor;
-    this.disposables.push(interceptor);
-
-    interceptor.onUserMessage(({ content, source }) => {
-      this.output.appendLine(`[network] User prompt captured via ${source} (${content.length} chars)`);
-
-      const chatId = this.activeRuntimeChatId ?? this.createRuntimeChatId();
-      const chat = this.ensureRuntimeChat(chatId, {
-        title: `${source} session`,
-        sourceLabel: source,
-        model: source,
-      });
-
-      const turn = this.createRuntimeTurn(chat);
-      this.networkTurnId = turn.id;
-      this.networkResponseBuffer = '';
-
-      this.setBlockContent(chat, turn.id, 'user-input', content);
-
-      this.activeRuntimeChatId = chat.id;
-      this.activeRuntimeTurnId = turn.id;
-      this.activeChatKey = `manual:${chat.id}`;
-      this.activeChatEngagedAt = Date.now();
-
-      this.emitSnapshot();
+  private startAntigravityCollector(): void {
+    const collector = new AntigravityLanguageServerCollector({
+      output: this.output,
+      getWorkspacePaths: () => this.getWorkspacePaths(),
+      getPreferredConversationId: () =>
+        this.antigravitySelectedChatId
+        ?? this.sourceCollections.get('antigravity')?.selectedChatId,
     });
+    this.antigravityCollector = collector;
+    this.disposables.push(collector);
 
-    interceptor.onAiResponseChunk(({ content }) => {
-      if (!this.networkTurnId || !this.activeRuntimeChatId) {
-        return;
-      }
-
-      this.networkResponseBuffer += content;
-
-      const chat = this.runtimeChats.get(this.activeRuntimeChatId);
+    collector.onConversationSummary((summary) => {
+      const chat = this.antigravityLiveChats.get(summary.conversationId);
       if (!chat) {
         return;
       }
 
-      this.setBlockContent(chat, this.networkTurnId, 'agent-output', this.networkResponseBuffer);
+      this.applyAntigravityLiveChatMetadata(chat, {
+        title: summary.title,
+        subtitle: summary.snippet,
+        updatedAt: summary.lastModifiedAt,
+      });
       this.scheduleNetworkEmit();
     });
 
-    interceptor.onAiResponseEnd(() => {
-      this.flushNetworkEmit();
+    collector.onTurnStart((turnStart) => {
+      const modelLabel = turnStart.model
+        ? `, model ${turnStart.model}`
+        : '';
+      this.output.appendLine(
+        `[antigravity-ls] Prompt captured (${turnStart.prompt.length} chars${modelLabel})`
+      );
 
-      if (!this.networkTurnId || !this.activeRuntimeChatId) {
+      const chatId = this.resolveAntigravityLiveChatId(turnStart.conversationId);
+      const chat = this.ensureAntigravityLiveChat(chatId, {
+        provider: SOURCE_LABELS.antigravity,
+        model: turnStart.model,
+        modelConfidence: turnStart.modelConfidence,
+        startedAt: turnStart.startedAt,
+        title: turnStart.title,
+        subtitle: turnStart.subtitle,
+        contextUsagePercent: turnStart.contextUsagePercent,
+        contextWindowTokens: turnStart.contextWindowTokens,
+      });
+      const turn = this.ensureRuntimeTurn(chat, {
+        turnId: `antigravity-turn:${turnStart.executionId}`,
+        timestamp: turnStart.startedAt,
+      });
+
+      this.antigravityRequestBindings.set(turnStart.executionId, {
+        chatId,
+        turnId: turn.id,
+      });
+      this.antigravitySelectedChatId = chatId;
+
+      this.setBlockContent(
+        chat,
+        turn.id,
+        'user-input',
+        turnStart.prompt,
+        false,
+        turnStart.startedAt
+      );
+
+      if (turnStart.model) {
+        chat.model = turnStart.model;
+        chat.modelConfidence = turnStart.modelConfidence;
+        turn.model = turnStart.model;
+        turn.modelConfidence = turnStart.modelConfidence;
+      }
+
+      this.activeChatKey = `antigravity:${chat.id}`;
+      this.activeChatEngagedAt = turnStart.startedAt;
+      this.refreshAntigravityCollection();
+    });
+
+    collector.onTurnUpdate((turnUpdate) => {
+      const binding = this.antigravityRequestBindings.get(turnUpdate.executionId);
+      if (!binding) {
         return;
       }
 
-      const chat = this.runtimeChats.get(this.activeRuntimeChatId);
-      if (chat) {
-        this.finalizeTurn(chat, this.networkTurnId);
-        this.emitSnapshot();
+      const chat = this.antigravityLiveChats.get(binding.chatId);
+      if (!chat) {
+        return;
       }
 
-      this.networkTurnId = undefined;
-      this.networkResponseBuffer = '';
+      this.applyAntigravityLiveChatMetadata(chat, {
+        model: turnUpdate.model,
+        modelConfidence: turnUpdate.modelConfidence,
+        title: turnUpdate.title,
+        subtitle: turnUpdate.subtitle,
+        contextUsagePercent: turnUpdate.contextUsagePercent,
+        contextWindowTokens: turnUpdate.contextWindowTokens,
+        updatedAt: turnUpdate.updatedAt,
+      });
+
+      const turn = this.mustGetTurn(chat, binding.turnId);
+      if (turnUpdate.model) {
+        turn.model = turnUpdate.model;
+        turn.modelConfidence = turnUpdate.modelConfidence ?? chat.modelConfidence;
+      }
+
+      if (turnUpdate.output !== undefined) {
+        this.setBlockContent(
+          chat,
+          turn.id,
+          'agent-output',
+          turnUpdate.output,
+          !turnUpdate.isComplete,
+          turnUpdate.updatedAt
+        );
+      }
+
+      if (turnUpdate.isComplete) {
+        this.flushNetworkEmit();
+        this.finalizeTurn(chat, turn.id, turnUpdate.updatedAt);
+        this.antigravityRequestBindings.delete(turnUpdate.executionId);
+        this.antigravitySelectedChatId = binding.chatId;
+        this.activeChatKey = `antigravity:${binding.chatId}`;
+        this.activeChatEngagedAt = turnUpdate.updatedAt;
+        this.refreshAntigravityCollection();
+        return;
+      }
+
+      this.scheduleNetworkEmit();
     });
 
-    interceptor.start();
-    this.output.appendLine('[network] HTTP/HTTPS interceptor activated for real-time AI traffic capture.');
+    collector.start();
+    this.output.appendLine('[antigravity-ls] Local language-server collector activated for live capture.');
   }
 
   private scheduleNetworkEmit(): void {
@@ -493,10 +570,18 @@ export class AgentMonitor implements vscode.Disposable {
       return;
     }
 
-    this.sourceCollections.set(sourceId, cloneCollection(decorated));
-    this.updateActiveChatLock(sourceId, decorated);
-    
-    const activeChat = decorated.chats.find(c => c.id === decorated.selectedChatId);
+    if (sourceId === 'antigravity') {
+      this.antigravitySelectedChatId = decorated.selectedChatId ?? this.antigravitySelectedChatId;
+    }
+
+    const resolvedCollection = sourceId === 'antigravity'
+      ? this.mergeAntigravityCollection(decorated)
+      : decorated;
+
+    this.sourceCollections.set(sourceId, cloneCollection(resolvedCollection));
+    this.updateActiveChatLock(sourceId, resolvedCollection);
+
+    const activeChat = resolvedCollection.chats.find((chat) => chat.id === resolvedCollection.selectedChatId);
     if (activeChat) {
       this.triggerGroqAnalysis(activeChat);
     }
@@ -530,6 +615,76 @@ export class AgentMonitor implements vscode.Disposable {
     });
 
     return next;
+  }
+
+  private refreshAntigravityCollection(): void {
+    const merged = this.mergeAntigravityCollection(this.sourceCollections.get('antigravity'));
+    this.sourceCollections.set('antigravity', cloneCollection(merged));
+    this.updateActiveChatLock('antigravity', merged);
+
+    const activeChat = merged.chats.find((chat) => chat.id === merged.selectedChatId);
+    if (activeChat) {
+      this.triggerGroqAnalysis(activeChat);
+    }
+
+    this.emitSnapshot();
+  }
+
+  private mergeAntigravityCollection(
+    baseCollection: ConversationCollection | undefined
+  ): ConversationCollection {
+    const base = baseCollection
+      ? cloneCollection(baseCollection)
+      : { chats: [], selectedChatId: undefined };
+    const chatsById = new Map(base.chats.map((chat) => [chat.id, chat]));
+
+    for (const liveChat of this.antigravityLiveChats.values()) {
+      const existing = chatsById.get(liveChat.id);
+      chatsById.set(
+        liveChat.id,
+        existing
+          ? this.mergeAntigravityChat(existing, liveChat)
+          : cloneChat(liveChat)
+      );
+    }
+
+    const chats = [...chatsById.values()]
+      .sort((left, right) => right.updatedAt - left.updatedAt);
+    const selectedChatId = this.antigravitySelectedChatId
+      ?? base.selectedChatId
+      ?? chats[0]?.id;
+
+    return {
+      chats,
+      selectedChatId,
+    };
+  }
+
+  private mergeAntigravityChat(
+    persistedChat: ConversationChat,
+    liveChat: ConversationChat
+  ): ConversationChat {
+    const preferredTitle = isGenericAntigravityTitle(persistedChat.title) && liveChat.title
+      ? liveChat.title
+      : persistedChat.title || liveChat.title;
+    const preferredSubtitle = persistedChat.subtitle || liveChat.subtitle;
+    const preferredModel = liveChat.model ?? persistedChat.model;
+    const preferredConfidence = liveChat.modelConfidence
+      ?? persistedChat.modelConfidence
+      ?? (preferredModel ? 'inferred' : 'unknown');
+
+    return {
+      ...persistedChat,
+      title: preferredTitle || 'Untitled chat',
+      subtitle: preferredSubtitle,
+      createdAt: Math.min(persistedChat.createdAt, liveChat.createdAt),
+      updatedAt: Math.max(persistedChat.updatedAt, liveChat.updatedAt),
+      turns: liveChat.turns.length > 0
+        ? liveChat.turns.map((turn) => cloneTurn(turn))
+        : persistedChat.turns.map((turn) => cloneTurn(turn)),
+      model: preferredModel,
+      modelConfidence: preferredConfidence,
+    };
   }
 
   private buildSnapshot(): MonitorSnapshot {
@@ -581,15 +736,19 @@ export class AgentMonitor implements vscode.Disposable {
 
     for (const sourceId of ['cursor', 'antigravity'] as const) {
       const collection = this.sourceCollections.get(sourceId);
-      if (!collection) {
+      if (!collection && !(sourceId === 'antigravity' && this.antigravityLiveChats.size > 0)) {
         continue;
       }
+
+      const resolvedCollection = sourceId === 'antigravity'
+        ? this.mergeAntigravityCollection(collection)
+        : collection!;
 
       sources.push({
         id: sourceId,
         label: SOURCE_LABELS[sourceId],
-        chats: collection.chats.map((chat) => ({ ...chat })),
-        selectedChatId: collection.selectedChatId,
+        chats: resolvedCollection.chats.map((chat) => ({ ...chat })),
+        selectedChatId: resolvedCollection.selectedChatId,
       });
     }
 
@@ -780,10 +939,86 @@ export class AgentMonitor implements vscode.Disposable {
     return `manual-chat:${++this.chatCounter}`;
   }
 
-  private createRuntimeTurn(chat: ConversationChat): ConversationTurn {
-    const now = Date.now();
+  private createAntigravityLiveChatId(): string {
+    return `antigravity-live:${++this.chatCounter}`;
+  }
+
+  private resolveAntigravityLiveChatId(preferredChatId?: string): string {
+    const selectedFromActiveChat = this.activeChatKey?.startsWith('antigravity:')
+      ? extractChatId(this.activeChatKey)
+      : undefined;
+
+    return preferredChatId
+      ?? this.antigravitySelectedChatId
+      ?? this.sourceCollections.get('antigravity')?.selectedChatId
+      ?? selectedFromActiveChat
+      ?? this.createAntigravityLiveChatId();
+  }
+
+  private ensureAntigravityLiveChat(
+    chatId: string,
+    options: {
+      provider: string;
+      model?: string;
+      modelConfidence?: ModelConfidence;
+      startedAt: number;
+      title?: string;
+      subtitle?: string;
+      contextUsagePercent?: number;
+      contextWindowTokens?: number;
+    }
+  ): ConversationChat {
+    const existing = this.antigravityLiveChats.get(chatId);
+    if (existing) {
+      this.applyAntigravityLiveChatMetadata(existing, options);
+      return existing;
+    }
+
+    const persisted = this.sourceCollections.get('antigravity')?.chats.find((chat) => chat.id === chatId);
+    const timestamp = options.startedAt || Date.now();
+    const next: ConversationChat = {
+      id: chatId,
+      title: persisted?.title ?? `${options.provider} live session`,
+      subtitle: persisted?.subtitle,
+      createdAt: persisted?.createdAt ?? timestamp,
+      updatedAt: persisted?.updatedAt ?? timestamp,
+      turns: persisted?.turns.map((turn) => cloneTurn(turn)) ?? [],
+      sourceId: 'antigravity',
+      sourceLabel: SOURCE_LABELS.antigravity,
+      model: options.model ?? persisted?.model,
+      modelConfidence: options.model
+        ? options.modelConfidence ?? 'inferred'
+        : persisted?.modelConfidence ?? 'unknown',
+      contextUsagePercent: options.contextUsagePercent ?? persisted?.contextUsagePercent,
+      contextWindowTokens: options.contextWindowTokens ?? persisted?.contextWindowTokens,
+    };
+
+    this.applyAntigravityLiveChatMetadata(next, options);
+    this.antigravityLiveChats.set(chatId, next);
+    return next;
+  }
+
+  private ensureRuntimeTurn(
+    chat: ConversationChat,
+    options?: { turnId?: string; timestamp?: number }
+  ): ConversationTurn {
+    if (options?.turnId) {
+      const existing = chat.turns.find((candidate) => candidate.id === options.turnId);
+      if (existing) {
+        return existing;
+      }
+    }
+
+    return this.createRuntimeTurn(chat, options);
+  }
+
+  private createRuntimeTurn(
+    chat: ConversationChat,
+    options?: { turnId?: string; timestamp?: number }
+  ): ConversationTurn {
+    const now = options?.timestamp ?? Date.now();
     const turn: ConversationTurn = {
-      id: `runtime-turn:${++this.turnCounter}`,
+      id: options?.turnId ?? `runtime-turn:${++this.turnCounter}`,
       createdAt: now,
       updatedAt: now,
       isComplete: false,
@@ -793,6 +1028,44 @@ export class AgentMonitor implements vscode.Disposable {
     chat.turns.push(turn);
     chat.updatedAt = now;
     return turn;
+  }
+
+  private applyAntigravityLiveChatMetadata(
+    chat: ConversationChat,
+    options: {
+      model?: string;
+      modelConfidence?: ModelConfidence;
+      title?: string;
+      subtitle?: string;
+      contextUsagePercent?: number;
+      contextWindowTokens?: number;
+      updatedAt?: number;
+    }
+  ): void {
+    if (options.model) {
+      chat.model = options.model;
+      chat.modelConfidence = options.modelConfidence ?? 'inferred';
+    }
+
+    if (options.title && (isGenericAntigravityTitle(chat.title) || !chat.title.trim())) {
+      chat.title = options.title;
+    }
+
+    if (options.subtitle && (!chat.subtitle || isGenericAntigravityTitle(chat.subtitle))) {
+      chat.subtitle = options.subtitle;
+    }
+
+    if (options.contextUsagePercent !== undefined) {
+      chat.contextUsagePercent = options.contextUsagePercent;
+    }
+
+    if (options.contextWindowTokens !== undefined) {
+      chat.contextWindowTokens = options.contextWindowTokens;
+    }
+
+    if (options.updatedAt !== undefined) {
+      chat.updatedAt = Math.max(chat.updatedAt, options.updatedAt);
+    }
   }
 
   private getLastOpenRuntimeTurn(chat: ConversationChat): ConversationTurn | undefined {
@@ -814,32 +1087,63 @@ export class AgentMonitor implements vscode.Disposable {
     return turn;
   }
 
-  private setBlockContent(chat: ConversationChat, turnId: string, blockType: BlockType, content: string): void {
+  private setBlockContent(
+    chat: ConversationChat,
+    turnId: string,
+    blockType: BlockType,
+    content: string,
+    isStreaming = false,
+    updatedAt = Date.now()
+  ): void {
     const turn = this.mustGetTurn(chat, turnId);
     turn.blocks[blockType].content = content;
-    turn.blocks[blockType].isStreaming = false;
-
-    if (blockType === 'agent-output') {
-      chat.subtitle = summarizeForSubtitle(content) ?? chat.subtitle;
-    } else if (blockType === 'user-input' && !chat.subtitle) {
-      chat.subtitle = summarizeForSubtitle(content);
-    }
-
-    this.touchTurn(chat, turn);
+    turn.blocks[blockType].isStreaming = isStreaming;
+    this.updateChatPresentationFromBlock(chat, blockType, content);
+    this.touchTurn(chat, turn, updatedAt);
   }
 
-  private finalizeTurn(chat: ConversationChat, turnId: string): void {
+  private appendBlockContent(
+    chat: ConversationChat,
+    turnId: string,
+    blockType: BlockType,
+    delta: string,
+    updatedAt = Date.now()
+  ): void {
+    if (!delta) {
+      return;
+    }
+
+    const turn = this.mustGetTurn(chat, turnId);
+    turn.blocks[blockType].content += delta;
+    turn.blocks[blockType].isStreaming = true;
+    this.updateChatPresentationFromBlock(chat, blockType, turn.blocks[blockType].content);
+    this.touchTurn(chat, turn, updatedAt);
+  }
+
+  private finalizeTurn(chat: ConversationChat, turnId: string, completedAt = Date.now()): void {
     const turn = this.mustGetTurn(chat, turnId);
     for (const blockType of BLOCK_TYPES) {
       turn.blocks[blockType].isStreaming = false;
     }
     turn.isComplete = Boolean(turn.blocks['agent-output'].content);
-    this.touchTurn(chat, turn);
+    this.touchTurn(chat, turn, completedAt);
   }
 
-  private touchTurn(chat: ConversationChat, turn: ConversationTurn): void {
-    turn.updatedAt = Date.now();
-    chat.updatedAt = turn.updatedAt;
+  private updateChatPresentationFromBlock(
+    chat: ConversationChat,
+    blockType: BlockType,
+    content: string
+  ): void {
+    if (blockType === 'agent-output') {
+      chat.subtitle = summarizeForSubtitle(content) ?? chat.subtitle;
+    } else if (blockType === 'user-input' && !chat.subtitle) {
+      chat.subtitle = summarizeForSubtitle(content);
+    }
+  }
+
+  private touchTurn(chat: ConversationChat, turn: ConversationTurn, updatedAt = Date.now()): void {
+    turn.updatedAt = updatedAt;
+    chat.updatedAt = Math.max(chat.updatedAt, turn.updatedAt);
   }
 
   private persistCompletedSessionIfNeeded(
@@ -1105,6 +1409,14 @@ function summarizeForSubtitle(value?: string): string | undefined {
   return singleLine.length <= 110
     ? singleLine
     : `${singleLine.slice(0, 107).trimEnd()}...`;
+}
+
+function isGenericAntigravityTitle(value: string | undefined): boolean {
+  const normalized = (value ?? '').trim().toLowerCase();
+  return !normalized
+    || normalized === 'new chat'
+    || normalized === 'untitled chat'
+    || normalized.endsWith('live session');
 }
 
 function loadPromptLibrary(rawValue: unknown): SavedPrompt[] {
