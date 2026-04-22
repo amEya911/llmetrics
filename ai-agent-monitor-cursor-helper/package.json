@@ -1,0 +1,21 @@
+{
+  "name": "ai-agent-monitor-cursor-helper",
+  "displayName": "AI Token Analytics Cursor Helper",
+  "description": "Diagnostic helper for Cursor host placement and network capture.",
+  "publisher": "ameyakulkarni",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onResolveRemoteAuthority:background-composer"
+  ],
+  "main": "./dist/extension.js"
+}

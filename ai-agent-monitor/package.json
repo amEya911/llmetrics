@@ -8,8 +8,8 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "enabledApiProposals": [
-    "cursor"
+  "extensionKind": [
+    "workspace"
   ],
   "categories": [
     "Other",
@@ -20,7 +20,9 @@
     "continue", "antigravity", "llm", "conversation"
   ],
   "activationEvents": [
-    "*"
+    "*",
+    "onStartupFinished",
+    "onResolveRemoteAuthority:background-composer"
   ],
   "main": "./dist/extension.js",
   "contributes": {

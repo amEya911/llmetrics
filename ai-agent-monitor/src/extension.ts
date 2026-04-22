@@ -1,4 +1,7 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { AgentMonitor } from './AgentMonitor';
 import { MonitorPanel } from './MonitorPanel';
 import { SidebarProvider } from './SidebarProvider';
@@ -12,6 +15,29 @@ function handleWebviewMessage(message: WebviewIncoming): void {
 }
 
 export function activate(context: vscode.ExtensionContext) {
+  const activationLogPath = path.join(os.tmpdir(), 'ai-token-analytics-activation.log');
+  const activationPayload = JSON.stringify({
+    timestamp: new Date().toISOString(),
+    pid: process.pid,
+    appName: vscode.env.appName,
+    remoteName: vscode.env.remoteName ?? null,
+    uiKind: vscode.env.uiKind,
+    execPath: process.execPath,
+    cwd: process.cwd(),
+    workspaceFolders: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath),
+  });
+
+  try {
+    fs.appendFileSync(activationLogPath, `${activationPayload}\n`, 'utf8');
+  } catch {
+    // Ignore activation log write failures during diagnostics.
+  }
+
+  console.log(
+    '[ai-agent-monitor] activate',
+    activationPayload
+  );
+
   monitor = new AgentMonitor(context);
   context.subscriptions.push(monitor);
 

@@ -4,6 +4,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { ConversationStoreWatcher } from './ConversationStoreWatcher';
 import { AntigravityLanguageServerCollector } from './AntigravityLanguageServerCollector';
+import { CursorSiblingNetworkBridge } from './CursorSiblingNetworkBridge';
+import { NetworkInterceptor } from './NetworkInterceptor';
 import {
   buildDashboardSnapshot,
   createDefaultBudgets,
@@ -96,6 +98,34 @@ interface AntigravityRequestBinding {
   turnId: string;
 }
 
+interface CursorRequestBinding {
+  chatId: string;
+  turnId: string;
+}
+
+interface CursorInterceptedTurnStart {
+  requestId: string;
+  provider: string;
+  prompt: string;
+  model?: string;
+  modelConfidence: ModelConfidence;
+  chatId?: string;
+  startedAt: number;
+}
+
+interface CursorInterceptedTurnChunk {
+  requestId: string;
+  provider: string;
+  kind: 'agent-thinking' | 'agent-output';
+  content: string;
+}
+
+interface CursorInterceptedTurnComplete extends CursorInterceptedTurnStart {
+  completedAt: number;
+  thinking: string;
+  output: string;
+}
+
 export class AgentMonitor implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly output: vscode.OutputChannel;
@@ -103,8 +133,12 @@ export class AgentMonitor implements vscode.Disposable {
   private readonly extensionContext: vscode.ExtensionContext;
   private readonly hostApp: HostApp;
   private readonly appLabel: string;
+  private cursorDiagnosticLogPath?: string;
+  private cursorDiagnosticWrite: Promise<void> = Promise.resolve();
 
   private readonly runtimeChats = new Map<string, ConversationChat>();
+  private readonly cursorLiveChats = new Map<string, ConversationChat>();
+  private readonly cursorRequestBindings = new Map<string, CursorRequestBinding>();
   private readonly antigravityLiveChats = new Map<string, ConversationChat>();
   private readonly antigravityRequestBindings = new Map<string, AntigravityRequestBinding>();
   private readonly sourceCollections = new Map<'cursor' | 'antigravity', ConversationCollection>();
@@ -125,8 +159,11 @@ export class AgentMonitor implements vscode.Disposable {
   private activeChatKey?: string;
   private activeChatEngagedAt = 0;
   private lastAlertIds = new Set<string>();
+  private cursorSelectedChatId?: string;
   private antigravitySelectedChatId?: string;
 
+  private cursorInProcessInterceptor?: NetworkInterceptor;
+  private cursorInterceptor?: CursorSiblingNetworkBridge;
   private antigravityCollector?: AntigravityLanguageServerCollector;
   private networkEmitHandle?: NodeJS.Timeout;
 
@@ -152,6 +189,9 @@ export class AgentMonitor implements vscode.Disposable {
     const host = detectHostApp();
     this.hostApp = host.app;
     this.appLabel = host.label;
+    this.cursorDiagnosticLogPath = this.hostApp === 'cursor'
+      ? path.join(os.tmpdir(), 'ai-token-analytics-cursor-network.log')
+      : undefined;
     this.output.appendLine(`[host] Running inside ${this.appLabel}.`);
 
     this.promptLibrary = loadPromptLibrary(context.globalState.get<unknown>(PROMPT_LIBRARY_KEY));
@@ -162,7 +202,9 @@ export class AgentMonitor implements vscode.Disposable {
       this.startWatcher(sourceId);
     }
 
-    if (this.hostApp === 'antigravity') {
+    if (this.hostApp === 'cursor') {
+      this.startCursorNetworkInterceptor();
+    } else if (this.hostApp === 'antigravity') {
       this.startAntigravityCollector();
     }
 
@@ -202,6 +244,8 @@ export class AgentMonitor implements vscode.Disposable {
   clearBlocks(): void {
     this.flushNetworkEmit();
     this.runtimeChats.clear();
+    this.cursorLiveChats.clear();
+    this.cursorRequestBindings.clear();
     this.antigravityLiveChats.clear();
     this.antigravityRequestBindings.clear();
     this.sourceCollections.clear();
@@ -213,6 +257,7 @@ export class AgentMonitor implements vscode.Disposable {
     this.activeChatEngagedAt = 0;
     this.currentGroqInsights = [];
     this.groqInsightChatKey = undefined;
+    this.cursorSelectedChatId = undefined;
     this.antigravitySelectedChatId = undefined;
 
     for (const sourceId of ['cursor', 'antigravity'] as const) {
@@ -400,6 +445,222 @@ export class AgentMonitor implements vscode.Disposable {
     watcher.start();
   }
 
+  private startCursorNetworkInterceptor(): void {
+    this.resetCursorDiagnosticLog();
+    if (this.cursorDiagnosticLogPath) {
+      this.logCursorDiagnostic(
+        `[cursor-network] Writing verbose request diagnostics to ${this.cursorDiagnosticLogPath}`
+      );
+    }
+
+    const localInterceptor = new NetworkInterceptor({
+      log: (message) => this.logCursorDiagnostic(message),
+    });
+    this.cursorInProcessInterceptor = localInterceptor;
+    this.disposables.push(localInterceptor);
+
+    localInterceptor.onTurnStart((turnStart) => {
+      this.handleCursorTurnStart(turnStart, 'in-process');
+    });
+    localInterceptor.onTurnChunk((turnChunk) => {
+      this.handleCursorTurnChunk(turnChunk);
+    });
+    localInterceptor.onTurnComplete((turnComplete) => {
+      this.handleCursorTurnComplete(turnComplete);
+    });
+    localInterceptor.start();
+    this.logCursorDiagnostic(
+      '[cursor-network] Cursor in-process NetworkInterceptor activated for user-host live capture.'
+    );
+
+    const eventLogPath = path.join(os.tmpdir(), 'ai-token-analytics-cursor-live-events.jsonl');
+    const interceptor = new CursorSiblingNetworkBridge({
+      diagnosticLogPath: this.cursorDiagnosticLogPath,
+      eventLogPath,
+      probeModulePath: this.extensionContext.asAbsolutePath(path.join('dist', 'cursorRemoteProbe.js')),
+      log: (message) => this.logCursorDiagnostic(message),
+    });
+    this.cursorInterceptor = interceptor;
+    this.disposables.push(interceptor);
+
+    interceptor.onTurnStart((turnStart) => {
+      this.handleCursorTurnStart(turnStart, 'sibling-host');
+    });
+
+    interceptor.onTurnChunk((turnChunk) => {
+      this.handleCursorTurnChunk(turnChunk);
+    });
+
+    interceptor.onTurnComplete((turnComplete) => {
+      this.handleCursorTurnComplete(turnComplete);
+    });
+
+    void interceptor.start();
+    this.logCursorDiagnostic(
+      '[cursor-network] Cursor sibling-host bridge activated for live capture.'
+    );
+  }
+
+  private handleCursorTurnStart(
+    turnStart: CursorInterceptedTurnStart,
+    captureSource: 'in-process' | 'sibling-host'
+  ): void {
+    if (turnStart.provider !== 'Cursor') {
+      return;
+    }
+
+    const modelLabel = turnStart.model
+      ? `, model ${turnStart.model}`
+      : '';
+    this.output.appendLine(
+      `[cursor-network] Prompt captured via ${captureSource} (${turnStart.prompt.length} chars${modelLabel})`
+    );
+
+    const chatId = this.resolveCursorLiveChatId(turnStart.chatId);
+    const chat = this.ensureCursorLiveChat(chatId, {
+      provider: SOURCE_LABELS.cursor,
+      model: turnStart.model,
+      modelConfidence: turnStart.modelConfidence,
+      startedAt: turnStart.startedAt,
+      title: summarizeForTitle(turnStart.prompt),
+      subtitle: summarizeForSubtitle(turnStart.prompt),
+    });
+    const turn = this.ensureRuntimeTurn(chat, {
+      turnId: `cursor-network:${turnStart.requestId}`,
+      timestamp: turnStart.startedAt,
+    });
+
+    this.cursorRequestBindings.set(turnStart.requestId, {
+      chatId,
+      turnId: turn.id,
+    });
+    this.cursorSelectedChatId = chatId;
+
+    this.setBlockContent(
+      chat,
+      turn.id,
+      'user-input',
+      turnStart.prompt,
+      false,
+      turnStart.startedAt
+    );
+
+    if (turnStart.model) {
+      chat.model = turnStart.model;
+      chat.modelConfidence = turnStart.modelConfidence;
+      turn.model = turnStart.model;
+      turn.modelConfidence = turnStart.modelConfidence;
+    }
+
+    this.activeChatKey = `cursor:${chat.id}`;
+    this.activeChatEngagedAt = turnStart.startedAt;
+    this.refreshCursorCollection();
+  }
+
+  private handleCursorTurnChunk(turnChunk: CursorInterceptedTurnChunk): void {
+    if (turnChunk.provider !== 'Cursor') {
+      return;
+    }
+
+    const binding = this.cursorRequestBindings.get(turnChunk.requestId);
+    if (!binding) {
+      return;
+    }
+
+    const chat = this.cursorLiveChats.get(binding.chatId);
+    if (!chat) {
+      return;
+    }
+
+    this.appendBlockContent(
+      chat,
+      binding.turnId,
+      turnChunk.kind,
+      turnChunk.content
+    );
+
+    this.scheduleNetworkEmit();
+  }
+
+  private handleCursorTurnComplete(turnComplete: CursorInterceptedTurnComplete): void {
+    if (turnComplete.provider !== 'Cursor') {
+      return;
+    }
+
+    const binding = this.cursorRequestBindings.get(turnComplete.requestId);
+    if (!binding) {
+      return;
+    }
+
+    const chat = this.cursorLiveChats.get(binding.chatId);
+    if (!chat) {
+      return;
+    }
+
+    const turn = this.mustGetTurn(chat, binding.turnId);
+    if (turnComplete.model) {
+      chat.model = turnComplete.model;
+      chat.modelConfidence = turnComplete.modelConfidence;
+      turn.model = turnComplete.model;
+      turn.modelConfidence = turnComplete.modelConfidence;
+    }
+
+    this.setBlockContent(
+      chat,
+      turn.id,
+      'agent-thinking',
+      turnComplete.thinking,
+      false,
+      turnComplete.completedAt
+    );
+    this.setBlockContent(
+      chat,
+      turn.id,
+      'agent-output',
+      turnComplete.output,
+      false,
+      turnComplete.completedAt
+    );
+    this.finalizeTurn(chat, turn.id, turnComplete.completedAt);
+
+    this.cursorRequestBindings.delete(turnComplete.requestId);
+    this.cursorSelectedChatId = binding.chatId;
+    this.activeChatKey = `cursor:${binding.chatId}`;
+    this.activeChatEngagedAt = turnComplete.completedAt;
+    this.refreshCursorCollection();
+  }
+
+  private resetCursorDiagnosticLog(): void {
+    if (!this.cursorDiagnosticLogPath) {
+      return;
+    }
+
+    const logPath = this.cursorDiagnosticLogPath;
+    this.cursorDiagnosticWrite = fs.writeFile(logPath, '', 'utf8').catch((error) => {
+      this.output.appendLine(
+        `[cursor-network] Failed to reset diagnostic log ${logPath}: ${formatError(error)}`
+      );
+    });
+  }
+
+  private logCursorDiagnostic(message: string): void {
+    const line = `[${new Date().toISOString()}] ${message}`;
+    this.output.appendLine(line);
+
+    if (!this.cursorDiagnosticLogPath) {
+      return;
+    }
+
+    const logPath = this.cursorDiagnosticLogPath;
+    this.cursorDiagnosticWrite = this.cursorDiagnosticWrite
+      .then(() => fs.appendFile(logPath, `${line}\n`, 'utf8'))
+      .catch((error) => {
+        this.output.appendLine(
+          `[cursor-network] Failed to write diagnostic log ${logPath}: ${formatError(error)}`
+        );
+      });
+  }
+
   private startAntigravityCollector(): void {
     const collector = new AntigravityLanguageServerCollector({
       output: this.output,
@@ -573,10 +834,15 @@ export class AgentMonitor implements vscode.Disposable {
     if (sourceId === 'antigravity') {
       this.antigravitySelectedChatId = decorated.selectedChatId ?? this.antigravitySelectedChatId;
     }
+    if (sourceId === 'cursor') {
+      this.cursorSelectedChatId = decorated.selectedChatId ?? this.cursorSelectedChatId;
+    }
 
     const resolvedCollection = sourceId === 'antigravity'
       ? this.mergeAntigravityCollection(decorated)
-      : decorated;
+      : sourceId === 'cursor'
+        ? this.mergeCursorCollection(decorated)
+        : decorated;
 
     this.sourceCollections.set(sourceId, cloneCollection(resolvedCollection));
     this.updateActiveChatLock(sourceId, resolvedCollection);
@@ -630,6 +896,77 @@ export class AgentMonitor implements vscode.Disposable {
     this.emitSnapshot();
   }
 
+  private refreshCursorCollection(): void {
+    const merged = this.mergeCursorCollection(this.sourceCollections.get('cursor'));
+    this.sourceCollections.set('cursor', cloneCollection(merged));
+    this.updateActiveChatLock('cursor', merged);
+
+    const activeChat = merged.chats.find((chat) => chat.id === merged.selectedChatId);
+    if (activeChat) {
+      this.triggerGroqAnalysis(activeChat);
+    }
+
+    this.emitSnapshot();
+  }
+
+  private mergeCursorCollection(
+    baseCollection: ConversationCollection | undefined
+  ): ConversationCollection {
+    const base = baseCollection
+      ? cloneCollection(baseCollection)
+      : { chats: [], selectedChatId: undefined };
+    const chatsById = new Map(base.chats.map((chat) => [chat.id, chat]));
+
+    for (const liveChat of this.cursorLiveChats.values()) {
+      const existing = chatsById.get(liveChat.id);
+      chatsById.set(
+        liveChat.id,
+        existing
+          ? this.mergeCursorChat(existing, liveChat)
+          : cloneChat(liveChat)
+      );
+    }
+
+    const chats = [...chatsById.values()]
+      .sort((left, right) => right.updatedAt - left.updatedAt);
+    const selectedChatId = this.cursorSelectedChatId
+      ?? base.selectedChatId
+      ?? chats[0]?.id;
+
+    return {
+      chats,
+      selectedChatId,
+    };
+  }
+
+  private mergeCursorChat(
+    persistedChat: ConversationChat,
+    liveChat: ConversationChat
+  ): ConversationChat {
+    const shouldPreferLiveTurns = hasOpenTurn(liveChat) || liveChat.updatedAt >= persistedChat.updatedAt;
+    const preferredTitle = isGenericLiveTitle(persistedChat.title) && liveChat.title
+      ? liveChat.title
+      : persistedChat.title || liveChat.title;
+    const preferredSubtitle = liveChat.subtitle || persistedChat.subtitle;
+    const preferredModel = liveChat.model ?? persistedChat.model;
+    const preferredConfidence = liveChat.modelConfidence
+      ?? persistedChat.modelConfidence
+      ?? (preferredModel ? 'inferred' : 'unknown');
+
+    return {
+      ...persistedChat,
+      title: preferredTitle || 'Untitled chat',
+      subtitle: preferredSubtitle,
+      createdAt: Math.min(persistedChat.createdAt, liveChat.createdAt),
+      updatedAt: Math.max(persistedChat.updatedAt, liveChat.updatedAt),
+      turns: shouldPreferLiveTurns
+        ? liveChat.turns.map((turn) => cloneTurn(turn))
+        : persistedChat.turns.map((turn) => cloneTurn(turn)),
+      model: preferredModel,
+      modelConfidence: preferredConfidence,
+    };
+  }
+
   private mergeAntigravityCollection(
     baseCollection: ConversationCollection | undefined
   ): ConversationCollection {
@@ -664,7 +1001,7 @@ export class AgentMonitor implements vscode.Disposable {
     persistedChat: ConversationChat,
     liveChat: ConversationChat
   ): ConversationChat {
-    const preferredTitle = isGenericAntigravityTitle(persistedChat.title) && liveChat.title
+    const preferredTitle = isGenericLiveTitle(persistedChat.title) && liveChat.title
       ? liveChat.title
       : persistedChat.title || liveChat.title;
     const preferredSubtitle = persistedChat.subtitle || liveChat.subtitle;
@@ -736,13 +1073,19 @@ export class AgentMonitor implements vscode.Disposable {
 
     for (const sourceId of ['cursor', 'antigravity'] as const) {
       const collection = this.sourceCollections.get(sourceId);
-      if (!collection && !(sourceId === 'antigravity' && this.antigravityLiveChats.size > 0)) {
+      if (
+        !collection
+        && !(sourceId === 'cursor' && this.cursorLiveChats.size > 0)
+        && !(sourceId === 'antigravity' && this.antigravityLiveChats.size > 0)
+      ) {
         continue;
       }
 
       const resolvedCollection = sourceId === 'antigravity'
         ? this.mergeAntigravityCollection(collection)
-        : collection!;
+        : sourceId === 'cursor'
+          ? this.mergeCursorCollection(collection)
+          : collection!;
 
       sources.push({
         id: sourceId,
@@ -939,8 +1282,24 @@ export class AgentMonitor implements vscode.Disposable {
     return `manual-chat:${++this.chatCounter}`;
   }
 
+  private createCursorLiveChatId(): string {
+    return `cursor-live:${++this.chatCounter}`;
+  }
+
   private createAntigravityLiveChatId(): string {
     return `antigravity-live:${++this.chatCounter}`;
+  }
+
+  private resolveCursorLiveChatId(preferredChatId?: string): string {
+    const selectedFromActiveChat = this.activeChatKey?.startsWith('cursor:')
+      ? extractChatId(this.activeChatKey)
+      : undefined;
+
+    return preferredChatId
+      ?? this.cursorSelectedChatId
+      ?? this.sourceCollections.get('cursor')?.selectedChatId
+      ?? selectedFromActiveChat
+      ?? this.createCursorLiveChatId();
   }
 
   private resolveAntigravityLiveChatId(preferredChatId?: string): string {
@@ -998,6 +1357,47 @@ export class AgentMonitor implements vscode.Disposable {
     return next;
   }
 
+  private ensureCursorLiveChat(
+    chatId: string,
+    options: {
+      provider: string;
+      model?: string;
+      modelConfidence?: ModelConfidence;
+      startedAt: number;
+      title?: string;
+      subtitle?: string;
+    }
+  ): ConversationChat {
+    const existing = this.cursorLiveChats.get(chatId);
+    if (existing) {
+      this.applyCursorLiveChatMetadata(existing, options);
+      return existing;
+    }
+
+    const persisted = this.sourceCollections.get('cursor')?.chats.find((chat) => chat.id === chatId);
+    const timestamp = options.startedAt || Date.now();
+    const next: ConversationChat = {
+      id: chatId,
+      title: persisted?.title ?? options.title ?? `${options.provider} live session`,
+      subtitle: persisted?.subtitle ?? options.subtitle,
+      createdAt: persisted?.createdAt ?? timestamp,
+      updatedAt: persisted?.updatedAt ?? timestamp,
+      turns: persisted?.turns.map((turn) => cloneTurn(turn)) ?? [],
+      sourceId: 'cursor',
+      sourceLabel: SOURCE_LABELS.cursor,
+      model: options.model ?? persisted?.model,
+      modelConfidence: options.model
+        ? options.modelConfidence ?? 'inferred'
+        : persisted?.modelConfidence ?? 'unknown',
+      contextUsagePercent: persisted?.contextUsagePercent,
+      contextWindowTokens: persisted?.contextWindowTokens,
+    };
+
+    this.applyCursorLiveChatMetadata(next, options);
+    this.cursorLiveChats.set(chatId, next);
+    return next;
+  }
+
   private ensureRuntimeTurn(
     chat: ConversationChat,
     options?: { turnId?: string; timestamp?: number }
@@ -1047,11 +1447,11 @@ export class AgentMonitor implements vscode.Disposable {
       chat.modelConfidence = options.modelConfidence ?? 'inferred';
     }
 
-    if (options.title && (isGenericAntigravityTitle(chat.title) || !chat.title.trim())) {
+    if (options.title && (isGenericLiveTitle(chat.title) || !chat.title.trim())) {
       chat.title = options.title;
     }
 
-    if (options.subtitle && (!chat.subtitle || isGenericAntigravityTitle(chat.subtitle))) {
+    if (options.subtitle && (!chat.subtitle || isGenericLiveTitle(chat.subtitle))) {
       chat.subtitle = options.subtitle;
     }
 
@@ -1061,6 +1461,34 @@ export class AgentMonitor implements vscode.Disposable {
 
     if (options.contextWindowTokens !== undefined) {
       chat.contextWindowTokens = options.contextWindowTokens;
+    }
+
+    if (options.updatedAt !== undefined) {
+      chat.updatedAt = Math.max(chat.updatedAt, options.updatedAt);
+    }
+  }
+
+  private applyCursorLiveChatMetadata(
+    chat: ConversationChat,
+    options: {
+      model?: string;
+      modelConfidence?: ModelConfidence;
+      title?: string;
+      subtitle?: string;
+      updatedAt?: number;
+    }
+  ): void {
+    if (options.model) {
+      chat.model = options.model;
+      chat.modelConfidence = options.modelConfidence ?? 'inferred';
+    }
+
+    if (options.title && (isGenericLiveTitle(chat.title) || !chat.title.trim())) {
+      chat.title = options.title;
+    }
+
+    if (options.subtitle && (!chat.subtitle || isGenericLiveTitle(chat.subtitle))) {
+      chat.subtitle = options.subtitle;
     }
 
     if (options.updatedAt !== undefined) {
@@ -1411,12 +1839,16 @@ function summarizeForSubtitle(value?: string): string | undefined {
     : `${singleLine.slice(0, 107).trimEnd()}...`;
 }
 
-function isGenericAntigravityTitle(value: string | undefined): boolean {
+function isGenericLiveTitle(value: string | undefined): boolean {
   const normalized = (value ?? '').trim().toLowerCase();
   return !normalized
     || normalized === 'new chat'
     || normalized === 'untitled chat'
     || normalized.endsWith('live session');
+}
+
+function hasOpenTurn(chat: ConversationChat): boolean {
+  return chat.turns.some((turn) => !turn.isComplete);
 }
 
 function loadPromptLibrary(rawValue: unknown): SavedPrompt[] {
