@@ -17,6 +17,7 @@ const https: typeof httpsTypes = require('https');
 const zlib: typeof import('zlib') = require('zlib');
 
 type ModelConfidence = 'exact' | 'inferred' | 'unknown';
+type PromptCaptureConfidence = 'none' | 'weak' | 'strong' | 'exact';
 
 export interface CursorRemoteProbeOptions {
   diagnosticLogPath?: string;
@@ -74,8 +75,14 @@ interface InterceptedRequestState extends InterceptedTurnStart {
   thinking: string;
   output: string;
   fallbackOutput: string;
+  promptConfidence: PromptCaptureConfidence;
   didComplete: boolean;
   didStartEvent: boolean;
+}
+
+interface PromptExtractionResult {
+  prompt: string;
+  confidence: PromptCaptureConfidence;
 }
 
 interface NormalizedRequestDetails {
@@ -113,6 +120,14 @@ interface PrototypeClientRequestCapture {
   requestId?: string;
   attemptedRegistration: boolean;
   responseObserved: boolean;
+}
+
+interface PendingCursorTurnSeed {
+  prompt?: string;
+  model?: string;
+  modelConfidence: ModelConfidence;
+  chatId?: string;
+  observedAt: number;
 }
 
 const GLOBAL_STATE_KEY = '__aiTokenAnalyticsCursorRemoteProbe';
@@ -160,6 +175,7 @@ class CursorRemoteProbe {
   private readonly originalRegisterConnectTransportProvider?: Function;
 
   private readonly activeRequests = new Map<string, InterceptedRequestState>();
+  private readonly pendingCursorTurnSeeds = new Map<string, PendingCursorTurnSeed>();
   private readonly undiciCaptures = new WeakMap<object, UndiciRequestCapture>();
   private readonly prototypeClientRequestCaptures =
     new WeakMap<httpTypes.ClientRequest, PrototypeClientRequestCapture>();
@@ -705,6 +721,7 @@ class CursorRemoteProbe {
     source: string
   ): unknown {
     const invocation = this.describeCursorConnectInvocation(transport, kind, args, source);
+    this.rememberCursorTurnSeed(invocation);
     const shouldCapture = this.shouldCaptureCursorConnectInvocation(invocation);
     const interceptedRequestId = shouldCapture
       ? this.registerCursorConnectRequest(invocation)
@@ -802,6 +819,17 @@ class CursorRemoteProbe {
 
   private registerCursorConnectRequest(invocation: CursorConnectInvocation): string {
     const payload = this.parseCursorConnectPayload(invocation);
+    const seed = this.consumeCursorTurnSeed(invocation);
+    if (!payload.prompt && seed?.prompt) {
+      payload.prompt = seed.prompt;
+    }
+    if (!payload.model && seed?.model) {
+      payload.model = seed.model;
+      payload.modelConfidence = seed.modelConfidence;
+    }
+    if (!payload.chatId && seed?.chatId) {
+      payload.chatId = seed.chatId;
+    }
     const modelHint = this.shouldApplyCursorModelHint(invocation)
       ? this.getRecentCursorModelHint()
       : undefined;
@@ -825,6 +853,7 @@ class CursorRemoteProbe {
       thinking: '',
       output: '',
       fallbackOutput: '',
+      promptConfidence: hasPrompt ? 'exact' : 'none',
       didComplete: false,
       didStartEvent: hasPrompt,
     };
@@ -874,6 +903,70 @@ class CursorRemoteProbe {
     }
 
     return requestId;
+  }
+
+  private rememberCursorTurnSeed(invocation: CursorConnectInvocation): void {
+    const normalizedService = invocation.serviceName.toLowerCase();
+    const normalizedMethod = invocation.methodName.toLowerCase();
+    if (!normalizedService.includes('aiservice') || normalizedMethod !== 'nametab') {
+      return;
+    }
+
+    const seedId = invocation.requestId?.trim();
+    if (!seedId) {
+      return;
+    }
+
+    const payload = this.parseCursorConnectPayload(invocation);
+    if (!payload.prompt && !payload.model && !payload.chatId) {
+      return;
+    }
+
+    this.pendingCursorTurnSeeds.set(seedId, {
+      prompt: payload.prompt?.trim() || undefined,
+      model: payload.model,
+      modelConfidence: payload.modelConfidence,
+      chatId: payload.chatId,
+      observedAt: Date.now(),
+    });
+
+    this.writeDiagnostic({
+      phase: 'cursor-turn-seed',
+      sourceServiceName: invocation.serviceName,
+      sourceMethodName: invocation.methodName,
+      seedId,
+      prompt: payload.prompt,
+      model: payload.model,
+      chatId: payload.chatId,
+      role: this.options.role,
+      pid: process.pid,
+    });
+  }
+
+  private consumeCursorTurnSeed(invocation: CursorConnectInvocation): PendingCursorTurnSeed | undefined {
+    const seedKeys = [
+      invocation.headers['x-original-request-id'],
+      invocation.headers['x-request-id'],
+      invocation.requestId,
+    ]
+      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      .map((value) => value.trim());
+
+    for (const key of seedKeys) {
+      const seed = this.pendingCursorTurnSeeds.get(key);
+      if (!seed) {
+        continue;
+      }
+
+      this.pendingCursorTurnSeeds.delete(key);
+      if (Date.now() - seed.observedAt > 2 * 60 * 1000) {
+        return undefined;
+      }
+
+      return seed;
+    }
+
+    return undefined;
   }
 
   private wrapCursorConnectUnaryResult(
@@ -1170,11 +1263,13 @@ class CursorRemoteProbe {
       return;
     }
 
-    if (!state.prompt) {
-      const prompt = this.extractCursorPromptFromStreamMessage(message);
-      if (prompt) {
-        state.prompt = prompt;
-      }
+    const promptCandidate = this.extractCursorPromptFromStreamMessage(message);
+    if (
+      promptCandidate
+      && this.isBetterPromptCandidate(promptCandidate.confidence, state.promptConfidence)
+    ) {
+      state.prompt = promptCandidate.prompt;
+      state.promptConfidence = promptCandidate.confidence;
     }
 
     if (!state.fallbackOutput) {
@@ -1221,6 +1316,10 @@ class CursorRemoteProbe {
       return;
     }
 
+    if (!this.isPromptReadyForEmission(state.promptConfidence)) {
+      return;
+    }
+
     state.didStartEvent = true;
     this.writeEvent({
       phase: 'turn-start',
@@ -1262,7 +1361,7 @@ class CursorRemoteProbe {
     }
   }
 
-  private extractCursorPromptFromStreamMessage(value: unknown): string | undefined {
+  private extractCursorPromptFromStreamMessage(value: unknown): PromptExtractionResult | undefined {
     if (!value || typeof value !== 'object') {
       return undefined;
     }
@@ -1274,7 +1373,10 @@ class CursorRemoteProbe {
         this.readTextLike((userMessageAppended as any)?.userMessage ?? userMessageAppended)
       );
       if (text) {
-        return text;
+        return {
+          prompt: text,
+          confidence: 'exact',
+        };
       }
     }
 
@@ -1292,15 +1394,29 @@ class CursorRemoteProbe {
         }
 
         const directText = this.sanitizeCursorPromptText(jsonEnvelope.text);
-        return directText;
+        return directText
+          ? {
+            prompt: directText,
+            confidence: 'exact',
+          }
+          : undefined;
       }
 
       const lexicalText = this.extractCursorLexicalText(blobText);
       if (lexicalText) {
-        return lexicalText;
+        return {
+          prompt: lexicalText,
+          confidence: 'strong',
+        };
       }
 
-      return this.extractCursorLeadingPrintableText(blobText);
+      const fallbackText = this.extractCursorLeadingPrintableText(blobText);
+      return fallbackText
+        ? {
+          prompt: fallbackText,
+          confidence: 'weak',
+        }
+        : undefined;
     }
 
     return undefined;
@@ -1495,8 +1611,10 @@ class CursorRemoteProbe {
       || trimmed.includes('Workspace Path:')
       || trimmed.includes('Terminals folder:')
       || trimmed.includes('Agent transcripts (past chats)')
+      || /^[A-Za-z_+-]+\/[A-Za-z_+-]+(?:\/[A-Za-z_+-]+)?$/.test(trimmed)
       || trimmed.startsWith('file://')
-      || trimmed.startsWith('/Users/')
+      || trimmed.includes('file:///')
+      || this.looksLikeFileSystemPath(trimmed)
       || trimmed.includes('open_and_recently_viewed_files')
       || trimmed.includes('User currently')
     ) {
@@ -1504,6 +1622,40 @@ class CursorRemoteProbe {
     }
 
     return trimmed;
+  }
+
+  private looksLikeFileSystemPath(value: string): boolean {
+    const unquoted = value.replace(/^['"]+|['"]+$/g, '').trim();
+    if (!unquoted) {
+      return false;
+    }
+
+    return /^\/(?:[^/\r\n]+\/)+[^/\r\n]*$/.test(unquoted)
+      || /^[A-Za-z]:\\(?:[^\\\r\n]+\\)+[^\\\r\n]*$/.test(unquoted);
+  }
+
+  private isPromptReadyForEmission(confidence: PromptCaptureConfidence): boolean {
+    return confidence === 'strong' || confidence === 'exact';
+  }
+
+  private isBetterPromptCandidate(
+    nextConfidence: PromptCaptureConfidence,
+    currentConfidence: PromptCaptureConfidence
+  ): boolean {
+    return this.getPromptConfidenceRank(nextConfidence) > this.getPromptConfidenceRank(currentConfidence);
+  }
+
+  private getPromptConfidenceRank(confidence: PromptCaptureConfidence): number {
+    switch (confidence) {
+      case 'exact':
+        return 3;
+      case 'strong':
+        return 2;
+      case 'weak':
+        return 1;
+      default:
+        return 0;
+    }
   }
 
   private extractCursorModelCandidate(value: unknown): string | undefined {
@@ -2588,6 +2740,7 @@ class CursorRemoteProbe {
     body: string | Buffer
   ): InterceptedRequestState | undefined {
     const payload = this.parseRequestPayload(body, url, headers);
+    this.maybeUpdateCursorModelHintFromRequest(provider, url, body);
     this.writeDiagnostic({
       phase: 'request',
       transport,
@@ -2618,6 +2771,7 @@ class CursorRemoteProbe {
       thinking: '',
       output: '',
       fallbackOutput: '',
+      promptConfidence: hasPrompt ? 'exact' : 'none',
       didComplete: false,
       didStartEvent: hasPrompt,
     };
@@ -3081,6 +3235,110 @@ class CursorRemoteProbe {
     return this.parseJsonCandidatesFromText(body);
   }
 
+  private maybeUpdateCursorModelHintFromRequest(
+    provider: string,
+    url: string,
+    body: string | Buffer
+  ): void {
+    if (provider !== 'Cursor') {
+      return;
+    }
+
+    const hint = this.extractCursorModelHintFromRequestBody(url, body);
+    if (!hint) {
+      return;
+    }
+
+    this.cursorModelHint = {
+      model: hint.model,
+      confidence: hint.confidence,
+      observedAt: Date.now(),
+    };
+
+    const now = Date.now();
+    for (const state of this.activeRequests.values()) {
+      if (state.provider !== 'Cursor' || state.didComplete || state.model) {
+        continue;
+      }
+
+      if (!this.isCursorTurnUrl(state.url)) {
+        continue;
+      }
+
+      if (now - state.startedAt > 30 * 1000) {
+        continue;
+      }
+
+      state.model = hint.model;
+      state.modelConfidence = hint.confidence;
+      this.emitTurnStartIfReady(state.requestId);
+    }
+
+    this.writeDiagnostic({
+      phase: 'cursor-model-hint-request',
+      url,
+      model: hint.model,
+      confidence: hint.confidence,
+      role: this.options.role,
+      pid: process.pid,
+    });
+  }
+
+  private extractCursorModelHintFromRequestBody(
+    url: string,
+    body: string | Buffer
+  ): { model: string; confidence: ModelConfidence } | undefined {
+    if (!/AnalyticsService\/Batch/i.test(url)) {
+      return undefined;
+    }
+
+    const strings = this.extractPrintableBodyStrings(body);
+    if (strings.length === 0) {
+      return undefined;
+    }
+
+    let composerSubmitIndex = -1;
+    for (let index = strings.length - 1; index >= 0; index -= 1) {
+      if (strings[index] === 'composer.submit') {
+        composerSubmitIndex = index;
+        break;
+      }
+    }
+
+    if (composerSubmitIndex === -1) {
+      return undefined;
+    }
+
+    for (let index = composerSubmitIndex + 1; index < strings.length - 1; index += 1) {
+      if (strings[index] !== 'model') {
+        continue;
+      }
+
+      const rawModel = strings[index + 1]?.trim();
+      if (!rawModel || rawModel.length > 120) {
+        continue;
+      }
+
+      return {
+        model: rawModel === 'default' ? 'Auto' : rawModel,
+        confidence: rawModel === 'default' ? 'inferred' : 'exact',
+      };
+    }
+
+    return undefined;
+  }
+
+  private extractPrintableBodyStrings(body: string | Buffer): string[] {
+    const text = Buffer.isBuffer(body)
+      ? body.toString('utf8')
+      : body;
+    return text.match(/[\x20-\x7E]{4,}/g) ?? [];
+  }
+
+  private isCursorTurnUrl(url: string): boolean {
+    return /agentservice\/run|chatservice|streamconversation|backgroundcomposer/i.test(url);
+  }
+
   private parseJsonCandidatesFromText(text: string): any[] {
     if (!text) {
       return [];
@@ -3211,12 +3469,26 @@ class CursorRemoteProbe {
         continue;
       }
 
-      const role = (candidate as any).role;
-      if (role !== 'user' && role !== 'input_user') {
+      const role = typeof (candidate as any).role === 'string'
+        ? (candidate as any).role.toLowerCase()
+        : undefined;
+      const type = typeof (candidate as any).type === 'string'
+        ? (candidate as any).type.toLowerCase()
+        : undefined;
+      if (
+        role !== 'user'
+        && role !== 'input_user'
+        && type !== 'message_type_human'
+        && type !== 'human'
+      ) {
         continue;
       }
 
-      const content = this.readTextLike((candidate as any).content);
+      const content = this.readTextLike(
+        (candidate as any).content
+        ?? (candidate as any).text
+        ?? (candidate as any).message
+      );
       if (content) {
         return content;
       }
