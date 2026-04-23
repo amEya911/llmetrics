@@ -389,7 +389,10 @@ class CursorRemoteProbe {
   }
 
   private async installAlwaysLocalInternalTransportHooksAsync(): Promise<void> {
-    const patchPrototypeFunction = String(function patchAiConnectHandlerPrototype(stateKey: string) {
+    const patchPrototypeFunction = String(function patchAiConnectHandlerPrototype(
+      this: Record<string, unknown>,
+      stateKey: string
+    ) {
       const state = (globalThis as Record<string, any>)[stateKey];
       const probe = state?.probe;
       if (!probe) {
@@ -405,7 +408,10 @@ class CursorRemoteProbe {
         return { ok: false, reason: 'createMultiProxyTransport-missing' };
       }
 
-      (this as Record<string, unknown>).createMultiProxyTransport = function (...args: unknown[]) {
+      (this as Record<string, unknown>).createMultiProxyTransport = function (
+        this: unknown,
+        ...args: unknown[]
+      ) {
         const transport = (originalCreateMultiProxyTransport as (...callArgs: unknown[]) => unknown)
           .apply(this, args);
         try {
@@ -425,7 +431,10 @@ class CursorRemoteProbe {
       };
     });
 
-    const patchInstanceFunction = String(function patchAiConnectHandlerInstance(stateKey: string) {
+    const patchInstanceFunction = String(function patchAiConnectHandlerInstance(
+      this: Record<string, unknown>,
+      stateKey: string
+    ) {
       const state = (globalThis as Record<string, any>)[stateKey];
       const probe = state?.probe;
       if (!probe) {

@@ -336,7 +336,10 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
     webSocketDebuggerUrl: string
   ): Promise<any> {
     const GLOBAL_STATE_KEY = '__aiTokenAnalyticsCursorRemoteProbe';
-    const patchPrototypeFunction = String(function (globalStateKey: string) {
+    const patchPrototypeFunction = String(function (
+      this: Record<string, unknown>,
+      globalStateKey: string
+    ) {
       const probe = (globalThis as any)[globalStateKey]?.probe;
       if (!probe) {
         return { ok: false, reason: 'probe-missing' };
@@ -350,7 +353,10 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
         return { ok: false, reason: 'createMultiProxyTransport-missing' };
       }
 
-      (this as any).createMultiProxyTransport = function (...args: unknown[]) {
+      (this as any).createMultiProxyTransport = function (
+        this: unknown,
+        ...args: unknown[]
+      ) {
         const transport = original.apply(this, args);
         try {
           return probe.wrapCursorConnectTransport(transport, 'always-local.createMultiProxyTransport');
@@ -362,7 +368,10 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
       return { ok: true, alreadyWrapped: false };
     });
 
-    const patchInstanceFunction = String(function (globalStateKey: string) {
+    const patchInstanceFunction = String(function (
+      this: Record<string, unknown>,
+      globalStateKey: string
+    ) {
       const probe = (globalThis as any)[globalStateKey]?.probe;
       if (!probe) {
         return { ok: false, reason: 'probe-missing' };
