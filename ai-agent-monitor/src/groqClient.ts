@@ -10,9 +10,13 @@ import {
   ConversationChat,
   CrossSessionPatterns,
   PersistedSessionSummary,
+  SessionDiagnostics,
 } from './types';
+import { analyzeSessionDiagnostics } from './sessionDiagnostics';
 
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
+const FULL_REPORT_MAX_PAYLOAD_CHARS = 90_000;
+const FULL_REPORT_CHUNK_TARGET_CHARS = 42_000;
 
 interface GroqResponse {
   choices: Array<{
@@ -30,20 +34,66 @@ export interface FullSessionPromptBreakdown {
   promptExcerpt: string;
   clarityScore: number;
   tokenEfficiencyScore: number;
-  whatWorkedWell: string[];
-  whatToImprove: string[];
+  diagnosis: string;
+  rewrittenPrompt: string;
 }
 
 export interface FullSessionAnalysisReport {
   executiveSummary: string;
   overallVerdict: string;
+  sessionPersonality: string;
+  nextSessionBriefing: string;
   promptBreakdown: FullSessionPromptBreakdown[];
   patternAnalysis: string[];
   contextManagementGrade: string;
   contextManagementSummary: string;
   modelChoiceAudit: string;
   topActions: string[];
-  efficiencyPercentile: number;
+  tokenWasteEstimate: number;
+  tokenWasteBreakdown: string[];
+}
+
+interface FullSessionTurnPayload {
+  promptIndex: number;
+  turnId: string;
+  createdAt: number;
+  updatedAt: number;
+  model: string | undefined;
+  prompt: string;
+  assistantThinking: string;
+  assistantOutput: string;
+  metrics: unknown;
+  assessment: unknown;
+  modelRecommendation: unknown;
+}
+
+interface FullSessionPayload {
+  session: {
+    id: string;
+    title: string;
+    source: string;
+    model: string | undefined;
+    contextUsagePercent: number | undefined;
+    contextWindowTokens: number | undefined;
+    metrics: unknown;
+    contextHealth: unknown;
+  };
+  diagnostics: SessionDiagnostics;
+  crossSession: {
+    recentSessionCount: number;
+    bestSession: unknown;
+    worstSession: unknown;
+    expensivePromptPatterns: unknown;
+    timeOfDay: unknown;
+  };
+  turns: FullSessionTurnPayload[];
+}
+
+interface ChunkPromptAnalysis {
+  promptBreakdown: FullSessionPromptBreakdown[];
+  chunkPatterns: string[];
+  chunkActions: string[];
+  personalityNotes: string[];
 }
 
 export async function analyzeChatWithGroq(chat: ConversationChat): Promise<CoachInsight[]> {
@@ -51,44 +101,61 @@ export async function analyzeChatWithGroq(chat: ConversationChat): Promise<Coach
     return [];
   }
 
-  const recentTurns = chat.turns.slice(-4);
-  if (recentTurns.length === 0) {
+  const payload = buildFullSessionPayload(chat, {
+    summaries: [],
+    averageHealthTrend: [],
+    expensivePromptPatterns: [],
+    timeOfDay: [],
+  }, []);
+  if (payload.turns.length === 0) {
     return [];
   }
 
-  const conversationText = recentTurns.map((turn, index) => {
-    return `Turn ${index + 1}
-User Prompt:
-${turn.blocks['user-input']?.content ?? ''}
+  const coachPayload = trimCoachPayload(payload);
+  const systemPrompt = `You are auditing one developer's AI coding session against real complaints developers keep making in the wild:
+- "I have to keep re-explaining the repo because the model forgot."
+- "I'm pasting the same terminal error back in and not getting unstuck."
+- "The chat drifted into too many tasks and now it's unusable."
+- "I'm burning premium-model money on cheap edits."
+- "A giant attachment got dragged along for no benefit."
+- "The session turned into a frustrated loop."
 
-Assistant Output Preview:
-${(turn.blocks['agent-output']?.content ?? '').slice(0, 900)}`;
-  }).join('\n\n');
-
-  const systemPrompt = `You are an expert, direct AI developer coach monitoring an engineer's coding session.
-Analyze the recent turns to identify severe prompt-quality or context-management mistakes (e.g., error loops, context rot, prompt drift, or over-constrained requests).
+You may ONLY surface these named patterns when the evidence supports them:
+- The Re-explainer
+- The Error Paster
+- The Scope Creeper
+- The Cheap Task Tax
+- The Dead Attachment
+- The Frustration Spiral
 
 Return ONLY a valid JSON object matching this schema:
 {
   "insights": [
     {
-      "id": "slug-style-unique-id",
-      "level": "warn" | "danger" | "info",
-      "title": "Short, punchy title (max 5 words)",
-      "detail": "One highly specific sentence describing the mistake AND how to phrase the prompt better."
+      "id": "slug-style-id",
+      "level": "danger" | "warn" | "info",
+      "title": "One exact pattern name from the list above",
+      "pattern": "re-explainer" | "error-paster" | "scope-creeper" | "cheap-task-tax" | "dead-attachment" | "frustration-spiral",
+      "summary": "One sentence on what is happening in this session",
+      "startedTurn": 1,
+      "turnNumbers": [1, 2],
+      "tokensSoFar": 0,
+      "costUsdSoFar": 0,
+      "actionNow": "One concrete next step the developer should take immediately"
     }
   ]
 }
 
 Rules:
-- Be ruthless but constructive. Do not point out minor typos or missing pleasantries.
-- Only surface high-leverage issues costing the user time or tokens.
-- If the conversation is healthy and efficient, you MUST return {"insights":[]}.
-`;
+- Use the diagnostics numbers when they are present instead of inventing your own.
+- Every insight must include exact turn numbers plus exact token or dollar impact from the payload.
+- Do not output generic advice like "be clearer", "tighten your prompt", or "improve context management".
+- Prefer the highest-cost 1-3 issues only.
+- If the evidence is weak or the session is healthy, return {"insights":[]}.`;
 
   const result = await requestGroqJson<{ insights?: CoachInsight[] }>([
     { role: 'system', content: systemPrompt },
-    { role: 'user', content: conversationText },
+    { role: 'user', content: JSON.stringify(coachPayload, null, 2) },
   ]);
 
   return sanitizeCoachInsights(result?.insights);
@@ -99,12 +166,75 @@ export async function generateFullSessionAnalysis(
   patterns: CrossSessionPatterns,
   sessionSummaries: PersistedSessionSummary[]
 ): Promise<FullSessionAnalysisReport> {
-  const userTurns = chat.turns.filter((turn) => Boolean(turn.blocks['user-input'].content.trim()));
-  if (userTurns.length === 0) {
+  const payload = buildFullSessionPayload(chat, patterns, sessionSummaries);
+  if (payload.turns.length === 0) {
     throw new Error('No user prompts are available in this session yet.');
   }
 
-  const payload = {
+  const payloadText = JSON.stringify(payload);
+  const promptBreakdownFallback = payload.turns.map((turn) => ({
+    promptIndex: turn.promptIndex,
+    promptExcerpt: turn.prompt,
+  }));
+
+  if (payloadText.length <= FULL_REPORT_MAX_PAYLOAD_CHARS) {
+    const report = await streamGroqJson<FullSessionAnalysisReport>([
+      { role: 'system', content: buildFullSessionSystemPrompt() },
+      { role: 'user', content: JSON.stringify(payload, null, 2) },
+    ]);
+    return sanitizeFullSessionReport(report, promptBreakdownFallback, payload.diagnostics, chat);
+  }
+
+  const chunkResults = await analyzePromptBreakdownChunks(payload);
+  const report = await streamGroqJson<Omit<FullSessionAnalysisReport, 'promptBreakdown'>>([
+    { role: 'system', content: buildChunkSynthesisSystemPrompt() },
+    {
+      role: 'user',
+      content: JSON.stringify({
+        session: payload.session,
+        diagnostics: payload.diagnostics,
+        crossSession: payload.crossSession,
+        mergedPromptBreakdown: chunkResults.promptBreakdown,
+        chunkPatterns: chunkResults.chunkPatterns,
+        chunkActions: chunkResults.chunkActions,
+        personalityNotes: chunkResults.personalityNotes,
+      }, null, 2),
+    },
+  ]);
+
+  return sanitizeFullSessionReport(
+    {
+      ...report,
+      promptBreakdown: chunkResults.promptBreakdown,
+    } as FullSessionAnalysisReport,
+    promptBreakdownFallback,
+    payload.diagnostics,
+    chat
+  );
+}
+
+function buildFullSessionPayload(
+  chat: ConversationChat,
+  patterns: CrossSessionPatterns,
+  sessionSummaries: PersistedSessionSummary[]
+): FullSessionPayload {
+  const userTurns = chat.turns
+    .filter((turn) => Boolean(turn.blocks['user-input'].content.trim()))
+    .map((turn, index) => ({
+      promptIndex: index + 1,
+      turnId: turn.id,
+      createdAt: turn.createdAt,
+      updatedAt: turn.updatedAt,
+      model: turn.model ?? chat.model,
+      prompt: turn.blocks['user-input'].content,
+      assistantThinking: turn.blocks['agent-thinking'].content,
+      assistantOutput: turn.blocks['agent-output'].content,
+      metrics: turn.metrics,
+      assessment: turn.assessment,
+      modelRecommendation: turn.modelRecommendation,
+    }));
+
+  return {
     session: {
       id: chat.id,
       title: chat.title,
@@ -114,18 +244,8 @@ export async function generateFullSessionAnalysis(
       contextWindowTokens: chat.contextWindowTokens,
       metrics: chat.metrics,
       contextHealth: chat.contextHealth,
-      turns: userTurns.map((turn, index) => ({
-        promptIndex: index + 1,
-        turnId: turn.id,
-        createdAt: turn.createdAt,
-        prompt: turn.blocks['user-input'].content,
-        assistantThinking: turn.blocks['agent-thinking'].content,
-        assistantOutput: turn.blocks['agent-output'].content,
-        metrics: turn.metrics,
-        assessment: turn.assessment,
-        modelRecommendation: turn.modelRecommendation,
-      })),
     },
+    diagnostics: analyzeSessionDiagnostics(chat),
     crossSession: {
       recentSessionCount: sessionSummaries.length,
       bestSession: patterns.bestSession
@@ -147,51 +267,188 @@ export async function generateFullSessionAnalysis(
       expensivePromptPatterns: patterns.expensivePromptPatterns,
       timeOfDay: patterns.timeOfDay,
     },
+    turns: userTurns,
   };
+}
 
-  const systemPrompt = `You are a premium AI usage analyst auditing a power user's workflow with their coding assistant.
-Using the provided JSON session data, produce a concrete, deeply specific evaluation of the session's efficiency.
-Anchor every conclusion in the explicit prompts, token metrics, and model choices provided in the payload.
+function trimCoachPayload(payload: FullSessionPayload) {
+  const conciseTurns = payload.turns.map((turn) => ({
+    ...turn,
+    assistantThinking: truncate(turn.assistantThinking, 700),
+    assistantOutput: truncate(turn.assistantOutput, 1200),
+  }));
+
+  const serialized = JSON.stringify({ ...payload, turns: conciseTurns });
+  if (serialized.length <= FULL_REPORT_CHUNK_TARGET_CHARS) {
+    return { ...payload, turns: conciseTurns };
+  }
+
+  const focusTurns = new Set<number>();
+  for (const issue of payload.diagnostics.issues) {
+    for (const turnNumber of issue.turnNumbers) {
+      focusTurns.add(turnNumber);
+      if (turnNumber > 1) {
+        focusTurns.add(turnNumber - 1);
+      }
+    }
+  }
+  conciseTurns.slice(-2).forEach((turn) => focusTurns.add(turn.promptIndex));
+
+  return {
+    ...payload,
+    turns: conciseTurns.filter((turn) => focusTurns.has(turn.promptIndex)),
+  };
+}
+
+async function analyzePromptBreakdownChunks(
+  payload: FullSessionPayload
+): Promise<{
+  promptBreakdown: FullSessionPromptBreakdown[];
+  chunkPatterns: string[];
+  chunkActions: string[];
+  personalityNotes: string[];
+}> {
+  const chunks = chunkTurns(payload.turns, FULL_REPORT_CHUNK_TARGET_CHARS);
+  const results: ChunkPromptAnalysis[] = [];
+
+  for (const chunk of chunks) {
+    const result = await streamGroqJson<ChunkPromptAnalysis>([
+      { role: 'system', content: buildChunkPromptSystemPrompt() },
+      {
+        role: 'user',
+        content: JSON.stringify({
+          session: payload.session,
+          diagnostics: payload.diagnostics,
+          chunk,
+        }, null, 2),
+      },
+    ]);
+    results.push(result);
+  }
+
+  return {
+    promptBreakdown: results
+      .flatMap((result) => result.promptBreakdown ?? [])
+      .sort((left, right) => left.promptIndex - right.promptIndex),
+    chunkPatterns: uniqueStrings(results.flatMap((result) => result.chunkPatterns ?? [])).slice(0, 6),
+    chunkActions: uniqueStrings(results.flatMap((result) => result.chunkActions ?? [])).slice(0, 6),
+    personalityNotes: uniqueStrings(results.flatMap((result) => result.personalityNotes ?? [])).slice(0, 6),
+  };
+}
+
+function chunkTurns(turns: FullSessionTurnPayload[], targetChars: number): FullSessionTurnPayload[][] {
+  const chunks: FullSessionTurnPayload[][] = [];
+  let current: FullSessionTurnPayload[] = [];
+  let currentChars = 0;
+
+  for (const turn of turns) {
+    const serialized = JSON.stringify(turn);
+    if (current.length > 0 && currentChars + serialized.length > targetChars) {
+      chunks.push(current);
+      current = [];
+      currentChars = 0;
+    }
+
+    current.push(turn);
+    currentChars += serialized.length;
+  }
+
+  if (current.length > 0) {
+    chunks.push(current);
+  }
+
+  return chunks;
+}
+
+function buildFullSessionSystemPrompt(): string {
+  return `You are auditing one AI coding-assistant session for the exact failures developers actually complain about: context rot, re-explaining the repo, pasting the same error again, scope creep, premium-model overspend on cheap tasks, dead attachments, and frustration spirals.
+Use only the JSON evidence. Every claim must tie back to prompt text, assistant output, token metrics, timestamps, model choice, or the diagnostics block.
 
 Return ONLY a valid JSON object matching this exact schema:
 {
-  "executiveSummary": "One paragraph ruthless verdict on the session's velocity and token efficiency.",
+  "executiveSummary": "One sharp paragraph on velocity, waste, and what actually went wrong.",
   "overallVerdict": "Excellent" | "Good" | "Mixed" | "Wasteful",
+  "sessionPersonality": "One paragraph naming this developer's prompting style in this session only.",
+  "nextSessionBriefing": "A ready-to-paste context block, 150 words or fewer, with project context, current task, and hard constraints.",
   "promptBreakdown": [
     {
       "promptIndex": 1,
       "promptExcerpt": "Short excerpt",
       "clarityScore": 0-100,
       "tokenEfficiencyScore": 0-100,
-      "whatWorkedWell": ["Bullet 1", "Bullet 2"],
-      "whatToImprove": ["Bullet 1", "Bullet 2"],
-      "rewrittenPrompt": "A highly optimized, token-efficient version of their prompt"
+      "diagnosis": "One sentence on why this prompt spent extra tokens or caused drift.",
+      "rewrittenPrompt": "A shorter, clearer prompt that would likely get the same or better result."
     }
   ],
-  "patternAnalysis": ["Specific recurring inefficiency 1", "Specific recurring inefficiency 2"],
-  "contextManagementGrade": "A single letter grade (A, B, C, D, or F) with optional +/-",
-  "contextManagementSummary": "Concrete explanation of their context management quality",
-  "modelChoiceAudit": "Concrete explanation of whether the selected model tier fit the task complexity",
-  "topActions": ["First actionable change", "Second actionable change", "Third actionable change"],
-  "efficiencyPercentile": 0-100
+  "patternAnalysis": ["Specific pattern 1", "Specific pattern 2"],
+  "contextManagementGrade": "A, A-, B+, ..., F",
+  "contextManagementSummary": "Specific explanation grounded in the session data.",
+  "modelChoiceAudit": "Specific explanation of where the model tier helped or wasted money.",
+  "topActions": ["Action 1", "Action 2", "Action 3"],
+  "tokenWasteEstimate": 1234,
+  "tokenWasteBreakdown": ["1234 tokens from dead context ...", "456 tokens from repeated setup ..."]
 }
 
 Rules:
-- Include every user prompt in 'promptBreakdown', preserving chronological order.
-- Keep the feedback extremely sharp and action-oriented. Do not use generic filler words.
-- Specifically call out repeated context setup, dead references, or using expensive models for simple syntax tasks.
-- For 'efficiencyPercentile', estimate a score strictly reflecting their token-to-value ratio.
-`;
+- Include every prompt in promptBreakdown in chronological order.
+- rewrittenPrompt must be materially better, not a paraphrase with the same bloat.
+- sessionPersonality must clearly name how this user works with the model in this session: over-explainer, terse corrector, error-loop debugger, etc.
+- nextSessionBriefing must be immediately pasteable and include the project, the current objective, and any hard constraints or mistakes to avoid.
+- tokenWasteEstimate must be a concrete integer grounded in dead context, repeated setup, repeated error pasting, scope creep history, frustration loops, and model mismatch evidence.
+- Prefer the exact pattern names The Re-explainer, The Error Paster, The Scope Creeper, The Cheap Task Tax, The Dead Attachment, and The Frustration Spiral when the evidence supports them.
+- Do not return generic coaching language like "be clearer" or "manage context better".`;
+}
 
-  const report = await streamGroqJson<FullSessionAnalysisReport>([
-    { role: 'system', content: systemPrompt },
-    { role: 'user', content: JSON.stringify(payload, null, 2) },
-  ]);
+function buildChunkPromptSystemPrompt(): string {
+  return `You are auditing one chunk of a larger AI coding-assistant session.
+Use only the JSON evidence in this chunk and the diagnostics summary.
 
-  return sanitizeFullSessionReport(report, userTurns.map((turn, index) => ({
-    promptIndex: index + 1,
-    promptExcerpt: turn.blocks['user-input'].content.trim(),
-  })));
+Return ONLY a valid JSON object matching this exact schema:
+{
+  "promptBreakdown": [
+    {
+      "promptIndex": 1,
+      "promptExcerpt": "Short excerpt",
+      "clarityScore": 0-100,
+      "tokenEfficiencyScore": 0-100,
+      "diagnosis": "One sentence on why this prompt spent extra tokens or caused drift.",
+      "rewrittenPrompt": "A shorter, clearer prompt that preserves intent."
+    }
+  ],
+  "chunkPatterns": ["Pattern seen in this chunk"],
+  "chunkActions": ["Concrete action implied by this chunk"],
+  "personalityNotes": ["What this chunk says about the developer's prompting style"]
+}
+
+Rules:
+- Include every promptIndex in the chunk.
+- rewrittenPrompt must be meaningfully shorter or more specific than the original.
+- diagnosis must reference the actual failure in the original prompt, not generic advice.`;
+}
+
+function buildChunkSynthesisSystemPrompt(): string {
+  return `You are merging chunk analyses from one full AI coding-assistant session.
+The prompt-by-prompt rewrites are already provided. Your job is to synthesize the whole session.
+
+Return ONLY a valid JSON object matching this exact schema:
+{
+  "executiveSummary": "One sharp paragraph on velocity, waste, and what actually went wrong.",
+  "overallVerdict": "Excellent" | "Good" | "Mixed" | "Wasteful",
+  "sessionPersonality": "One paragraph naming this developer's prompting style in this session only.",
+  "nextSessionBriefing": "A ready-to-paste context block, 150 words or fewer, with project context, current task, and hard constraints.",
+  "patternAnalysis": ["Specific pattern 1", "Specific pattern 2"],
+  "contextManagementGrade": "A, A-, B+, ..., F",
+  "contextManagementSummary": "Specific explanation grounded in the session data.",
+  "modelChoiceAudit": "Specific explanation of where the model tier helped or wasted money.",
+  "topActions": ["Action 1", "Action 2", "Action 3"],
+  "tokenWasteEstimate": 1234,
+  "tokenWasteBreakdown": ["1234 tokens from dead context ...", "456 tokens from repeated setup ..."]
+}
+
+Rules:
+- Ground everything in the merged prompt breakdown plus diagnostics.
+- Keep it sharp. No percentile scores. No generic filler.
+- nextSessionBriefing must be pasteable immediately and include the project, the current objective, and any hard constraints or mistakes to avoid.`;
 }
 
 export function renderFullSessionAnalysisHtml(
@@ -218,22 +475,21 @@ export function renderFullSessionAnalysisHtml(
           </div>
         </div>
         <div class="prompt-body">${escapeHtml(promptBody)}</div>
-        <div class="prompt-grid">
-          <section>
-            <div class="section-label">What Worked</div>
-            <ul>${prompt.whatWorkedWell.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>
-          </section>
-          <section>
-            <div class="section-label">What To Improve</div>
-            <ul>${prompt.whatToImprove.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>
-          </section>
-        </div>
+        <section>
+          <div class="section-label">Why This Cost Extra</div>
+          <div class="summary-copy">${escapeHtml(prompt.diagnosis)}</div>
+        </section>
+        <section>
+          <div class="section-label">Rewritten Prompt</div>
+          <div class="prompt-body prompt-rewrite">${escapeHtml(prompt.rewrittenPrompt)}</div>
+        </section>
       </article>
     `;
   }).join('');
 
   const patternItems = report.patternAnalysis.map((item) => `<li>${escapeHtml(item)}</li>`).join('');
   const actionItems = report.topActions.map((item, index) => `<li><span>${index + 1}</span>${escapeHtml(item)}</li>`).join('');
+  const wasteItems = report.tokenWasteBreakdown.map((item) => `<li>${escapeHtml(item)}</li>`).join('');
   const timeOfDay = patterns.timeOfDay[0];
 
   return `<!DOCTYPE html>
@@ -509,9 +765,9 @@ export function renderFullSessionAnalysisHtml(
           </div>
         </div>
         <div class="hero-stat">
-          <div class="eyebrow">Efficiency Percentile</div>
-          <div class="hero-stat-value">${Math.round(report.efficiencyPercentile)}th</div>
-          <div class="hero-stat-note">Generated ${escapeHtml(generatedAt)} using ${escapeHtml(chat.model || 'the active model context')} session data.</div>
+          <div class="eyebrow">Token Waste Estimate</div>
+          <div class="hero-stat-value">${Math.round(report.tokenWasteEstimate).toLocaleString()}</div>
+          <div class="hero-stat-note">Likely avoidable tokens from dead context, repeated setup, drift, or mismatched model spend. Generated ${escapeHtml(generatedAt)}.</div>
         </div>
       </div>
     </section>
@@ -526,8 +782,8 @@ export function renderFullSessionAnalysisHtml(
       </div>
       <div class="summary-grid">
         <article class="summary-card">
-          <div class="section-label">Pattern Analysis</div>
-          <ul>${patternItems}</ul>
+          <div class="section-label">Session Personality</div>
+          <div class="summary-copy">${escapeHtml(report.sessionPersonality)}</div>
         </article>
         <article class="summary-card">
           <div class="section-label">Model Choice Audit</div>
@@ -539,12 +795,8 @@ export function renderFullSessionAnalysisHtml(
           <div class="summary-copy">${escapeHtml(report.contextManagementSummary)}</div>
         </article>
         <article class="summary-card">
-          <div class="section-label">Cross-Session Signal</div>
-          <div class="summary-copy">${escapeHtml(
-    timeOfDay
-      ? `${timeOfDay.label} has been your strongest recent work window, averaging ${Math.round(timeOfDay.averageEfficiencyScore)} / 100 efficiency across ${timeOfDay.sessions} sessions.`
-      : 'Not enough previous sessions were available to add a strong time-of-day comparison.'
-  )}</div>
+          <div class="section-label">Token Waste Breakdown</div>
+          <ul>${wasteItems || '<li>No major avoidable waste patterns were detected.</li>'}</ul>
         </article>
       </div>
     </section>
@@ -552,8 +804,37 @@ export function renderFullSessionAnalysisHtml(
     <section class="section">
       <div class="section-head">
         <div>
+          <div class="section-title">Next Session Briefing</div>
+          <div class="section-note">Paste this at the top of the next chat instead of re-explaining the whole session.</div>
+        </div>
+      </div>
+      <article class="panel">
+        <div class="prompt-body">${escapeHtml(report.nextSessionBriefing)}</div>
+      </article>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <div class="section-title">Pattern Analysis</div>
+          <div class="section-note">Only the patterns that showed up in this session, grounded in turns, spend, and context behavior.</div>
+        </div>
+      </div>
+      <article class="panel">
+        <ul>${patternItems}</ul>
+        <div class="panel-copy">${escapeHtml(
+    timeOfDay
+      ? `${timeOfDay.label} has recently been your strongest work window, averaging ${Math.round(timeOfDay.averageEfficiencyScore)} / 100 efficiency across ${timeOfDay.sessions} sessions.`
+      : 'There was not enough previous-session data to draw a strong cross-session comparison.'
+  )}</div>
+      </article>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div>
           <div class="section-title">Prompt-by-Prompt Breakdown</div>
-          <div class="section-note">Every user prompt scored for clarity and token efficiency, with concrete feedback.</div>
+          <div class="section-note">Each original prompt, the exact problem with it, and a sharper rewrite that should be cheaper to run.</div>
         </div>
       </div>
       ${promptCards}
@@ -740,7 +1021,7 @@ function sanitizeCoachInsights(insights: CoachInsight[] | undefined): CoachInsig
     }
 
     const title = typeof candidate.title === 'string' ? candidate.title.trim() : '';
-    const detail = typeof candidate.detail === 'string' ? candidate.detail.trim() : '';
+    const detail = buildCoachDetail(candidate);
     if (!title || !detail) {
       return [];
     }
@@ -754,19 +1035,36 @@ function sanitizeCoachInsights(insights: CoachInsight[] | undefined): CoachInsig
         : 'info',
       title,
       detail,
+      pattern: candidate.pattern,
+      startedTurn: safeNumber(candidate.startedTurn),
+      turnNumbers: Array.isArray(candidate.turnNumbers)
+        ? candidate.turnNumbers.filter((item): item is number => typeof item === 'number' && Number.isFinite(item))
+        : undefined,
+      tokensSoFar: safeNumber(candidate.tokensSoFar),
+      costUsdSoFar: safeNumber(candidate.costUsdSoFar),
+      actionNow: typeof candidate.actionNow === 'string' ? candidate.actionNow.trim() : undefined,
     }];
   });
 }
 
 function sanitizeFullSessionReport(
   report: FullSessionAnalysisReport,
-  prompts: Array<{ promptIndex: number; promptExcerpt: string }>
+  prompts: Array<{ promptIndex: number; promptExcerpt: string }>,
+  diagnostics: SessionDiagnostics,
+  chat: ConversationChat
 ): FullSessionAnalysisReport {
   const promptLookup = new Map(prompts.map((prompt) => [prompt.promptIndex, prompt.promptExcerpt]));
+  const fallbackBriefing = buildNextSessionBriefing(chat);
+  const fallbackPersonality = buildFallbackSessionPersonality(chat, diagnostics);
 
   return {
-    executiveSummary: safeString(report.executiveSummary, 'This session has enough activity for analysis, but the summary came back incomplete.'),
+    executiveSummary: safeString(
+      report.executiveSummary,
+      'This session has enough activity for analysis, but the report came back incomplete; the clearest problems were repeated context replay, prompt drift, or model mismatch.'
+    ),
     overallVerdict: safeString(report.overallVerdict, 'Mixed'),
+    sessionPersonality: safeString(report.sessionPersonality, fallbackPersonality),
+    nextSessionBriefing: truncateWords(safeString(report.nextSessionBriefing, fallbackBriefing), 150),
     promptBreakdown: prompts.map((prompt, index) => {
       const existing = Array.isArray(report.promptBreakdown)
         ? report.promptBreakdown.find((candidate) => candidate.promptIndex === prompt.promptIndex)
@@ -780,13 +1078,19 @@ function sanitizeFullSessionReport(
         ),
         clarityScore: clampScore(existing?.clarityScore),
         tokenEfficiencyScore: clampScore(existing?.tokenEfficiencyScore),
-        whatWorkedWell: safeStringArray(existing?.whatWorkedWell, 'Clear objective or helpful context was present.'),
-        whatToImprove: safeStringArray(existing?.whatToImprove, 'Tighten the ask and remove context the model did not need.'),
+        diagnosis: safeString(
+          existing?.diagnosis,
+          'The original prompt either carried avoidable setup, left the real constraint implicit, or bundled too many asks together.'
+        ),
+        rewrittenPrompt: safeString(
+          existing?.rewrittenPrompt,
+          promptLookup.get(prompt.promptIndex) ?? `Prompt ${index + 1}`
+        ),
       };
     }),
     patternAnalysis: safeStringArray(
       report.patternAnalysis,
-      'Patterns were inconclusive, but replayed context and prompt clarity should still be watched.'
+      'The session showed some avoidable replay or prompt drift, but the model response did not return a complete pattern list.'
     ),
     contextManagementGrade: safeString(report.contextManagementGrade, 'B'),
     contextManagementSummary: safeString(
@@ -803,7 +1107,13 @@ function sanitizeFullSessionReport(
       'Use a cheaper fast model for lightweight edits and formatting work.',
       'Start a fresh chat once replay cost or context saturation climbs.'
     ).slice(0, 3),
-    efficiencyPercentile: clampScore(report.efficiencyPercentile),
+    tokenWasteEstimate: safeInteger(report.tokenWasteEstimate, Math.round(diagnostics.tokenWaste.totalTokens)),
+    tokenWasteBreakdown: safeStringArray(
+      report.tokenWasteBreakdown,
+      ...diagnostics.tokenWaste.breakdown.map((item) =>
+        `${Math.round(item.tokens).toLocaleString()} tokens / ${formatUsd(item.costUsd)}: ${item.detail}`
+      )
+    ).slice(0, 6),
   };
 }
 
@@ -829,6 +1139,115 @@ function clampScore(value: unknown): number {
   }
 
   return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function safeInteger(value: unknown, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return fallback;
+  }
+
+  return Math.max(0, Math.round(value));
+}
+
+function safeNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function buildCoachDetail(candidate: Partial<CoachInsight>): string {
+  if (typeof candidate.detail === 'string' && candidate.detail.trim()) {
+    return candidate.detail.trim();
+  }
+
+  const summary = candidate && typeof (candidate as { summary?: unknown }).summary === 'string'
+    ? ((candidate as { summary?: string }).summary ?? '').trim()
+    : '';
+  const startedTurn = safeNumber(candidate.startedTurn);
+  const tokensSoFar = safeNumber(candidate.tokensSoFar);
+  const costUsdSoFar = safeNumber(candidate.costUsdSoFar);
+  const actionNow = typeof candidate.actionNow === 'string' ? candidate.actionNow.trim() : '';
+  const turnNumbers = Array.isArray(candidate.turnNumbers)
+    ? candidate.turnNumbers.filter((item): item is number => typeof item === 'number' && Number.isFinite(item))
+    : [];
+
+  const fragments = [
+    summary,
+    startedTurn ? `Started at turn ${startedTurn}.` : '',
+    turnNumbers.length > 0 ? `Turns involved: ${turnNumbers.join(', ')}.` : '',
+    tokensSoFar !== undefined || costUsdSoFar !== undefined
+      ? `Estimated waste so far: ${tokensSoFar !== undefined ? `${Math.round(tokensSoFar).toLocaleString()} tokens` : 'unknown tokens'}${costUsdSoFar !== undefined ? ` / ${formatUsd(costUsdSoFar)}` : ''}.`
+      : '',
+    actionNow ? `Do now: ${actionNow}` : '',
+  ].filter(Boolean);
+
+  return fragments.join(' ');
+}
+
+function buildFallbackSessionPersonality(
+  chat: ConversationChat,
+  diagnostics: SessionDiagnostics
+): string {
+  const primaryIssue = diagnostics.issues[0]?.pattern;
+  if (primaryIssue === 're-explainer') {
+    return 'This session reads like an over-explaining collaborator: you front-load a lot of architecture and requirement context, then end up re-sending it when the chat drifts.';
+  }
+  if (primaryIssue === 'error-paster') {
+    return 'This session reads like an error-loop debugger: once the first fix fails, you tend to paste the latest failure back into the same thread instead of forcing a new root-cause plan.';
+  }
+  if (primaryIssue === 'frustration-spiral') {
+    return 'This session reads like a terse corrector: prompts get shorter and more corrective over time, which is usually a sign the thread is burning cycles instead of converging.';
+  }
+
+  const promptCount = chat.metrics?.promptCount ?? 0;
+  if (promptCount >= 6) {
+    return 'This session reads like a multitask collaborator: you use one thread for planning, debugging, editing, and follow-up corrections, which is powerful but expensive once the history starts replaying.';
+  }
+
+  return 'This session reads like a direct task-oriented collaborator: you are trying to move quickly, but the efficiency depends heavily on whether each prompt makes the objective and constraints explicit.';
+}
+
+function buildNextSessionBriefing(chat: ConversationChat): string {
+  const prompts = chat.turns
+    .filter((turn) => Boolean(turn.blocks['user-input'].content.trim()))
+    .map((turn) => turn.blocks['user-input'].content.trim());
+  const opening = prompts[0] ? summarizeText(prompts[0], 180) : summarizeText(chat.title || 'Untitled session', 120);
+  const latest = prompts[prompts.length - 1] ? summarizeText(prompts[prompts.length - 1], 180) : 'Continue from the latest task in this session.';
+
+  return truncateWords(
+    `Working session: ${opening} Current task: ${latest} Assume the core project context has not changed unless I say it has. Keep the thread focused on one objective, call out if a cheaper model is enough, and when debugging give one root-cause hypothesis plus one verification step before proposing more edits.`,
+    150
+  );
+}
+
+function truncate(value: string, maxLength: number): string {
+  return value.length <= maxLength
+    ? value
+    : `${value.slice(0, maxLength - 3).trimEnd()}...`;
+}
+
+function summarizeText(value: string, maxLength = 96): string {
+  const singleLine = value.replace(/\s+/g, ' ').trim();
+  if (!singleLine) {
+    return 'Untitled';
+  }
+
+  return truncate(singleLine, maxLength);
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
+}
+
+function truncateWords(value: string, maxWords: number): string {
+  const words = value.trim().split(/\s+/);
+  if (words.length <= maxWords) {
+    return value.trim();
+  }
+
+  return `${words.slice(0, maxWords).join(' ')}...`;
+}
+
+function formatUsd(value: number): string {
+  return `$${value.toFixed(value >= 1 ? 2 : 3)}`;
 }
 
 function verdictToneFor(value: string): 'green' | 'blue' | 'amber' | 'red' {

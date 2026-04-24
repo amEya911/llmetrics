@@ -42,6 +42,11 @@ export interface ContextReference {
   tokenCountEstimate: number;
   mentionCount: number;
   referencedInResponse: boolean;
+  firstMentionTurn?: number;
+  lastMentionTurn?: number;
+  mentionedTurns?: number[];
+  estimatedReplayTurns?: number;
+  estimatedReplayTokens?: number;
 }
 
 export interface ContextHealthScore {
@@ -50,6 +55,7 @@ export interface ContextHealthScore {
   deadReferences: ContextReference[];
   warnings: string[];
   deadWeightTokensPerTurn: number;
+  deadWeightTokensSoFar: number;
 }
 
 export interface ModelRecommendation {
@@ -182,6 +188,56 @@ export interface CoachInsight {
   level: CoachInsightLevel;
   title: string;
   detail: string;
+  pattern?: SessionFailurePattern;
+  startedTurn?: number;
+  turnNumbers?: number[];
+  tokensSoFar?: number;
+  costUsdSoFar?: number;
+  actionNow?: string;
+}
+
+export type SessionFailurePattern =
+  | 're-explainer'
+  | 'error-paster'
+  | 'scope-creeper'
+  | 'cheap-task-tax'
+  | 'dead-attachment'
+  | 'frustration-spiral';
+
+export interface SessionFailureInsight {
+  id: string;
+  pattern: SessionFailurePattern;
+  level: CoachInsightLevel;
+  title: string;
+  summary: string;
+  startedTurn: number;
+  turnNumbers: number[];
+  tokensSoFar: number;
+  costUsdSoFar: number;
+  actionNow: string;
+  evidence: string[];
+}
+
+export interface TokenWasteBreakdown {
+  label: string;
+  tokens: number;
+  costUsd: number;
+  detail: string;
+}
+
+export interface TokenWasteEstimate {
+  totalTokens: number;
+  totalCostUsd: number;
+  breakdown: TokenWasteBreakdown[];
+}
+
+export interface SessionDiagnostics {
+  issues: SessionFailureInsight[];
+  tokenWaste: TokenWasteEstimate;
+  distinctTaskCount: number;
+  frustrationMarkers: Array<{ turn: number; phrase: string }>;
+  repeatedSetupTurns: number[];
+  repeatedErrorTurns: number[];
 }
 
 export interface SessionPromptSummary {

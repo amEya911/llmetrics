@@ -20,8 +20,8 @@ export class CursorContextAnalyzer {
 
   constructor(private readonly workspacePaths: string[] = []) {}
 
-  analyzeUserPrompt(promptText: string): void {
-    this.turnCount += 1;
+  analyzeUserPrompt(promptText: string, turnIndex: number): void {
+    this.turnCount = Math.max(this.turnCount, turnIndex);
 
     for (const mention of extractMentions(promptText)) {
       const normalized = normalizeMention(mention);
@@ -32,10 +32,12 @@ export class CursorContextAnalyzer {
       const existing = this.references.get(normalized);
       if (existing) {
         existing.mentionCount += 1;
+        existing.lastMentionTurn = turnIndex;
+        existing.mentionedTurns = [...new Set([...(existing.mentionedTurns ?? []), turnIndex])];
         continue;
       }
 
-      this.references.set(normalized, buildReference(normalized, this.workspacePaths));
+      this.references.set(normalized, buildReference(normalized, this.workspacePaths, turnIndex));
     }
   }
 
@@ -65,8 +67,13 @@ export class CursorContextAnalyzer {
     this.turnCount = 0;
     this.historyBloatRatio = chat.metrics?.historyBloatRatio ?? 0;
 
+    let promptIndex = 0;
+
     for (const turn of chat.turns) {
-      this.analyzeUserPrompt(turn.blocks['user-input'].content);
+      if (turn.blocks['user-input'].content.trim()) {
+        promptIndex += 1;
+        this.analyzeUserPrompt(turn.blocks['user-input'].content, promptIndex);
+      }
       this.analyzeOutput([
         turn.blocks['agent-thinking'].content,
         turn.blocks['agent-output'].content,
@@ -80,10 +87,20 @@ export class CursorContextAnalyzer {
     const deadReferences = [...this.references.values()]
       .filter((reference) => !reference.referencedInResponse)
       .sort((left, right) => right.tokenCountEstimate - left.tokenCountEstimate)
-      .map(({ searchTerms: _searchTerms, ...reference }) => reference);
+      .map(({ searchTerms: _searchTerms, ...reference }) => {
+        const firstMentionTurn = reference.firstMentionTurn ?? 1;
+        const estimatedReplayTurns = Math.max(0, this.turnCount - firstMentionTurn);
+        return {
+          ...reference,
+          estimatedReplayTurns,
+          estimatedReplayTokens: reference.tokenCountEstimate * estimatedReplayTurns,
+        };
+      });
 
     const deadWeightTokensPerTurn = deadReferences
       .reduce((sum, reference) => sum + reference.tokenCountEstimate, 0);
+    const deadWeightTokensSoFar = deadReferences
+      .reduce((sum, reference) => sum + (reference.estimatedReplayTokens ?? 0), 0);
 
     const warnings: string[] = [];
     let score = 100;
@@ -114,6 +131,7 @@ export class CursorContextAnalyzer {
       deadReferences,
       warnings,
       deadWeightTokensPerTurn,
+      deadWeightTokensSoFar,
     };
   }
 }
@@ -160,7 +178,11 @@ function normalizeMention(value: string): string {
     .replace(/^["'`]+|["'`]+$/g, '');
 }
 
-function buildReference(mention: string, workspacePaths: string[]): MutableReference {
+function buildReference(
+  mention: string,
+  workspacePaths: string[],
+  turnIndex: number
+): MutableReference {
   const resolvedPath = resolveWorkspacePath(mention, workspacePaths);
   const stat = resolvedPath ? safeStat(resolvedPath) : undefined;
   const isDirectory = Boolean(stat?.isDirectory());
@@ -178,6 +200,9 @@ function buildReference(mention: string, workspacePaths: string[]): MutableRefer
     tokenCountEstimate,
     mentionCount: 1,
     referencedInResponse: false,
+    firstMentionTurn: turnIndex,
+    lastMentionTurn: turnIndex,
+    mentionedTurns: [turnIndex],
     searchTerms,
   };
 }

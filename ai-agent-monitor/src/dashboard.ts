@@ -15,6 +15,7 @@ import {
   RankedPrompt,
   RankedSession,
   SavedPrompt,
+  SessionDiagnostics,
   SessionAnalysisState,
   SessionHealthTrendPoint,
   SourceSnapshot,
@@ -23,6 +24,7 @@ import {
   TrendPoint,
 } from './types';
 import { analyzeChatContext } from './CursorContextAnalyzer';
+import { analyzeSessionDiagnostics, toCoachInsight } from './sessionDiagnostics';
 
 interface DashboardBuildOptions {
   app: MonitorSnapshot['app'];
@@ -567,12 +569,14 @@ function computeAnalytics(
 
   const byAgentRows = finalizeBreakdown(byAgent);
   const byModelRows = finalizeBreakdown(byModel);
+  const activeDiagnostics = activeChat ? analyzeSessionDiagnostics(activeChat) : undefined;
   const coach = computeCoachInsights(
     promptRecords,
     activeChat,
     activeSuggestion,
     repeatedCounts,
-    groqInsights
+    groqInsights,
+    activeDiagnostics
   );
   const bestValueModel = [...byModelRows]
     .filter((row) => row.costUsd > 0)
@@ -639,9 +643,20 @@ function computeCoachInsights(
   activeChat: ConversationChat | undefined,
   activeSuggestion: PromptSuggestion | undefined,
   repeatedCounts: Map<string, number>,
-  groqInsights: CoachInsight[] | undefined
+  groqInsights: CoachInsight[] | undefined,
+  diagnostics: SessionDiagnostics | undefined
 ): CoachInsight[] {
   const candidates: CoachCandidate[] = [];
+
+  for (const issue of diagnostics?.issues ?? []) {
+    const insight = toCoachInsight(issue);
+    candidates.push({
+      ...insight,
+      weight: issue.level === 'danger'
+        ? 120 + Math.round(issue.costUsdSoFar * 100)
+        : 96 + Math.round(issue.costUsdSoFar * 100),
+    });
+  }
 
   if (activeChat?.contextUsagePercent !== undefined && activeChat.contextUsagePercent >= 82) {
     candidates.push({
@@ -677,61 +692,6 @@ function computeCoachInsights(
     });
   }
 
-  const latestPromptWithRecommendation = activeChat?.turns
-    .slice()
-    .reverse()
-    .find((turn) => Boolean(turn.blocks['user-input'].content.trim()) && turn.modelRecommendation);
-
-  if (
-    latestPromptWithRecommendation?.modelRecommendation
-    && latestPromptWithRecommendation.modelRecommendation.estimatedOverspendUsd >= 0.003
-  ) {
-    const recommendation = latestPromptWithRecommendation.modelRecommendation;
-    candidates.push({
-      id: 'model-fit',
-      level: recommendation.complexity === 'trivial' ? 'danger' : 'warn',
-      title: `Model mismatch for a ${recommendation.complexity} task`,
-      detail: `This prompt looks ${recommendation.complexity}, but it is using ${recommendation.currentModel}. ${recommendation.reason} Estimated overspend: ${formatUsd(recommendation.estimatedOverspendUsd)} (${recommendation.estimatedOverspendPct}% above a better-fit option).`,
-      weight: recommendation.complexity === 'trivial' ? 94 : 72,
-    });
-  }
-
-  const worstRepeatedRecord = [...promptRecords]
-    .map((record) => ({
-      record,
-      repeatedCount: repeatedCounts.get(record.key) ?? 1,
-      wastedTokens: (record.turn.metrics?.inputTokens ?? 0) * Math.max(0, (repeatedCounts.get(record.key) ?? 1) - 1),
-    }))
-    .filter((item) => item.repeatedCount > 1)
-    .sort((left, right) => {
-      if (right.repeatedCount !== left.repeatedCount) {
-        return right.repeatedCount - left.repeatedCount;
-      }
-      return right.wastedTokens - left.wastedTokens;
-    })[0];
-
-  if (worstRepeatedRecord) {
-    candidates.push({
-      id: 'repeated-prompts',
-      level: worstRepeatedRecord.repeatedCount >= 4 ? 'danger' : 'warn',
-      title: `Repeated prompt pattern: "${summarizePrompt(worstRepeatedRecord.record.text)}"`,
-      detail: `Seen ${worstRepeatedRecord.repeatedCount} times already, burning roughly ${formatTokenCount(worstRepeatedRecord.wastedTokens)} duplicate input tokens.`,
-      weight: worstRepeatedRecord.repeatedCount >= 4 ? 95 : 74,
-    });
-  }
-
-  const codebaseLikeRecords = promptRecords.filter((record) => looksLikeCodebaseDump(record.text));
-  if (codebaseLikeRecords.length >= 3) {
-    const totalTokens = codebaseLikeRecords.reduce((sum, record) => sum + (record.turn.metrics?.inputTokens ?? 0), 0);
-    candidates.push({
-      id: 'codebase-brief',
-      level: 'warn',
-      title: 'You keep re-sending codebase setup',
-      detail: `${codebaseLikeRecords.length} prompts look like repo/context setup, adding about ${formatTokenCount(totalTokens)} input tokens that could be saved into one reusable brief.`,
-      weight: 72,
-    });
-  }
-
   if (activeSuggestion) {
     candidates.push({
       id: 'saved-prompt-match',
@@ -753,6 +713,15 @@ function computeCoachInsights(
   }
 
   for (const insight of groqInsights ?? []) {
+    const isDuplicate = candidates.some((candidate) =>
+      candidate.pattern && insight.pattern
+        ? candidate.pattern === insight.pattern
+        : candidate.title === insight.title
+    );
+    if (isDuplicate) {
+      continue;
+    }
+
     candidates.push({
       ...insight,
       level: insight.level === 'info' ? 'info' : insight.level,
