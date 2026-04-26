@@ -2,7 +2,14 @@ export type HostApp = 'cursor' | 'antigravity' | 'unknown';
 
 export type AgentSourceId = 'cursor' | 'antigravity' | 'manual';
 
-export type BlockType = 'user-input' | 'agent-thinking' | 'agent-output';
+export type BlockType =
+  | 'user-input'
+  | 'agent-thinking'
+  | 'agent-subagent'
+  | 'agent-editor'
+  | 'agent-output';
+
+export type InterceptedRequestType = 'primary' | 'subagent' | 'editor';
 
 export type CoachInsightLevel = 'danger' | 'warn' | 'info';
 
@@ -11,6 +18,8 @@ export type PromptComplexity = 'trivial' | 'moderate' | 'complex' | 'reasoning-h
 export const BLOCK_TYPES: readonly BlockType[] = [
   'user-input',
   'agent-thinking',
+  'agent-subagent',
+  'agent-editor',
   'agent-output',
 ];
 
@@ -21,14 +30,26 @@ export interface ConversationSegment {
   isStreaming: boolean;
 }
 
+export interface CapturedTokenUsage {
+  inputTokens?: number;
+  thinkingTokens?: number;
+  subagentTokens?: number;
+  editorTokens?: number;
+  outputTokens?: number;
+}
+
 export interface TokenEstimate {
   inputTokens: number;
   historyTokens: number;
   thinkingTokens: number;
+  subagentTokens: number;
+  editorTokens: number;
   outputTokens: number;
   inputCostUsd: number;
   historyCostUsd: number;
   thinkingCostUsd: number;
+  subagentCostUsd: number;
+  editorCostUsd: number;
   outputCostUsd: number;
   totalTokens: number;
   costUsd: number;
@@ -79,6 +100,8 @@ export interface SessionMetrics {
   inputTokens: number;
   historyTokens: number;
   thinkingTokens: number;
+  subagentTokens: number;
+  editorTokens: number;
   outputTokens: number;
   totalTokens: number;
   costUsd: number;
@@ -94,6 +117,7 @@ export interface ConversationTurn {
   updatedAt: number;
   isComplete: boolean;
   blocks: Record<BlockType, ConversationSegment>;
+  capturedTokenUsage?: CapturedTokenUsage;
   model?: string;
   modelConfidence?: ModelConfidence;
   metrics?: TokenEstimate;

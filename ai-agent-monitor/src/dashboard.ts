@@ -226,26 +226,56 @@ function enrichChat(chat: ConversationChat, workspacePaths: string[]): Conversat
   let sessionInputTokens = 0;
   let sessionHistoryTokens = 0;
   let sessionThinkingTokens = 0;
+  let sessionSubagentTokens = 0;
+  let sessionEditorTokens = 0;
   let sessionOutputTokens = 0;
   let sessionCostUsd = 0;
 
   for (const turn of turns) {
     const inputTokens = estimateTokens(turn.blocks['user-input'].content);
-    const thinkingTokens = estimateTokens(turn.blocks['agent-thinking'].content);
-    const outputTokens = estimateTokens(turn.blocks['agent-output'].content);
+    const thinkingTokens = resolveTurnTokenCount(
+      turn,
+      'thinkingTokens',
+      turn.blocks['agent-thinking'].content
+    );
+    const subagentTokens = resolveTurnTokenCount(
+      turn,
+      'subagentTokens',
+      turn.blocks['agent-subagent'].content
+    );
+    const editorTokens = resolveTurnTokenCount(
+      turn,
+      'editorTokens',
+      turn.blocks['agent-editor'].content
+    );
+    const outputTokens = resolveTurnTokenCount(
+      turn,
+      'outputTokens',
+      turn.blocks['agent-output'].content
+    );
     const historyTokens = transcriptTokens;
     const paidInputTokens = inputTokens + historyTokens;
+    const auxiliaryRateUsdPer1k = (profile.inputRateUsdPer1k + profile.outputRateUsdPer1k) / 2;
     const inputCostUsd = (inputTokens * profile.inputRateUsdPer1k) / 1000;
     const historyCostUsd = (historyTokens * profile.inputRateUsdPer1k) / 1000;
     const thinkingCostUsd = (thinkingTokens * profile.thinkingRateUsdPer1k) / 1000;
+    const subagentCostUsd = (subagentTokens * auxiliaryRateUsdPer1k) / 1000;
+    const editorCostUsd = (editorTokens * auxiliaryRateUsdPer1k) / 1000;
     const outputCostUsd = (outputTokens * profile.outputRateUsdPer1k) / 1000;
-    const totalTokens = paidInputTokens + thinkingTokens + outputTokens;
-    const costUsd = inputCostUsd + historyCostUsd + thinkingCostUsd + outputCostUsd;
+    const totalTokens = paidInputTokens + thinkingTokens + subagentTokens + editorTokens + outputTokens;
+    const costUsd = inputCostUsd
+      + historyCostUsd
+      + thinkingCostUsd
+      + subagentCostUsd
+      + editorCostUsd
+      + outputCostUsd;
 
     transcriptTokens += inputTokens + thinkingTokens + outputTokens;
     sessionInputTokens += inputTokens;
     sessionHistoryTokens += historyTokens;
     sessionThinkingTokens += thinkingTokens;
+    sessionSubagentTokens += subagentTokens;
+    sessionEditorTokens += editorTokens;
     sessionOutputTokens += outputTokens;
     sessionCostUsd += costUsd;
 
@@ -255,14 +285,18 @@ function enrichChat(chat: ConversationChat, workspacePaths: string[]): Conversat
       inputTokens,
       historyTokens,
       thinkingTokens,
+      subagentTokens,
+      editorTokens,
       outputTokens,
       inputCostUsd,
       historyCostUsd,
       thinkingCostUsd,
+      subagentCostUsd,
+      editorCostUsd,
       outputCostUsd,
       totalTokens,
       costUsd,
-      isEstimated: true,
+      isEstimated: !turn.capturedTokenUsage,
     };
   }
 
@@ -274,8 +308,15 @@ function enrichChat(chat: ConversationChat, workspacePaths: string[]): Conversat
     inputTokens: sessionInputTokens,
     historyTokens: sessionHistoryTokens,
     thinkingTokens: sessionThinkingTokens,
+    subagentTokens: sessionSubagentTokens,
+    editorTokens: sessionEditorTokens,
     outputTokens: sessionOutputTokens,
-    totalTokens: sessionInputTokens + sessionHistoryTokens + sessionThinkingTokens + sessionOutputTokens,
+    totalTokens: sessionInputTokens
+      + sessionHistoryTokens
+      + sessionThinkingTokens
+      + sessionSubagentTokens
+      + sessionEditorTokens
+      + sessionOutputTokens,
     costUsd: sessionCostUsd,
     promptCount: turns.filter((turn) => Boolean(turn.blocks['user-input'].content.trim())).length,
     turnCount: turns.length,
@@ -286,7 +327,7 @@ function enrichChat(chat: ConversationChat, workspacePaths: string[]): Conversat
   let contextWindowTokens = chat.contextWindowTokens;
   if (!contextWindowTokens) {
     const usageFraction = (chat.contextUsagePercent ?? 0) / 100;
-    const transcriptVisibleTokens = metrics.totalTokens - metrics.historyTokens;
+    const transcriptVisibleTokens = sessionInputTokens + sessionThinkingTokens + sessionOutputTokens;
     if (usageFraction > 0.01 && transcriptVisibleTokens > 0) {
       contextWindowTokens = Math.round(transcriptVisibleTokens / usageFraction);
     } else {
@@ -309,6 +350,19 @@ function enrichChat(chat: ConversationChat, workspacePaths: string[]): Conversat
   enrichedChat.metrics.historyBloatRatio = contextHealth.historyBloatRatio;
 
   return enrichedChat;
+}
+
+function resolveTurnTokenCount(
+  turn: ConversationTurn,
+  key: 'thinkingTokens' | 'subagentTokens' | 'editorTokens' | 'outputTokens',
+  fallbackContent: string
+): number {
+  const capturedValue = turn.capturedTokenUsage?.[key];
+  if (typeof capturedValue === 'number' && Number.isFinite(capturedValue) && capturedValue >= 0) {
+    return capturedValue;
+  }
+
+  return estimateTokens(fallbackContent);
 }
 
 function collectPromptRecords(sources: SourceSnapshot[]): PromptRecord[] {

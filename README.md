@@ -55,41 +55,34 @@
 
 ### High-Level System Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         VS Code Extension Host                      │
-│                                                                     │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │                      AgentMonitor (Core)                      │  │
-│  │                                                               │  │
-│  │  Orchestrates all data sources, maintains conversation state, │  │
-│  │  generates snapshots for the dashboard, and triggers coaching │  │
-│  └──────┬──────────────┬──────────────┬──────────────┬───────────┘  │
-│         │              │              │              │               │
-│    ┌────▼────┐   ┌─────▼─────┐  ┌────▼─────┐  ┌────▼──────┐       │
-│    │ Network │   │  Cursor   │  │Antigrav. │  │  Cursor   │       │
-│    │Intercept│   │ Sibling   │  │Language  │  │Interceptor│       │
-│    │   or    │   │ Network   │  │ Server   │  │  (API)    │       │
-│    │         │   │  Bridge   │  │Collector │  │           │       │
-│    └────┬────┘   └─────┬─────┘  └────┬─────┘  └────┬──────┘       │
-│         │              │              │              │               │
-│         ▼              ▼              ▼              ▼               │
-│    Patches          Injects       Polls gRPC     Wraps Cursor       │
-│    http/https/      remote        /Connect       registerAgent      │
-│    http2/fetch      probes via    state from     Provider API       │
-│    modules          V8 Inspector  language       for streaming      │
-│                     + lsof        server         turn data          │
-│                                                                     │
-│  ┌──────────────────────────────────────────────┐                   │
-│  │              Dashboard Pipeline              │                   │
-│  │                                              │                   │
-│  │  Raw Turns → Analytics Engine → WebView UI   │                   │
-│  │              ↓                                │                   │
-│  │         Groq AI Coach (LLaMA 3.3 70B)        │                   │
-│  │              ↓                                │                   │
-│  │     Session Diagnostics + Coaching Insights   │                   │
-│  └──────────────────────────────────────────────┘                   │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Host["VS Code Extension Host"]
+        AM["🧠 AgentMonitor\n(Core Orchestrator)"]
+
+        NI["🌐 NetworkInterceptor\nPatches http/https/\nhttp2/fetch modules"]
+        SB["🔌 CursorSiblingNetworkBridge\nInjects V8 Inspector\nprobes into siblings"]
+        AG["🔗 AntigravityLanguageServer\nCollector — Polls gRPC/\nConnect state"]
+        CI["🎯 CursorInterceptor\nWraps registerAgent\nProvider API"]
+
+        NI -->|turn-start / chunk / complete| AM
+        SB -->|turn-start / chunk / complete| AM
+        AG -->|turn-start / update| AM
+        CI -->|streaming turn data| AM
+
+        subgraph Dash["Dashboard Pipeline"]
+            RAW["Raw Turns"] --> AE["Analytics Engine\n(dashboard.ts)"]
+            AE --> WV["WebView UI"]
+            AE --> GC["Groq AI Coach\n(LLaMA 3.3 70B)"]
+            AE --> SD["Session Diagnostics\n+ Coaching Insights"]
+        end
+
+        AM --> RAW
+    end
+
+    style Host fill:#1e1e2e,stroke:#89b4fa,color:#cdd6f4
+    style Dash fill:#181825,stroke:#a6e3a1,color:#cdd6f4
+    style AM fill:#313244,stroke:#f5c2e7,color:#cdd6f4
 ```
 
 ### Source File Map
@@ -126,27 +119,29 @@ ai-agent-monitor/
 
 The most technically interesting part of this project. The `NetworkInterceptor` **monkey-patches Node.js core modules** to passively observe all outgoing HTTP/HTTPS/HTTP2 traffic. It identifies LLM API calls by matching URL patterns (OpenAI, Anthropic, Google, etc.) and extracts token counts, model names, and costs.
 
-```
-┌──────────────────── Extension Process ────────────────────┐
-│                                                           │
-│  Original http.request() ──────┐                          │
-│  Original https.request() ─────┤                          │
-│  Original http2.connect() ─────┤    ┌──────────────────┐  │
-│  Original fetch() ─────────────┼───►│ NetworkInterceptor│  │
-│  diagnostics_channel ──────────┘    │                  │  │
-│  (undici:request:create)            │  1. URL matching  │  │
-│                                     │  2. Body capture  │  │
-│                                     │  3. Token extract │  │
-│                                     │  4. Cost estimate │  │
-│                                     │  5. Emit events   │  │
-│                                     └────────┬─────────┘  │
-│                                              │            │
-│                                     ┌────────▼─────────┐  │
-│                                     │  AgentMonitor    │  │
-│                                     │  (merges into    │  │
-│                                     │   conversation)  │  │
-│                                     └──────────────────┘  │
-└───────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph Sources["Monkey-Patched Modules"]
+        H["http.request()"]
+        HS["https.request()"]
+        H2["http2.connect()"]
+        F["globalThis.fetch()"]
+        DC["diagnostics_channel\n(undici:request:create)"]
+    end
+
+    Sources --> NI
+
+    subgraph NI["NetworkInterceptor"]
+        direction TB
+        S1["1. URL Pattern Matching\n(AI_ENDPOINTS list)"]
+        S2["2. Request Body Capture"]
+        S3["3. Streaming Response\nPiece Extraction"]
+        S4["4. Token Estimation\n& Cost Calculation"]
+        S5["5. Emit turn-start /\nturn-chunk / turn-complete"]
+        S1 --> S2 --> S3 --> S4 --> S5
+    end
+
+    NI -->|Events| AM["AgentMonitor\n(merges into\nconversation state)"]
 ```
 
 **Key design choice:** The interceptor uses a **debounced emit system** (`NetworkEmitHandle`) to batch rapid streaming chunks into a single dashboard update, preventing UI thrashing during high-velocity SSE responses.
@@ -161,31 +156,37 @@ The most technically interesting part of this project. The `NetworkInterceptor` 
 
 Cursor runs multiple Node.js processes (retrieval, always-local, agent-exec). Since the extension only lives in one process, it needs to **reach into sibling processes** to capture their LLM traffic.
 
-```
-┌───────────────── How the Sibling Bridge Works ─────────────────┐
-│                                                                │
-│  Step 1: Discovery                                             │
-│  ┌──────────────┐    lsof -p <cursor_pid>     ┌────────────┐  │
-│  │  Extension   │ ──────────────────────────► │  Find TCP  │  │
-│  │  Process     │                             │  listeners │  │
-│  └──────────────┘                             └─────┬──────┘  │
-│                                                     │         │
-│  Step 2: Activate V8 Inspector                      ▼         │
-│  ┌──────────────┐   SIGUSR1 signal    ┌─────────────────────┐ │
-│  │  Extension   │ ─────────────────► │  Sibling Process    │ │
-│  │  Process     │                     │  (e.g. retrieval)   │ │
-│  └──────────────┘                     │  Inspector opens    │ │
-│                                       │  on debug port      │ │
-│  Step 3: Connect & Inject             └─────────┬───────────┘ │
-│  ┌──────────────┐   WebSocket          ┌────────▼──────────┐  │
-│  │  Extension   │ ◄──────────────────► │  V8 Inspector    │  │
-│  │  Process     │   Runtime.evaluate   │  Protocol        │  │
-│  └──────────────┘   (inject probe)     └─────────────────  ┘  │
-│                                                                │
-│  Step 4: Probe writes intercepted events to a shared logfile   │
-│  Step 5: Extension tails the logfile for turn-start/chunk/     │
-│          turn-complete events                                  │
-└────────────────────────────────────────────────────────────────┘
+```mermaid
+sequenceDiagram
+    participant Ext as Extension Process
+    participant PS as ps / lsof
+    participant Sib as Sibling Process<br>(retrieval / always-local / agent-exec)
+    participant Log as Shared JSONL Logfile
+
+    Note over Ext: Step 1 — Discovery
+    Ext->>PS: ps -axo pid,ppid,command
+    PS-->>Ext: Sibling PIDs with roles
+    Ext->>PS: lsof -nP -p <pid> -iTCP -sTCP:LISTEN
+    PS-->>Ext: Listening TCP ports
+
+    Note over Ext,Sib: Step 2 — Activate V8 Inspector
+    Ext->>Sib: SIGUSR1 signal
+    Sib-->>Sib: Inspector opens on debug port
+
+    Note over Ext,Sib: Step 3 — Connect & Inject Probe
+    Ext->>Sib: WebSocket → GET /json/list
+    Sib-->>Ext: webSocketDebuggerUrl
+    Ext->>Sib: Runtime.evaluate(probeSourceCode)
+    Sib-->>Ext: Probe installed ✓
+
+    Note over Sib,Log: Step 4 — Probe captures LLM traffic
+    Sib->>Log: Write turn-start / turn-chunk / turn-complete
+
+    Note over Ext,Log: Step 5 — Extension tails logfile
+    loop Every 200ms
+        Ext->>Log: Read new bytes (pollEventLog)
+        Log-->>Ext: JSONL events
+    end
 ```
 
 The injected probe (`cursorRemoteProbe.ts` — 5,120 lines) is a complete network interception engine that runs **inside the sibling process**. It patches the same Node.js modules and additionally hooks into Cursor's internal Connect/gRPC transport layer.
@@ -194,40 +195,35 @@ The injected probe (`cursorRemoteProbe.ts` — 5,120 lines) is a complete networ
 
 The diagnostics engine analyzes your conversation in real-time and flags 6 failure patterns:
 
-```
-┌────────────────── Session Diagnostics Pipeline ──────────────────┐
-│                                                                  │
-│  ConversationChat                                                │
-│       │                                                          │
-│       ▼                                                          │
-│  buildUserTurnSnapshots()                                        │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │ For each user turn, extract:                                │ │
-│  │  • Prompt tokens & cost       • Task label & keywords       │ │
-│  │  • Setup candidates           • Error blocks & signatures   │ │
-│  │  • Frustration markers        • Prompt complexity class     │ │
-│  └──────────────────────┬──────────────────────────────────────┘ │
-│                         │                                        │
-│                         ▼                                        │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │              Six Parallel Detectors                         │ │
-│  │                                                             │ │
-│  │  🔁 Re-explainer    — Same setup context pasted repeatedly  │ │
-│  │  🐛 Error Paster    — Same error pasted without new info    │ │
-│  │  📈 Scope Creeper   — Chat drifts across 4+ unrelated tasks │ │
-│  │  💸 Cheap Task Tax  — Trivial task on expensive model       │ │
-│  │  📎 Dead Attachment — @file never used in agent responses   │ │
-│  │  😤 Frustration     — Terse, corrective tone detected       │ │
-│  │     Spiral                                                  │ │
-│  └──────────────────────┬──────────────────────────────────────┘ │
-│                         │                                        │
-│                         ▼                                        │
-│  SessionDiagnostics {                                            │
-│    issues: sorted by cost impact                                 │
-│    tokenWaste: { totalTokens, totalCostUsd, breakdown[] }        │
-│    frustrationMarkers: [{ turn, phrase }]                        │
-│  }                                                               │
-└──────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    CC["ConversationChat"] --> BTS["buildUserTurnSnapshots()"]
+
+    subgraph Extract["Per-Turn Feature Extraction"]
+        E1["Prompt tokens & cost"]
+        E2["Task label & keywords"]
+        E3["Setup candidates"]
+        E4["Error blocks & signatures"]
+        E5["Frustration markers"]
+        E6["Prompt complexity class"]
+    end
+
+    BTS --> Extract
+
+    Extract --> D1["🔁 Re-explainer\nSame setup context pasted repeatedly"]
+    Extract --> D2["🐛 Error Paster\nSame error pasted without new info"]
+    Extract --> D3["📈 Scope Creeper\nChat drifts across 4+ unrelated tasks"]
+    Extract --> D4["💸 Cheap Task Tax\nTrivial task on expensive model"]
+    Extract --> D5["📎 Dead Attachment\n@file never used in agent responses"]
+    Extract --> D6["😤 Frustration Spiral\nTerse, corrective tone detected"]
+
+    D1 & D2 & D3 & D4 & D5 & D6 --> SD
+
+    subgraph SD["SessionDiagnostics"]
+        I["issues — sorted by cost impact"]
+        TW["tokenWaste — totalTokens, totalCostUsd, breakdown"]
+        FM["frustrationMarkers — turn, phrase pairs"]
+    end
 ```
 
 Each detector produces a `SessionFailureInsight` with:
@@ -240,33 +236,24 @@ Each detector produces a `SessionFailureInsight` with:
 
 When you have a Groq API key configured, the extension sends structured session data to **LLaMA 3.3 70B** for deeper analysis:
 
-```
-┌─────── Coaching Pipeline ───────┐
-│                                 │
-│  Session Snapshot               │
-│       │                         │
-│       ▼                         │
-│  Local Diagnostics              │
-│  (sessionDiagnostics.ts)        │
-│       │                         │
-│       ▼                         │
-│  Groq API Call                  │
-│  (LLaMA 3.3 70B)               │
-│       │                         │
-│       ▼                         │
-│  Structured JSON Response       │
-│  • Executive Summary            │
-│  • Session Personality          │
-│  • Per-prompt Breakdown         │
-│  • Rewritten Prompts            │
-│  • Context Management Grade     │
-│  • Model Choice Audit           │
-│  • Top 3 Actions                │
-│       │                         │
-│       ▼                         │
-│  Rendered in Floating           │
-│  WebView Window                 │
-└─────────────────────────────────┘
+```mermaid
+flowchart TB
+    SS["Session Snapshot"] --> LD["Local Diagnostics\n(sessionDiagnostics.ts)"]
+    LD --> GA["Groq API Call\n(LLaMA 3.3 70B)"]
+
+    GA --> JR["Structured JSON Response"]
+
+    subgraph JR["Structured JSON Response"]
+        R1["Executive Summary"]
+        R2["Session Personality"]
+        R3["Per-prompt Breakdown"]
+        R4["Rewritten Prompts"]
+        R5["Context Management Grade"]
+        R6["Model Choice Audit"]
+        R7["Top 3 Actions"]
+    end
+
+    JR --> WV["Rendered in Floating\nWebView Window"]
 ```
 
 For large sessions, the payload is **chunked** (target ~42K chars per chunk) and merged across multiple API calls to stay within Groq's context window.
@@ -275,28 +262,16 @@ For large sessions, the payload is **chunked** (target ~42K chars per chunk) and
 
 Both Cursor and Antigravity store conversation state in SQLite databases (`state.vscdb`). The extension reads these directly — including **uncommitted WAL (Write-Ahead Log) data**:
 
-```
-┌─────── SQLite + WAL Merge ───────┐
-│                                  │
-│  state.vscdb (main DB file)      │
-│       +                          │
-│  state.vscdb-wal (WAL file)      │
-│       │                          │
-│       ▼                          │
-│  Manual WAL Frame Parser         │
-│  (no native SQLite dependency!)  │
-│       │                          │
-│       ▼                          │
-│  Merged key-value map            │
-│       │                          │
-│       ▼                          │
-│  Protobuf Decoder                │
-│  (custom wire-format parser)     │
-│       │                          │
-│       ▼                          │
-│  Extracted conversations,        │
-│  model catalog, settings         │
-└──────────────────────────────────┘
+```mermaid
+flowchart TB
+    DB["state.vscdb\n(main DB file)"] --> MP["Manual WAL Frame Parser\n(no native SQLite dependency!)"]
+    WAL["state.vscdb-wal\n(WAL file)"] --> MP
+
+    MP --> MKV["Merged In-Memory\nSQLite Buffer"]
+    MKV --> SQL["sqlite3 -json\n(query ItemTable)"]
+    SQL --> KV["Key-Value Map"]
+    KV --> PB["Protobuf Decoder\n(custom wire-format parser)"]
+    PB --> OUT["Extracted conversations,\nmodel catalog, settings"]
 ```
 
 **Why not just use `better-sqlite3`?** Because VS Code extensions run in a sandboxed environment where native Node modules are problematic. Instead, this project implements a **pure-TypeScript SQLite page reader** that understands the SQLite B-tree page format and WAL frame structure, plus a **custom Protobuf decoder** for Cursor's binary conversation storage.

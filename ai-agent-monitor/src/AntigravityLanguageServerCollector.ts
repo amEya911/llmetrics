@@ -1,10 +1,12 @@
 import * as http2 from 'http2';
+import { execFile as execFileCallback } from 'child_process';
 import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { promisify } from 'util';
 import * as vscode from 'vscode';
 import { formatError } from './stateSqlite';
-import { ModelConfidence } from './types';
+import { CapturedTokenUsage, ModelConfidence } from './types';
 
 const HEARTBEAT_PATH = '/exa.language_server_pb.LanguageServerService/Heartbeat';
 const SEARCH_CONVERSATIONS_PATH = '/exa.language_server_pb.LanguageServerService/SearchConversations';
@@ -14,6 +16,9 @@ const DISCOVERY_INTERVAL_MS = 2_000;
 const SEARCH_INTERVAL_MS = 3_000;
 const STREAM_RETRY_MS = 3_000;
 const CONNECT_END_STREAM_FLAG = 0x02;
+const PS_OUTPUT_MAX_BUFFER = 4 * 1024 * 1024;
+
+const execFile = promisify(execFileCallback);
 
 interface CollectorOptions {
   output: vscode.OutputChannel;
@@ -24,7 +29,7 @@ interface CollectorOptions {
 interface LanguageServerClientInfo {
   csrfToken: string;
   port: number;
-  source: 'runtime' | 'logs';
+  source: 'runtime' | 'logs' | 'process-log';
   discoveredAt: number;
 }
 
@@ -53,6 +58,10 @@ interface ActiveRunState {
   executionId: string;
   prompt?: string;
   promptStartedAt?: number;
+  lastUpdatedAt?: number;
+  thinking?: string;
+  subagent?: string;
+  editor?: string;
   output?: string;
   model?: string;
   modelConfidence: ModelConfidence;
@@ -62,6 +71,8 @@ interface ActiveRunState {
   contextWindowTokens?: number;
   startedEmitted: boolean;
   completed: boolean;
+  capturedTokenUsage: Required<Pick<CapturedTokenUsage, 'thinkingTokens' | 'subagentTokens' | 'editorTokens' | 'outputTokens'>>;
+  countedStepKeys: Set<string>;
 }
 
 interface StreamState {
@@ -75,6 +86,13 @@ interface StreamState {
 interface LogCandidate {
   csrfToken: string;
   port: number;
+  discoveredAt: number;
+  source?: 'logs' | 'process-log';
+}
+
+interface ProcessCandidate {
+  pid: number;
+  csrfToken: string;
   discoveredAt: number;
 }
 
@@ -109,7 +127,11 @@ export interface AntigravityTurnUpdateEvent {
   modelConfidence?: ModelConfidence;
   contextUsagePercent?: number;
   contextWindowTokens?: number;
+  thinking?: string;
+  subagent?: string;
+  editor?: string;
   output?: string;
+  capturedTokenUsage?: CapturedTokenUsage;
   isComplete: boolean;
 }
 
@@ -269,7 +291,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
     for (const candidate of logCandidates) {
       candidates.push({
         ...candidate,
-        source: 'logs',
+        source: candidate.source ?? 'logs',
       });
     }
 
@@ -342,6 +364,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       path.join(os.homedir(), '.config', 'Anti-Gravity', 'logs'),
     ];
 
+    const processCandidates = await this.readProcessCandidates();
     const candidates: LogCandidate[] = [];
     for (const root of roots) {
       let entries: string[];
@@ -352,39 +375,120 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       }
 
       for (const entry of entries) {
-        const logPath = path.join(root, entry, 'ls-main.log');
-        let raw: string;
-        let stats;
-        try {
-          [raw, stats] = await Promise.all([
-            fs.readFile(logPath, 'utf8'),
-            fs.stat(logPath),
-          ]);
-        } catch {
-          continue;
-        }
+        const lsMainPath = path.join(root, entry, 'ls-main.log');
+        const exthostPath = path.join(root, entry, 'window1', 'exthost', 'google.antigravity', 'Antigravity.log');
 
-        const csrfToken = raw.match(/Args:\s+.*--csrf_token\s+([a-f0-9-]+)/i)?.[1];
-        const portMatches = [...raw.matchAll(/(?:LS started on port|listening on random port at)\s+(\d+)\s+for HTTPS|LS started on port\s+(\d+)/gi)];
-        const port = [...portMatches]
-          .map((match) => Number(match[1] ?? match[2]))
-          .filter((value) => Number.isFinite(value) && value > 0)
-          .pop();
-
-        if (!csrfToken || !port) {
-          continue;
-        }
-
-        candidates.push({
-          csrfToken,
-          port,
-          discoveredAt: stats.mtimeMs,
-        });
+        candidates.push(...await this.readLsMainCandidates(lsMainPath));
+        candidates.push(...await this.readExthostCandidates(exthostPath, processCandidates));
       }
     }
 
     return candidates
       .sort((left, right) => right.discoveredAt - left.discoveredAt);
+  }
+
+  private async readProcessCandidates(): Promise<Map<number, ProcessCandidate>> {
+    try {
+      const { stdout } = await execFile('ps', ['-axo', 'pid=,command='], {
+        maxBuffer: PS_OUTPUT_MAX_BUFFER,
+      });
+      const now = Date.now();
+      const candidates = new Map<number, ProcessCandidate>();
+      for (const line of stdout.split(/\r?\n/)) {
+        const match = line.match(/^\s*(\d+)\s+(.+)$/);
+        if (!match) {
+          continue;
+        }
+
+        const pid = Number(match[1]);
+        const command = match[2] ?? '';
+        if (!Number.isFinite(pid) || !/language_server/i.test(command)) {
+          continue;
+        }
+
+        const csrfToken = command.match(/--csrf_token\s+([a-f0-9-]+)/i)?.[1];
+        if (!csrfToken) {
+          continue;
+        }
+
+        candidates.set(pid, {
+          pid,
+          csrfToken,
+          discoveredAt: now,
+        });
+      }
+
+      return candidates;
+    } catch {
+      return new Map();
+    }
+  }
+
+  private async readLsMainCandidates(logPath: string): Promise<LogCandidate[]> {
+    let raw: string;
+    let stats;
+    try {
+      [raw, stats] = await Promise.all([
+        fs.readFile(logPath, 'utf8'),
+        fs.stat(logPath),
+      ]);
+    } catch {
+      return [];
+    }
+
+    const csrfToken = raw.match(/Args:\s+.*--csrf_token\s+([a-f0-9-]+)/i)?.[1];
+    const portMatches = [...raw.matchAll(/(?:LS started on port|listening on random port at)\s+(\d+)\s+for HTTPS|LS started on port\s+(\d+)/gi)];
+    const port = [...portMatches]
+      .map((match) => Number(match[1] ?? match[2]))
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .pop();
+
+    if (!csrfToken || !port) {
+      return [];
+    }
+
+    return [{
+      csrfToken,
+      port,
+      discoveredAt: stats.mtimeMs,
+      source: 'logs',
+    }];
+  }
+
+  private async readExthostCandidates(
+    logPath: string,
+    processCandidates: Map<number, ProcessCandidate>
+  ): Promise<LogCandidate[]> {
+    let raw: string;
+    let stats;
+    try {
+      [raw, stats] = await Promise.all([
+        fs.readFile(logPath, 'utf8'),
+        fs.stat(logPath),
+      ]);
+    } catch {
+      return [];
+    }
+
+    const matches = [...raw.matchAll(/(?:^|\s)(\d+)\s+server\.go:454\]\s+Language server listening on random port at\s+(\d+)\s+for HTTPS/gi)];
+    const candidates: LogCandidate[] = [];
+    for (const match of matches) {
+      const pid = Number(match[1]);
+      const port = Number(match[2]);
+      const processCandidate = processCandidates.get(pid);
+      if (!Number.isFinite(pid) || !Number.isFinite(port) || port <= 0 || !processCandidate) {
+        continue;
+      }
+
+      candidates.push({
+        csrfToken: processCandidate.csrfToken,
+        port,
+        discoveredAt: Math.max(stats.mtimeMs, processCandidate.discoveredAt),
+        source: 'process-log',
+      });
+    }
+
+    return candidates;
   }
 
   private async refreshConversationSearch(): Promise<void> {
@@ -606,6 +710,9 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
     for (const step of steps) {
       this.applyStepUpdate(resolvedConversationId, step, summary);
     }
+
+    this.applyExecutorCompletions(resolvedConversationId, update);
+    this.applyConversationCompletion(resolvedConversationId, update);
   }
 
   private applyGeneratorMetadata(
@@ -671,7 +778,11 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
           modelConfidence: run.modelConfidence,
           contextUsagePercent: run.contextUsagePercent,
           contextWindowTokens: run.contextWindowTokens,
+          thinking: run.thinking,
+          subagent: run.subagent,
+          editor: run.editor,
           output: run.output,
+          capturedTokenUsage: { ...run.capturedTokenUsage },
           isComplete: run.completed,
         });
       }
@@ -727,40 +838,77 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       return;
     }
 
-    if (type !== 'CORTEX_STEP_TYPE_PLANNER_RESPONSE') {
-      return;
-    }
-
-    const output = extractPlannerResponse(step?.plannerResponse);
     const updatedAt = stepTimestamp(step?.metadata) ?? Date.now();
-    const isComplete = status === 'CORTEX_STEP_STATUS_DONE';
 
-    if (!run.startedEmitted && run.prompt) {
-      run.startedEmitted = true;
-      this._onTurnStart.fire({
+    if (type === 'CORTEX_STEP_TYPE_PLANNER_RESPONSE') {
+      this.emitLateTurnStartIfNeeded(conversationId, executionId, run, summary, updatedAt);
+      const tokenChanged = this.captureStepTokenUsage(run, step, 'primary');
+      const output = extractPlannerResponse(step?.plannerResponse);
+      const thinking = extractPlannerThinking(step?.plannerResponse);
+      const changedThinking = thinking !== undefined && thinking !== run.thinking;
+      const changedOutput = output !== undefined && output !== run.output;
+      if (!changedThinking && !changedOutput && !tokenChanged) {
+        return;
+      }
+
+      if (thinking !== undefined) {
+        run.thinking = thinking;
+      }
+      if (output !== undefined) {
+        run.output = output;
+      }
+      run.lastUpdatedAt = updatedAt;
+
+      this._onTurnUpdate.fire({
         conversationId,
         executionId,
-        prompt: run.prompt,
-        startedAt: run.promptStartedAt ?? updatedAt,
+        updatedAt,
         title: run.title,
         subtitle: run.subtitle,
         model: run.model,
         modelConfidence: run.modelConfidence,
         contextUsagePercent: run.contextUsagePercent,
         contextWindowTokens: run.contextWindowTokens,
+        thinking: run.thinking,
+        subagent: run.subagent,
+        editor: run.editor,
+        output: run.output,
+        capturedTokenUsage: { ...run.capturedTokenUsage },
+        isComplete: false,
       });
-    }
-
-    const changedOutput = output !== undefined && output !== run.output;
-    const completionChanged = isComplete && !run.completed;
-    if (!changedOutput && !completionChanged) {
       return;
     }
 
-    if (output !== undefined) {
-      run.output = output;
+    const auxiliaryText = extractAuxiliaryStepText(step);
+    const auxiliaryKind = classifyAuxiliaryStepType(type);
+    if (auxiliaryKind) {
+      this.emitLateTurnStartIfNeeded(conversationId, executionId, run, summary, updatedAt);
     }
-    run.completed = run.completed || isComplete;
+    const tokenChanged = auxiliaryKind
+      ? this.captureStepTokenUsage(run, step, auxiliaryKind)
+      : false;
+    if (!auxiliaryKind) {
+      return;
+    }
+
+    const nextValue = auxiliaryText
+      ? mergeStepText(auxiliaryKind === 'subagent' ? run.subagent : run.editor, auxiliaryText)
+      : auxiliaryKind === 'subagent'
+        ? run.subagent
+        : run.editor;
+    const changedAuxiliary = auxiliaryKind === 'subagent'
+      ? nextValue !== run.subagent
+      : nextValue !== run.editor;
+    if (!changedAuxiliary && !tokenChanged) {
+      return;
+    }
+
+    if (auxiliaryKind === 'subagent') {
+      run.subagent = nextValue;
+    } else {
+      run.editor = nextValue;
+    }
+    run.lastUpdatedAt = updatedAt;
 
     this._onTurnUpdate.fire({
       conversationId,
@@ -772,8 +920,126 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       modelConfidence: run.modelConfidence,
       contextUsagePercent: run.contextUsagePercent,
       contextWindowTokens: run.contextWindowTokens,
+      thinking: run.thinking,
+      subagent: run.subagent,
+      editor: run.editor,
       output: run.output,
-      isComplete: run.completed,
+      capturedTokenUsage: { ...run.capturedTokenUsage },
+      isComplete: false,
+    });
+  }
+
+  private applyConversationCompletion(conversationId: string, update: any): void {
+    const statuses = [
+      update?.status,
+      update?.executableStatus,
+      update?.executorLoopStatus,
+    ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+    const isIdle = statuses.length > 0 && statuses.every((value) => value === 'CASCADE_RUN_STATUS_IDLE');
+    if (!isIdle) {
+      return;
+    }
+
+    const relatedRuns = [...this.runStates.values()]
+      .filter((run) =>
+        run.conversationId === conversationId
+        && run.startedEmitted
+        && !run.completed
+      );
+
+    for (const run of relatedRuns) {
+      this.emitRunCompletion(conversationId, run);
+    }
+  }
+
+  private applyExecutorCompletions(conversationId: string, update: any): void {
+    const executorMetadatas = update?.mainTrajectoryUpdate?.executorMetadatasUpdate?.executorMetadatas;
+    if (!Array.isArray(executorMetadatas)) {
+      return;
+    }
+
+    for (const metadata of executorMetadatas) {
+      const executionId = this.extractExecutionId(metadata);
+      const terminationReason = typeof metadata?.terminationReason === 'string'
+        ? metadata.terminationReason
+        : '';
+      if (!executionId || !terminationReason) {
+        continue;
+      }
+
+      const run = this.runStates.get(`${conversationId}:${executionId}`);
+      if (!run || !run.startedEmitted || run.completed) {
+        continue;
+      }
+
+      this.emitRunCompletion(conversationId, run);
+    }
+  }
+
+  private emitRunCompletion(
+    conversationId: string,
+    run: ActiveRunState
+  ): void {
+    if (run.completed) {
+      return;
+    }
+
+    run.completed = true;
+    const updatedAt = run.lastUpdatedAt ?? run.promptStartedAt ?? Date.now();
+    this._onTurnUpdate.fire({
+      conversationId,
+      executionId: run.executionId,
+      updatedAt,
+      title: run.title,
+      subtitle: run.subtitle,
+      model: run.model,
+      modelConfidence: run.modelConfidence,
+      contextUsagePercent: run.contextUsagePercent,
+      contextWindowTokens: run.contextWindowTokens,
+      thinking: run.thinking,
+      subagent: run.subagent,
+      editor: run.editor,
+      output: run.output,
+      capturedTokenUsage: { ...run.capturedTokenUsage },
+      isComplete: true,
+    });
+  }
+
+  private emitLateTurnStartIfNeeded(
+    conversationId: string,
+    executionId: string,
+    run: ActiveRunState,
+    summary: ConversationSummary | undefined,
+    startedAt: number
+  ): void {
+    if (run.startedEmitted) {
+      return;
+    }
+
+    const recoveredPrompt = run.prompt
+      ?? summary?.snippet
+      ?? '';
+    run.prompt = recoveredPrompt;
+    run.promptStartedAt = run.promptStartedAt ?? startedAt;
+    run.startedEmitted = true;
+
+    if (!recoveredPrompt) {
+      this.output.appendLine(
+        `[antigravity-ls] Late-attached live run ${executionId} started without a recovered prompt.`
+      );
+    }
+
+    this._onTurnStart.fire({
+      conversationId,
+      executionId,
+      prompt: recoveredPrompt,
+      startedAt: run.promptStartedAt,
+      title: run.title,
+      subtitle: run.subtitle,
+      model: run.model,
+      modelConfidence: run.modelConfidence,
+      contextUsagePercent: run.contextUsagePercent,
+      contextWindowTokens: run.contextWindowTokens,
     });
   }
 
@@ -790,9 +1056,60 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       modelConfidence: 'unknown',
       startedEmitted: false,
       completed: false,
+      capturedTokenUsage: {
+        thinkingTokens: 0,
+        subagentTokens: 0,
+        editorTokens: 0,
+        outputTokens: 0,
+      },
+      countedStepKeys: new Set<string>(),
     };
     this.runStates.set(key, next);
     return next;
+  }
+
+  private captureStepTokenUsage(
+    run: ActiveRunState,
+    step: any,
+    kind: 'primary' | 'subagent' | 'editor'
+  ): boolean {
+    const stepKey = buildCountedStepKey(step);
+    if (!stepKey || run.countedStepKeys.has(stepKey)) {
+      return false;
+    }
+
+    const metadata = step?.metadata ?? {};
+    let changed = false;
+
+    if (kind === 'primary') {
+      const usage = metadata?.modelUsage ?? {};
+      const totalOutputTokens = toNumber(usage?.outputTokens) ?? 0;
+      const thinkingTokens = toNumber(usage?.thinkingOutputTokens) ?? 0;
+      const responseTokens = toNumber(usage?.responseOutputTokens);
+      const outputTokens = responseTokens ?? Math.max(0, totalOutputTokens - thinkingTokens);
+
+      if (thinkingTokens > 0 || outputTokens > 0) {
+        run.capturedTokenUsage.thinkingTokens += thinkingTokens;
+        run.capturedTokenUsage.outputTokens += outputTokens;
+        changed = true;
+      }
+    } else {
+      const toolTokens = toNumber(metadata?.toolCallOutputTokens) ?? 0;
+      if (toolTokens > 0) {
+        if (kind === 'editor') {
+          run.capturedTokenUsage.editorTokens += toolTokens;
+        } else {
+          run.capturedTokenUsage.subagentTokens += toolTokens;
+        }
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      run.countedStepKeys.add(stepKey);
+    }
+
+    return changed;
   }
 
   private extractExecutionId(value: any): string | undefined {
@@ -945,6 +1262,95 @@ function extractPlannerResponse(plannerResponse: any): string | undefined {
   return undefined;
 }
 
+function extractPlannerThinking(plannerResponse: any): string | undefined {
+  const candidates = [
+    plannerResponse?.thinking,
+    plannerResponse?.reasoning,
+    plannerResponse?.reasoningText,
+    plannerResponse?.thought,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  return undefined;
+}
+
+function classifyAuxiliaryStepType(type: string): 'subagent' | 'editor' | undefined {
+  const normalized = type.toLowerCase();
+  if (/(?:edit|rewrite|diff|apply|patch)/.test(normalized)) {
+    return 'editor';
+  }
+  if (/(?:subagent|background|tool|terminal|grep|search|lint|command)/.test(normalized)) {
+    return 'subagent';
+  }
+  return undefined;
+}
+
+function extractAuxiliaryStepText(step: any): string | undefined {
+  const candidates = [
+    step?.text,
+    step?.response,
+    step?.output,
+    step?.message,
+    step?.toolResponse,
+    step?.toolRequest,
+    step?.edit,
+    step?.diff,
+    step?.rewrite,
+  ];
+
+  for (const candidate of candidates) {
+    const text = readNestedText(candidate);
+    if (text) {
+      return text;
+    }
+  }
+
+  return undefined;
+}
+
+function readNestedText(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.trim()) {
+    return value.trim();
+  }
+
+  if (Array.isArray(value)) {
+    const combined = value
+      .map((entry) => readNestedText(entry))
+      .filter((entry): entry is string => Boolean(entry))
+      .join('\n\n')
+      .trim();
+    return combined || undefined;
+  }
+
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+
+  for (const key of ['text', 'content', 'message', 'output', 'response', 'diff', 'rewrite', 'patch']) {
+    const text = readNestedText((value as Record<string, unknown>)[key]);
+    if (text) {
+      return text;
+    }
+  }
+
+  return undefined;
+}
+
+function mergeStepText(current: string | undefined, next: string): string {
+  if (!current) {
+    return next;
+  }
+  if (current.includes(next)) {
+    return current;
+  }
+  return `${current}\n\n${next}`;
+}
+
 function stepTimestamp(metadata: any): number | undefined {
   const candidates = [
     metadata?.completedAt,
@@ -962,6 +1368,26 @@ function stepTimestamp(metadata: any): number | undefined {
   }
 
   return undefined;
+}
+
+function buildCountedStepKey(step: any): string | undefined {
+  const metadata = step?.metadata ?? {};
+  const sourceInfo = metadata?.sourceTrajectoryStepInfo ?? {};
+  const stepIndex = sourceInfo?.stepIndex;
+  const metadataIndex = sourceInfo?.metadataIndex;
+  const executionId = metadata?.executionId ?? step?.executionId;
+  const type = typeof step?.type === 'string' ? step.type : '';
+
+  if (!type || typeof executionId !== 'string' || !executionId.trim()) {
+    return undefined;
+  }
+
+  const indexLabel = [
+    Number.isFinite(stepIndex) ? String(stepIndex) : 'step',
+    Number.isFinite(metadataIndex) ? String(metadataIndex) : '0',
+  ].join(':');
+
+  return `${executionId}:${type}:${indexLabel}`;
 }
 
 function toTimestamp(value: unknown): number | undefined {

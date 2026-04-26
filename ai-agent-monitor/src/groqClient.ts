@@ -61,7 +61,16 @@ interface FullSessionTurnPayload {
   model: string | undefined;
   prompt: string;
   assistantThinking: string;
+  assistantSubagents: string;
+  assistantEditor: string;
   assistantOutput: string;
+  tokenBreakdown: {
+    inputTokens: number;
+    thinkingTokens: number;
+    subagentTokens: number;
+    editorTokens: number;
+    outputTokens: number;
+  };
   metrics: unknown;
   assessment: unknown;
   modelRecommendation: unknown;
@@ -228,7 +237,16 @@ function buildFullSessionPayload(
       model: turn.model ?? chat.model,
       prompt: turn.blocks['user-input'].content,
       assistantThinking: turn.blocks['agent-thinking'].content,
+      assistantSubagents: turn.blocks['agent-subagent'].content,
+      assistantEditor: turn.blocks['agent-editor'].content,
       assistantOutput: turn.blocks['agent-output'].content,
+      tokenBreakdown: {
+        inputTokens: turn.metrics?.inputTokens ?? 0,
+        thinkingTokens: turn.metrics?.thinkingTokens ?? 0,
+        subagentTokens: turn.metrics?.subagentTokens ?? 0,
+        editorTokens: turn.metrics?.editorTokens ?? 0,
+        outputTokens: turn.metrics?.outputTokens ?? 0,
+      },
       metrics: turn.metrics,
       assessment: turn.assessment,
       modelRecommendation: turn.modelRecommendation,
@@ -275,6 +293,8 @@ function trimCoachPayload(payload: FullSessionPayload) {
   const conciseTurns = payload.turns.map((turn) => ({
     ...turn,
     assistantThinking: truncate(turn.assistantThinking, 700),
+    assistantSubagents: truncate(turn.assistantSubagents, 900),
+    assistantEditor: truncate(turn.assistantEditor, 900),
     assistantOutput: truncate(turn.assistantOutput, 1200),
   }));
 

@@ -17,6 +17,7 @@ const https: typeof httpsTypes = require('https');
 const zlib: typeof import('zlib') = require('zlib');
 
 type ModelConfidence = 'exact' | 'inferred' | 'unknown';
+type InterceptedRequestType = 'primary' | 'subagent' | 'editor';
 type PromptCaptureConfidence = 'none' | 'weak' | 'strong' | 'exact';
 
 export interface CursorRemoteProbeOptions {
@@ -30,6 +31,7 @@ interface InterceptedTurnStart {
   provider: string;
   url: string;
   prompt: string;
+  requestType: InterceptedRequestType;
   model?: string;
   modelConfidence: ModelConfidence;
   chatId?: string;
@@ -40,6 +42,7 @@ interface InterceptedTurnStart {
 interface InterceptedTurnChunk {
   requestId: string;
   provider: string;
+  requestType: InterceptedRequestType;
   kind: 'agent-thinking' | 'agent-output';
   content: string;
 }
@@ -49,6 +52,7 @@ interface InterceptedTurnComplete {
   provider: string;
   url: string;
   prompt: string;
+  requestType: InterceptedRequestType;
   model?: string;
   modelConfidence: ModelConfidence;
   chatId?: string;
@@ -60,6 +64,7 @@ interface InterceptedTurnComplete {
 
 interface ParsedRequestPayload {
   prompt?: string;
+  requestText?: string;
   model?: string;
   modelConfidence: ModelConfidence;
   chatId?: string;
@@ -101,6 +106,17 @@ interface DecodedChunkObserver {
   onEnd(): void;
   onClose(): void;
   onError(): void;
+}
+
+interface ResponseStreamStats {
+  openedAt: number;
+  transport: string;
+  url: string;
+  contentType: string;
+  isStreaming: boolean;
+  chunkCount: number;
+  totalBytes: number;
+  sawDoneSignal: boolean;
 }
 
 interface UndiciRequestCapture {
@@ -175,6 +191,7 @@ class CursorRemoteProbe {
   private readonly originalRegisterConnectTransportProvider?: Function;
 
   private readonly activeRequests = new Map<string, InterceptedRequestState>();
+  private readonly responseStreams = new Map<string, ResponseStreamStats>();
   private readonly pendingCursorTurnSeeds = new Map<string, PendingCursorTurnSeed>();
   private readonly undiciCaptures = new WeakMap<object, UndiciRequestCapture>();
   private readonly prototypeClientRequestCaptures =
@@ -818,12 +835,57 @@ class CursorRemoteProbe {
     const normalizedService = invocation.serviceName.toLowerCase();
     const normalizedMethod = invocation.methodName.toLowerCase();
     return normalizedService.includes('chatservice')
-      || normalizedService.includes('backgroundcomposerservice')
       || normalizedService.includes('agentservice')
+      || (normalizedService.includes('backgroundcomposerservice') && !normalizedMethod.includes('list'))
+      || normalizedService.includes('diff')
+      || normalizedService.includes('edit')
+      || normalizedService.includes('cpp')
       || normalizedMethod.includes('streamunifiedchatwithtools')
       || normalizedMethod.includes('streamconversation')
       || normalizedMethod.includes('attachbackgroundcomposer')
+      || normalizedMethod.includes('stream')
+      || normalizedMethod.includes('apply')
+      || normalizedMethod.includes('rewrite')
+      || normalizedMethod.includes('edit')
+      || normalizedMethod.includes('diff')
       || normalizedMethod === 'run';
+  }
+
+  private classifyCursorConnectInvocation(
+    invocation: CursorConnectInvocation,
+    payload: ParsedRequestPayload
+  ): InterceptedRequestType {
+    const haystack = [
+      invocation.source,
+      invocation.serviceName,
+      invocation.methodName,
+      payload.requestText,
+      payload.prompt,
+      payload.chatId,
+    ]
+      .filter((value): value is string => typeof value === 'string' && value.length > 0)
+      .join(' ')
+      .toLowerCase();
+
+    if (
+      /\b(?:cpp|edit|edithistory|diff|rewrite|apply|patch|filesync)\b/.test(haystack)
+      || invocation.source.toLowerCase().includes('geocpp')
+      || invocation.source.toLowerCase().includes('cppconfig')
+    ) {
+      return 'editor';
+    }
+
+    if (
+      /\b(?:backgroundcomposer|background|subagent|agentexec|terminal|grep|lint|search)\b/.test(haystack)
+      || /agentservice/.test(invocation.serviceName.toLowerCase())
+      || invocation.source.toLowerCase().includes('backgroundcomposer')
+      || invocation.source.toLowerCase().includes('agenticcomposer')
+      || invocation.source.toLowerCase().includes('agentbidi')
+    ) {
+      return 'subagent';
+    }
+
+    return 'primary';
   }
 
   private registerCursorConnectRequest(invocation: CursorConnectInvocation): string {
@@ -848,12 +910,17 @@ class CursorRemoteProbe {
     }
     const requestId = this.createRequestId();
     const url = this.buildCursorConnectUrl(invocation);
+    const requestType = this.classifyCursorConnectInvocation(invocation, payload);
+    const requestText = requestType === 'primary'
+      ? payload.prompt?.trim() ?? ''
+      : payload.requestText?.trim() ?? payload.prompt?.trim() ?? '';
     const hasPrompt = Boolean(payload.prompt?.trim());
     const state: InterceptedRequestState = {
       requestId,
       provider: 'Cursor',
       url,
-      prompt: payload.prompt?.trim() ?? '',
+      prompt: requestText,
+      requestType,
       model: payload.model,
       modelConfidence: payload.modelConfidence,
       chatId: payload.chatId,
@@ -864,7 +931,7 @@ class CursorRemoteProbe {
       fallbackOutput: '',
       promptConfidence: hasPrompt ? 'exact' : 'none',
       didComplete: false,
-      didStartEvent: hasPrompt,
+      didStartEvent: hasPrompt || requestType !== 'primary',
     };
 
     this.activeRequests.set(requestId, state);
@@ -879,13 +946,14 @@ class CursorRemoteProbe {
       role: this.options.role,
       pid: process.pid,
       hasPrompt,
+      requestType,
       model: payload.model,
       chatId: payload.chatId,
       input: this.serializeUnknown(invocation.plainInput ?? invocation.input),
       inputPreview: this.previewUnknown(invocation.plainInput ?? invocation.input),
     });
 
-    if (hasPrompt) {
+    if (hasPrompt || requestType !== 'primary') {
       this.writeEvent({
         phase: 'turn-start',
         role: this.options.role,
@@ -894,6 +962,7 @@ class CursorRemoteProbe {
         provider: state.provider,
         url: state.url,
         prompt: state.prompt,
+        requestType: state.requestType,
         model: state.model,
         modelConfidence: state.modelConfidence,
         chatId: state.chatId,
@@ -1111,11 +1180,37 @@ class CursorRemoteProbe {
     }
 
     maybeStream[WRAPPED_CONNECT_STREAM] = true;
+    const state = this.activeRequests.get(requestId);
+    const streamUrl = state?.url ?? this.buildCursorConnectUrl(invocation);
+    this.ensureResponseStream(
+      requestId,
+      'cursor-connect',
+      streamUrl,
+      'application/cursor-connect-stream',
+      true
+    );
+    this.writeDiagnostic({
+      phase: 'cursor-connect-stream-open',
+      serviceName: invocation.serviceName,
+      methodName: invocation.methodName,
+      requestId,
+      role: this.options.role,
+      pid: process.pid,
+    });
     let chunkCount = 0;
+    let closeReason = 'iterator-complete';
     try {
       for await (const message of stream) {
         chunkCount += 1;
         const plainMessage = this.coerceToPlainObject(message);
+        const serializedMessage = this.serializeUnknown(plainMessage) ?? '';
+        const { stats, chunkBytes } = this.recordResponseChunk(
+          requestId,
+          'cursor-connect',
+          streamUrl,
+          'application/cursor-connect-stream',
+          serializedMessage
+        );
         this.inspectCursorConnectStreamMessage(requestId, plainMessage);
         const pieces = this.extractCursorConnectResponsePieces(plainMessage);
         for (const piece of pieces) {
@@ -1128,9 +1223,12 @@ class CursorRemoteProbe {
           methodName: invocation.methodName,
           requestId,
           chunkCount,
+          chunkBytes,
+          totalBytes: stats.totalBytes,
+          sawDoneSignal: stats.sawDoneSignal,
           pieceCount: pieces.length,
           preview: this.previewUnknown(plainMessage),
-          payload: chunkCount <= 4 ? this.serializeUnknown(plainMessage) : undefined,
+          payload: chunkCount <= 4 ? serializedMessage : undefined,
           role: this.options.role,
           pid: process.pid,
         });
@@ -1147,17 +1245,23 @@ class CursorRemoteProbe {
         role: this.options.role,
         pid: process.pid,
       });
+      closeReason = 'iterator-error';
       throw error;
     } finally {
+      const stats = this.responseStreams.get(requestId);
       this.writeDiagnostic({
         phase: 'cursor-connect-stream-complete',
         serviceName: invocation.serviceName,
         methodName: invocation.methodName,
         requestId,
         chunkCount,
+        totalBytes: stats?.totalBytes ?? 0,
+        sawDoneSignal: stats?.sawDoneSignal ?? false,
+        durationMs: stats ? Date.now() - stats.openedAt : undefined,
         role: this.options.role,
         pid: process.pid,
       });
+      this.writeResponseEndDiagnostic(requestId, closeReason);
       this.completeRequest(requestId);
     }
   }
@@ -1321,12 +1425,14 @@ class CursorRemoteProbe {
       return;
     }
 
-    if (!state.prompt.trim()) {
-      return;
-    }
+    if (state.requestType === 'primary') {
+      if (!state.prompt.trim()) {
+        return;
+      }
 
-    if (!this.isPromptReadyForEmission(state.promptConfidence)) {
-      return;
+      if (!this.isPromptReadyForEmission(state.promptConfidence)) {
+        return;
+      }
     }
 
     state.didStartEvent = true;
@@ -1338,6 +1444,7 @@ class CursorRemoteProbe {
       provider: state.provider,
       url: state.url,
       prompt: state.prompt,
+      requestType: state.requestType,
       model: state.model,
       modelConfidence: state.modelConfidence,
       chatId: state.chatId,
@@ -1352,6 +1459,7 @@ class CursorRemoteProbe {
         pid: process.pid,
         requestId: state.requestId,
         provider: state.provider,
+        requestType: state.requestType,
         kind: 'agent-thinking',
         content: state.thinking,
       });
@@ -1364,6 +1472,7 @@ class CursorRemoteProbe {
         pid: process.pid,
         requestId: state.requestId,
         provider: state.provider,
+        requestType: state.requestType,
         kind: 'agent-output',
         content: state.output,
       });
@@ -1693,6 +1802,9 @@ class CursorRemoteProbe {
   private parseCursorConnectPayload(invocation: CursorConnectInvocation): ParsedRequestPayload {
     const value = invocation.plainInput ?? invocation.input;
     const prompt = this.extractPromptFromCandidates([value]);
+    const requestText = prompt
+      ?? this.extractRequestTextFromCandidates([value])
+      ?? this.previewUnknown(value);
     const model = this.findStringByKeys(value, [
       'model',
       'modelName',
@@ -1723,6 +1835,7 @@ class CursorRemoteProbe {
     ]);
     return {
       prompt,
+      requestText,
       model,
       modelConfidence: model ? 'exact' : 'unknown',
       chatId: chatId && chatId.trim().length <= 200 ? chatId.trim() : undefined,
@@ -2567,6 +2680,7 @@ class CursorRemoteProbe {
       || /stream/i.test(contentType)
       || /ndjson/i.test(contentType)
       || isConnectJson;
+    this.ensureResponseStream(requestId, 'fetch', url, contentType, isStreaming);
 
     this.writeDiagnostic({
       phase: 'response-headers',
@@ -2586,20 +2700,14 @@ class CursorRemoteProbe {
       for (const piece of pieces) {
         this.appendResponsePiece(requestId, piece);
       }
-      this.writeDiagnostic({
-        phase: 'response-end',
-        requestId,
-        transport: 'fetch',
-        url,
-        role: this.options.role,
-        pid: process.pid,
-      });
+      this.writeResponseEndDiagnostic(requestId, 'reader-done');
       this.completeRequest(requestId);
       return;
     }
 
     const reader = response.body?.getReader();
     if (!reader) {
+      this.writeResponseEndDiagnostic(requestId, 'missing-reader');
       this.completeRequest(requestId);
       return;
     }
@@ -2631,14 +2739,7 @@ class CursorRemoteProbe {
         }
       }
 
-      this.writeDiagnostic({
-        phase: 'response-end',
-        requestId,
-        transport: 'fetch',
-        url,
-        role: this.options.role,
-        pid: process.pid,
-      });
+      this.writeResponseEndDiagnostic(requestId, 'reader-done');
       this.completeRequest(requestId);
       return;
     }
@@ -2669,14 +2770,7 @@ class CursorRemoteProbe {
       this.appendResponsePiece(requestId, piece);
     }
 
-    this.writeDiagnostic({
-      phase: 'response-end',
-      requestId,
-      transport: 'fetch',
-      url,
-      role: this.options.role,
-      pid: process.pid,
-    });
+    this.writeResponseEndDiagnostic(requestId, 'reader-done');
     this.completeRequest(requestId);
   }
 
@@ -2765,13 +2859,21 @@ class CursorRemoteProbe {
       pid: process.pid,
     });
 
+    const requestType = this.classifyRequest(provider, transport, url, headers, payload);
+    if (!this.shouldTrackRequest(provider, url, requestType, payload)) {
+      return undefined;
+    }
     const requestId = this.createRequestId();
+    const requestText = requestType === 'primary'
+      ? payload.prompt?.trim() ?? ''
+      : payload.requestText?.trim() ?? payload.prompt?.trim() ?? '';
     const hasPrompt = Boolean(payload.prompt?.trim());
     const state: InterceptedRequestState = {
       requestId,
       provider,
       url,
-      prompt: payload.prompt?.trim() ?? '',
+      prompt: requestText,
+      requestType,
       model: payload.model,
       modelConfidence: payload.modelConfidence,
       chatId: payload.chatId,
@@ -2782,11 +2884,11 @@ class CursorRemoteProbe {
       fallbackOutput: '',
       promptConfidence: hasPrompt ? 'exact' : 'none',
       didComplete: false,
-      didStartEvent: hasPrompt,
+      didStartEvent: hasPrompt || requestType !== 'primary',
     };
 
     this.activeRequests.set(requestId, state);
-    if (hasPrompt) {
+    if (hasPrompt || requestType !== 'primary') {
       this.writeEvent({
         phase: 'turn-start',
         role: this.options.role,
@@ -2795,6 +2897,7 @@ class CursorRemoteProbe {
         provider: state.provider,
         url: state.url,
         prompt: state.prompt,
+        requestType: state.requestType,
         model: state.model,
         modelConfidence: state.modelConfidence,
         chatId: state.chatId,
@@ -2836,6 +2939,7 @@ class CursorRemoteProbe {
       const event: InterceptedTurnChunk = {
         requestId,
         provider: state.provider,
+        requestType: state.requestType,
         kind: piece.kind,
         content: piece.content,
       };
@@ -2851,6 +2955,7 @@ class CursorRemoteProbe {
   private completeRequest(requestId: string): void {
     const state = this.activeRequests.get(requestId);
     if (!state || state.didComplete) {
+      this.responseStreams.delete(requestId);
       return;
     }
 
@@ -2865,6 +2970,7 @@ class CursorRemoteProbe {
         provider: state.provider,
         url: state.url,
         prompt: state.prompt,
+        requestType: state.requestType,
         model: state.model,
         modelConfidence: state.modelConfidence,
         chatId: state.chatId,
@@ -2882,6 +2988,7 @@ class CursorRemoteProbe {
       });
     }
     this.activeRequests.delete(requestId);
+    this.responseStreams.delete(requestId);
   }
 
   private createResponseObserver(
@@ -2892,6 +2999,7 @@ class CursorRemoteProbe {
     encoding: string,
     isStreaming = true
   ): DecodedChunkObserver {
+    this.ensureResponseStream(requestId, transport, url, contentType, isStreaming);
     return isStreaming
       ? this.createStreamingObserver(requestId, transport, url, encoding, contentType)
       : this.createBufferedObserver(requestId, transport, url, encoding, contentType);
@@ -2919,7 +3027,7 @@ class CursorRemoteProbe {
             this.appendResponsePiece(requestId, piece);
           }
         },
-        () => {
+        (reason) => {
           if (buffer.length > 0) {
             const extracted = this.extractConnectStreamingPieces(buffer, true);
             for (const piece of extracted.pieces) {
@@ -2927,14 +3035,7 @@ class CursorRemoteProbe {
             }
           }
 
-          this.writeDiagnostic({
-            phase: 'response-end',
-            requestId,
-            transport,
-            url,
-            role: this.options.role,
-            pid: process.pid,
-          });
+          this.writeResponseEndDiagnostic(requestId, reason);
           this.completeRequest(requestId);
         }
       );
@@ -2954,7 +3055,7 @@ class CursorRemoteProbe {
           this.appendResponsePiece(requestId, piece);
         }
       },
-      () => {
+      (reason) => {
         if (buffer) {
           const extracted = this.extractStreamingPieces(buffer, true);
           for (const piece of extracted.pieces) {
@@ -2962,14 +3063,7 @@ class CursorRemoteProbe {
           }
         }
 
-        this.writeDiagnostic({
-          phase: 'response-end',
-          requestId,
-          transport,
-          url,
-          role: this.options.role,
-          pid: process.pid,
-        });
+        this.writeResponseEndDiagnostic(requestId, reason);
         this.completeRequest(requestId);
       }
     );
@@ -2991,21 +3085,14 @@ class CursorRemoteProbe {
           this.writeResponseChunkDiagnostic(requestId, transport, url, contentType, chunk);
           chunks.push(chunk);
         },
-        () => {
+        (reason) => {
           const body = Buffer.concat(chunks);
           const pieces = this.extractResponsePiecesFromBody(body, contentType);
           for (const piece of pieces) {
             this.appendResponsePiece(requestId, piece);
           }
 
-          this.writeDiagnostic({
-            phase: 'response-end',
-            requestId,
-            transport,
-            url,
-            role: this.options.role,
-            pid: process.pid,
-          });
+          this.writeResponseEndDiagnostic(requestId, reason);
           this.completeRequest(requestId);
         }
       );
@@ -3019,20 +3106,13 @@ class CursorRemoteProbe {
         this.writeResponseChunkDiagnostic(requestId, transport, url, contentType, text);
         body += text;
       },
-      () => {
+      (reason) => {
         const pieces = this.extractResponsePieces(body);
         for (const piece of pieces) {
           this.appendResponsePiece(requestId, piece);
         }
 
-        this.writeDiagnostic({
-          phase: 'response-end',
-          requestId,
-          transport,
-          url,
-          role: this.options.role,
-          pid: process.pid,
-        });
+        this.writeResponseEndDiagnostic(requestId, reason);
         this.completeRequest(requestId);
       }
     );
@@ -3041,25 +3121,25 @@ class CursorRemoteProbe {
   private createBufferObserver(
     encoding: string,
     onBuffer: (chunk: Buffer) => void,
-    onFinished: () => void
+    onFinished: (reason: 'end' | 'close' | 'error') => void
   ): DecodedChunkObserver {
     let finished = false;
-    const finish = () => {
+    const finish = (reason: 'end' | 'close' | 'error') => {
       if (finished) {
         return;
       }
 
       finished = true;
-      onFinished();
+      onFinished(reason);
     };
 
     const normalizedEncoding = encoding.toLowerCase();
     if (!normalizedEncoding || normalizedEncoding === 'identity') {
       return {
         onData: onBuffer,
-        onEnd: finish,
-        onClose: finish,
-        onError: finish,
+        onEnd: () => finish('end'),
+        onClose: () => finish('close'),
+        onError: () => finish('error'),
       };
     }
 
@@ -3071,9 +3151,9 @@ class CursorRemoteProbe {
     inflate.on('data', (chunk: Buffer) => {
       onBuffer(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     });
-    inflate.on('end', finish);
-    inflate.on('close', finish);
-    inflate.on('error', finish);
+    inflate.on('end', () => finish('end'));
+    inflate.on('close', () => finish('close'));
+    inflate.on('error', () => finish('error'));
 
     return {
       onData: (chunk) => {
@@ -3087,7 +3167,7 @@ class CursorRemoteProbe {
       },
       onError: () => {
         inflate.destroy();
-        finish();
+        finish('error');
       },
     };
   }
@@ -3095,16 +3175,16 @@ class CursorRemoteProbe {
   private createDecodedObserver(
     encoding: string,
     onText: (text: string) => void,
-    onFinished: () => void
+    onFinished: (reason: 'end' | 'close' | 'error') => void
   ): DecodedChunkObserver {
     let finished = false;
-    const finish = () => {
+    const finish = (reason: 'end' | 'close' | 'error') => {
       if (finished) {
         return;
       }
 
       finished = true;
-      onFinished();
+      onFinished(reason);
     };
 
     const normalizedEncoding = encoding.toLowerCase();
@@ -3120,10 +3200,10 @@ class CursorRemoteProbe {
           if (remaining) {
             onText(remaining);
           }
-          finish();
+          finish('end');
         },
-        onClose: finish,
-        onError: finish,
+        onClose: () => finish('close'),
+        onError: () => finish('error'),
       };
     }
 
@@ -3135,9 +3215,9 @@ class CursorRemoteProbe {
     inflate.on('data', (chunk: Buffer) => {
       onText(chunk.toString('utf8'));
     });
-    inflate.on('end', finish);
-    inflate.on('close', finish);
-    inflate.on('error', finish);
+    inflate.on('end', () => finish('end'));
+    inflate.on('close', () => finish('close'));
+    inflate.on('error', () => finish('error'));
 
     return {
       onData: (chunk) => {
@@ -3151,7 +3231,7 @@ class CursorRemoteProbe {
       },
       onError: () => {
         inflate.destroy();
-        finish();
+        finish('error');
       },
     };
   }
@@ -3181,6 +3261,8 @@ class CursorRemoteProbe {
     const parsedCandidates = this.parseBodyCandidates(body, headers);
     const cursorProxy = this.parseCursorProxyMetadata(headers);
     const prompt = this.extractPromptFromCandidates(parsedCandidates);
+    const requestText = prompt ?? this.extractRequestTextFromCandidates(parsedCandidates)
+      ?? this.extractRequestTextFallback(body, headers);
     const bodyModel = this.findStringByKeys(parsedCandidates, [
       'model',
       'modelName',
@@ -3221,6 +3303,7 @@ class CursorRemoteProbe {
 
     return {
       prompt,
+      requestText,
       model: bodyModel ?? headerModel ?? urlModel,
       modelConfidence,
       chatId: chatId && chatId.trim().length <= 200 ? chatId.trim() : undefined,
@@ -3348,6 +3431,65 @@ class CursorRemoteProbe {
     return /agentservice\/run|chatservice|streamconversation|backgroundcomposer/i.test(url);
   }
 
+  private classifyRequest(
+    provider: string,
+    transport: string,
+    url: string,
+    headers: Record<string, string>,
+    payload: ParsedRequestPayload
+  ): InterceptedRequestType {
+    const normalizedUrl = url.toLowerCase();
+    const haystack = [
+      transport,
+      normalizedUrl,
+      payload.requestText,
+      payload.prompt,
+      ...Object.entries(headers).map(([key, value]) => `${key}:${value}`),
+    ]
+      .filter((value): value is string => typeof value === 'string' && value.length > 0)
+      .join(' ')
+      .toLowerCase();
+
+    if (
+      /\b(?:cpp|edit|edithistory|diff|rewrite|apply|patch|filesync)\b/.test(haystack)
+      || /\/(?:cpp|edit|diff|rewrite|apply)/.test(normalizedUrl)
+    ) {
+      return 'editor';
+    }
+
+    if (
+      /\b(?:backgroundcomposer|background|subagent|agentexec|lint|terminal|grep|search)\b/.test(haystack)
+      || /agentservice\/run/.test(normalizedUrl)
+    ) {
+      return 'subagent';
+    }
+
+    if (provider === 'Cursor' && !payload.prompt?.trim() && !this.isCursorTurnUrl(url)) {
+      return 'subagent';
+    }
+
+    return 'primary';
+  }
+
+  private shouldTrackRequest(
+    provider: string,
+    url: string,
+    requestType: InterceptedRequestType,
+    payload: ParsedRequestPayload
+  ): boolean {
+    const normalizedUrl = url.toLowerCase();
+    if (payload.prompt?.trim()) {
+      return true;
+    }
+
+    if (provider === 'Cursor') {
+      return requestType === 'editor'
+        || /chatservice|streamconversation|agentservice\/run|attachbackgroundcomposer/.test(normalizedUrl);
+    }
+
+    return requestType !== 'primary';
+  }
+
   private parseJsonCandidatesFromText(text: string): any[] {
     if (!text) {
       return [];
@@ -3407,6 +3549,54 @@ class CursorRemoteProbe {
     }
 
     return undefined;
+  }
+
+  private extractRequestTextFromCandidates(candidates: any[]): string | undefined {
+    for (const candidate of candidates) {
+      const text = this.findStringByKeys(candidate, [
+        'instructions',
+        'instruction',
+        'request',
+        'query',
+        'text',
+        'content',
+        'goal',
+        'task',
+        'message',
+        'userResponse',
+      ]);
+      if (text) {
+        return text;
+      }
+    }
+
+    return undefined;
+  }
+
+  private extractRequestTextFallback(
+    body: string | Buffer,
+    headers: Record<string, string>
+  ): string | undefined {
+    const contentType = headers['content-type'] ?? '';
+    if (/octet-stream/i.test(contentType)) {
+      return undefined;
+    }
+
+    const matches = this.extractPrintableBodyStrings(body)
+      .map((value) => value.trim())
+      .filter((value) =>
+        value
+        && !/^https?:\/\//i.test(value)
+        && !/^file:\/\//i.test(value)
+        && !/^[A-Za-z_+-]+\/[A-Za-z_+-]+(?:\/[A-Za-z_+-]+)?$/.test(value)
+      )
+      .slice(0, 8);
+
+    if (matches.length === 0) {
+      return undefined;
+    }
+
+    return matches.join('\n').slice(0, 4000);
   }
 
   private extractPrompt(parsed: any): string | undefined {
@@ -3604,6 +3794,27 @@ class CursorRemoteProbe {
       return [];
     }
 
+    if (value.type === 'content_block_delta' && value.delta) {
+      return this.compactPieces([
+        {
+          kind: value.delta?.type === 'thinking_delta' ? 'agent-thinking' : 'agent-output',
+          content: this.readTextLike(value.delta?.thinking ?? value.delta?.text ?? value.delta?.content),
+        },
+      ]);
+    }
+
+    if (Array.isArray(value.content)) {
+      const contentPieces = this.compactPieces(value.content.map((part: any) => ({
+        kind: part?.type === 'thinking' || part?.type === 'reasoning'
+          ? 'agent-thinking'
+          : 'agent-output',
+        content: this.readTextLike(part?.thinking ?? part?.text ?? part?.content ?? part),
+      })));
+      if (contentPieces.length > 0) {
+        return contentPieces;
+      }
+    }
+
     const envelope = this.getCaseEnvelope(value);
     if (envelope?.value && envelope.value !== value) {
       switch (envelope.caseName.toLowerCase()) {
@@ -3644,7 +3855,7 @@ class CursorRemoteProbe {
 
     if (value.delta || value.content || typeof value.completion === 'string') {
       return this.compactPieces([
-        { kind: 'agent-thinking', content: this.readTextLike(value.delta?.thinking) },
+        { kind: 'agent-thinking', content: this.readTextLike(value.delta?.thinking ?? value.delta?.reasoning) },
         { kind: 'agent-output', content: this.readTextLike(value.delta?.text) },
         { kind: 'agent-output', content: this.readTextLike(value.content) },
         { kind: 'agent-output', content: this.readTextLike(value.completion) },
@@ -3656,6 +3867,9 @@ class CursorRemoteProbe {
       for (const part of value.candidates[0].content.parts) {
         if (typeof part?.thought === 'string' && part.thought) {
           pieces.push({ kind: 'agent-thinking', content: part.thought });
+        }
+        if (typeof part?.thinking === 'string' && part.thinking) {
+          pieces.push({ kind: 'agent-thinking', content: part.thinking });
         }
         if (typeof part?.text === 'string' && part.text) {
           pieces.push({ kind: 'agent-output', content: part.text });
@@ -3672,8 +3886,10 @@ class CursorRemoteProbe {
       return this.compactPieces(value.output.flatMap((item: any) => {
         const content = Array.isArray(item?.content) ? item.content : [];
         return content.map((part: any) => ({
-          kind: part?.type === 'reasoning' ? 'agent-thinking' : 'agent-output',
-          content: this.readTextLike(part?.text ?? part?.content ?? part),
+          kind: part?.type === 'reasoning' || part?.type === 'thinking'
+            ? 'agent-thinking'
+            : 'agent-output',
+          content: this.readTextLike(part?.thinking ?? part?.text ?? part?.content ?? part),
         }));
       }));
     }
@@ -3725,6 +3941,9 @@ class CursorRemoteProbe {
         if (envelopeText) {
           return envelopeText;
         }
+      }
+      if (typeof (value as any).thinking === 'string') {
+        return (value as any).thinking;
       }
       if (typeof (value as any).text === 'string') {
         return (value as any).text;
@@ -5004,12 +5223,23 @@ class CursorRemoteProbe {
     contentType: string,
     chunk: string | Buffer
   ): void {
+    const { stats, chunkBytes } = this.recordResponseChunk(
+      requestId,
+      transport,
+      url,
+      contentType,
+      chunk
+    );
     this.writeDiagnostic({
       phase: 'response-chunk',
       requestId,
       transport,
       url,
       contentType,
+      chunkCount: stats.chunkCount,
+      chunkBytes,
+      totalBytes: stats.totalBytes,
+      sawDoneSignal: stats.sawDoneSignal,
       chunk: typeof chunk === 'string'
         ? chunk
         : this.serializeBodyForLog(chunk, contentType),
@@ -5041,6 +5271,103 @@ class CursorRemoteProbe {
 
     const hexPreview = buffer.subarray(0, 48).toString('hex');
     return hexPreview ? `hex:${hexPreview}` : undefined;
+  }
+
+  private ensureResponseStream(
+    requestId: string,
+    transport: string,
+    url: string,
+    contentType: string,
+    isStreaming: boolean
+  ): ResponseStreamStats {
+    const existing = this.responseStreams.get(requestId);
+    if (existing) {
+      if (!existing.transport && transport) {
+        existing.transport = transport;
+      }
+      if (!existing.url && url) {
+        existing.url = url;
+      }
+      if (!existing.contentType && contentType) {
+        existing.contentType = contentType;
+      }
+      return existing;
+    }
+
+    const stats: ResponseStreamStats = {
+      openedAt: Date.now(),
+      transport,
+      url,
+      contentType,
+      isStreaming,
+      chunkCount: 0,
+      totalBytes: 0,
+      sawDoneSignal: false,
+    };
+    this.responseStreams.set(requestId, stats);
+    this.writeDiagnostic({
+      phase: 'response-open',
+      requestId,
+      transport,
+      url,
+      contentType,
+      isStreaming,
+      role: this.options.role,
+      pid: process.pid,
+    });
+    return stats;
+  }
+
+  private recordResponseChunk(
+    requestId: string,
+    transport: string,
+    url: string,
+    contentType: string,
+    chunk: string | Buffer
+  ): { stats: ResponseStreamStats; chunkBytes: number } {
+    const stats = this.responseStreams.get(requestId)
+      ?? this.ensureResponseStream(requestId, transport, url, contentType, true);
+    const chunkBytes = Buffer.isBuffer(chunk)
+      ? chunk.length
+      : Buffer.byteLength(chunk, 'utf8');
+
+    stats.chunkCount += 1;
+    stats.totalBytes += chunkBytes;
+    if (!stats.sawDoneSignal && this.chunkContainsDoneSignal(chunk)) {
+      stats.sawDoneSignal = true;
+    }
+
+    return { stats, chunkBytes };
+  }
+
+  private writeResponseEndDiagnostic(
+    requestId: string,
+    closeReason: string
+  ): void {
+    const state = this.activeRequests.get(requestId);
+    const stats = this.responseStreams.get(requestId);
+    this.writeDiagnostic({
+      phase: 'response-end',
+      requestId,
+      transport: stats?.transport,
+      url: stats?.url ?? state?.url ?? '',
+      contentType: stats?.contentType,
+      isStreaming: stats?.isStreaming,
+      closeReason,
+      chunkCount: stats?.chunkCount ?? 0,
+      totalBytes: stats?.totalBytes ?? 0,
+      sawDoneSignal: stats?.sawDoneSignal ?? false,
+      durationMs: stats ? Date.now() - stats.openedAt : undefined,
+      role: this.options.role,
+      pid: process.pid,
+    });
+  }
+
+  private chunkContainsDoneSignal(chunk: string | Buffer): boolean {
+    const text = typeof chunk === 'string'
+      ? chunk
+      : chunk.toString('utf8');
+    return /\[DONE\]/.test(text);
   }
 
   private isLoopbackAddress(value: string | undefined): boolean {

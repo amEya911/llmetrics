@@ -7,7 +7,7 @@ import { promises as fs } from 'fs';
 import { StringDecoder } from 'string_decoder';
 import { promisify } from 'util';
 import * as vscode from 'vscode';
-import { ModelConfidence } from './types';
+import { InterceptedRequestType, ModelConfidence } from './types';
 
 const execFileAsync = promisify(execFile);
 const TARGET_ROLES = ['retrieval', 'always-local', 'agent-exec'] as const;
@@ -19,6 +19,7 @@ export interface CursorTurnStart {
   provider: string;
   url: string;
   prompt: string;
+  requestType: InterceptedRequestType;
   model?: string;
   modelConfidence: ModelConfidence;
   chatId?: string;
@@ -29,6 +30,7 @@ export interface CursorTurnStart {
 export interface CursorTurnChunk {
   requestId: string;
   provider: string;
+  requestType: InterceptedRequestType;
   kind: 'agent-thinking' | 'agent-output';
   content: string;
 }
@@ -38,6 +40,7 @@ export interface CursorTurnComplete {
   provider: string;
   url: string;
   prompt: string;
+  requestType: InterceptedRequestType;
   model?: string;
   modelConfidence: ModelConfidence;
   chatId?: string;
@@ -74,6 +77,7 @@ interface EventLogEnvelope {
   requestId?: string;
   url?: string;
   prompt?: string;
+  requestType?: InterceptedRequestType;
   model?: string;
   modelConfidence?: ModelConfidence;
   chatId?: string;
@@ -685,7 +689,7 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
     }
 
     if (payload.phase === 'turn-start') {
-      if (!payload.requestId || !payload.url || !payload.prompt || payload.startedAt === undefined) {
+      if (!payload.requestId || !payload.url || payload.startedAt === undefined) {
         return;
       }
 
@@ -693,7 +697,8 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
         requestId: payload.requestId,
         provider: payload.provider ?? 'Cursor',
         url: payload.url,
-        prompt: payload.prompt,
+        prompt: payload.prompt ?? '',
+        requestType: payload.requestType ?? 'primary',
         model: payload.model,
         modelConfidence: payload.modelConfidence ?? 'unknown',
         chatId: payload.chatId,
@@ -711,6 +716,7 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
       this._onTurnChunk.fire({
         requestId: payload.requestId,
         provider: payload.provider ?? 'Cursor',
+        requestType: payload.requestType ?? 'primary',
         kind: payload.kind,
         content: payload.content,
       });
@@ -718,7 +724,7 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
     }
 
     if (payload.phase === 'turn-complete') {
-      if (!payload.requestId || !payload.url || !payload.prompt || payload.startedAt === undefined || payload.completedAt === undefined) {
+      if (!payload.requestId || !payload.url || payload.startedAt === undefined || payload.completedAt === undefined) {
         return;
       }
 
@@ -726,7 +732,8 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
         requestId: payload.requestId,
         provider: payload.provider ?? 'Cursor',
         url: payload.url,
-        prompt: payload.prompt,
+        prompt: payload.prompt ?? '',
+        requestType: payload.requestType ?? 'primary',
         model: payload.model,
         modelConfidence: payload.modelConfidence ?? 'unknown',
         chatId: payload.chatId,

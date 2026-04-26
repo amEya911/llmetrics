@@ -76,6 +76,8 @@ export class CursorContextAnalyzer {
       }
       this.analyzeOutput([
         turn.blocks['agent-thinking'].content,
+        turn.blocks['agent-subagent'].content,
+        turn.blocks['agent-editor'].content,
         turn.blocks['agent-output'].content,
       ].join('\n'));
     }

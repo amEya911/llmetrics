@@ -194,6 +194,65 @@ export function getConversationWebviewHtml(
       align-items: stretch;
     }
 
+    .segment-breakdown {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .segment-bar {
+      display: flex;
+      overflow: hidden;
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .segment {
+      min-width: 6px;
+      height: 100%;
+    }
+
+    .segment.input { background: var(--blue); }
+    .segment.thinking { background: var(--green); }
+    .segment.subagent { background: var(--amber); }
+    .segment.editor { background: var(--red); }
+    .segment.output { background: #9ad6ff; }
+
+    .segment-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .segment-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--muted-strong);
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .segment-pill::before {
+      content: '';
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: currentColor;
+    }
+
+    .segment-pill.input { color: var(--blue); }
+    .segment-pill.thinking { color: var(--green); }
+    .segment-pill.subagent { color: var(--amber); }
+    .segment-pill.editor { color: var(--red); }
+    .segment-pill.output { color: #9ad6ff; }
+
     .live-title {
       margin-top: 12px;
       font-size: 30px;
@@ -820,6 +879,43 @@ export function getConversationWebviewHtml(
       return parts.filter(Boolean).join(' · ');
     }
 
+    function tokenSegments(metrics) {
+      return [
+        { key: 'input', label: 'Input', value: Math.round((metrics && metrics.inputTokens) || 0), tone: 'input' },
+        { key: 'thinking', label: 'Thinking', value: Math.round((metrics && metrics.thinkingTokens) || 0), tone: 'thinking' },
+        { key: 'subagent', label: 'Sub-agent', value: Math.round((metrics && metrics.subagentTokens) || 0), tone: 'subagent' },
+        { key: 'editor', label: 'Editor', value: Math.round((metrics && metrics.editorTokens) || 0), tone: 'editor' },
+        { key: 'output', label: 'Output', value: Math.round((metrics && metrics.outputTokens) || 0), tone: 'output' },
+      ].filter(function(segment) {
+        return segment.value > 0;
+      });
+    }
+
+    function renderTokenBreakdown(metrics) {
+      const segments = tokenSegments(metrics);
+      if (!segments.length) {
+        return '';
+      }
+
+      const total = segments.reduce(function(sum, segment) {
+        return sum + segment.value;
+      }, 0) || 1;
+
+      return ''
+        + '<div class="segment-breakdown">'
+        + '  <div class="segment-bar">'
+        +      segments.map(function(segment) {
+                 return '<div class="segment ' + escapeHtml(segment.tone) + '" style="width:' + ((segment.value / total) * 100).toFixed(2) + '%;"></div>';
+               }).join('')
+        + '  </div>'
+        + '  <div class="segment-legend">'
+        +      segments.map(function(segment) {
+                 return '<span class="segment-pill ' + escapeHtml(segment.tone) + '">' + escapeHtml(segment.label + ' ' + formatTokenCompact(segment.value)) + '</span>';
+               }).join('')
+        + '  </div>'
+        + '</div>';
+    }
+
     function toneForScore(score) {
       if ((score || 0) >= 85) {
         return 'green';
@@ -883,6 +979,9 @@ export function getConversationWebviewHtml(
         costUsd: 0,
         promptCount: 0,
         inputTokens: 0,
+        thinkingTokens: 0,
+        subagentTokens: 0,
+        editorTokens: 0,
         outputTokens: 0,
         historyTokens: 0,
         historyBloatRatio: 0,
@@ -934,14 +1033,23 @@ export function getConversationWebviewHtml(
         + '    <div class="hero-context">' + escapeHtml(compact([
                formatUsd(metrics.costUsd || 0),
                formatTokens(metrics.historyTokens || 0) + ' replayed',
-               formatTokens(metrics.outputTokens || 0) + ' output',
              ])) + '</div>'
+        +      renderTokenBreakdown(metrics)
         + '    <div class="progress"><div class="progress-fill" style="' + progressStyle(chat.contextUsagePercent || 0) + '"></div></div>'
         + '    <div class="mini-grid">'
-        +        renderMini('Prompts', String(metrics.promptCount || 0), compact([formatTokens(metrics.inputTokens || 0), formatUsd(metrics.costUsd || 0)]))
-        +        renderMini('Replay', formatPct((metrics.historyBloatRatio || 0) * 100), formatTokens(metrics.historyTokens || 0))
-        +        renderMini('Dead Context', contextHealth.deadReferences.length ? String(contextHealth.deadReferences.length) + ' refs' : '0 refs', contextHealth.deadReferences.length ? formatTokens(contextHealth.deadWeightTokensPerTurn || 0) + ' / turn' : 'No unused @ mentions detected')
+        +        renderMini('Input', formatTokenCompact(metrics.inputTokens || 0), 'user prompt')
+        +        renderMini('Thinking', formatTokenCompact(metrics.thinkingTokens || 0), 'model reasoning')
+        +        renderMini('Sub-agents', formatTokenCompact(metrics.subagentTokens || 0), 'background tasks')
+        +        renderMini('Editor', formatTokenCompact(metrics.editorTokens || 0), 'diff and apply')
+        +        renderMini('Output', formatTokenCompact(metrics.outputTokens || 0), 'final reply')
         + '    </div>'
+        + '    <div class="support-copy">' + escapeHtml(compact([
+               String(metrics.promptCount || 0) + ' prompts',
+               formatPct((metrics.historyBloatRatio || 0) * 100) + ' replay',
+               contextHealth.deadReferences.length
+                 ? formatTokens(contextHealth.deadWeightTokensPerTurn || 0) + ' dead context / turn'
+                 : 'No unused @ mentions detected',
+             ])) + '</div>'
         + '  </div>'
         + '</div>';
     }
@@ -990,15 +1098,25 @@ export function getConversationWebviewHtml(
           inputTokens: 0,
           historyTokens: 0,
           thinkingTokens: 0,
+          subagentTokens: 0,
+          editorTokens: 0,
           outputTokens: 0,
           inputCostUsd: 0,
           historyCostUsd: 0,
           thinkingCostUsd: 0,
+          subagentCostUsd: 0,
+          editorCostUsd: 0,
           outputCostUsd: 0,
           costUsd: 0,
         };
         const userPreview = summarizeText(turn.blocks['user-input'].content, 110) || 'Prompt captured';
-        const agentPreview = summarizeText(turn.blocks['agent-output'].content || turn.blocks['agent-thinking'].content, 110) || 'Waiting for response';
+        const agentPreview = summarizeText(
+          turn.blocks['agent-output'].content
+            || turn.blocks['agent-thinking'].content
+            || turn.blocks['agent-subagent'].content
+            || turn.blocks['agent-editor'].content,
+          110
+        ) || 'Waiting for response';
 
         return ''
           + '<div class="timeline-item">'
@@ -1020,10 +1138,13 @@ export function getConversationWebviewHtml(
           +        escapeHtml(compact([
                    metrics.outputTokens > 0 ? formatTokenCompact(metrics.outputTokens) + ' output' : 'Waiting',
                    metrics.thinkingTokens > 0 ? formatTokenCompact(metrics.thinkingTokens) + ' thinking' : '',
-                   formatUsd((metrics.outputCostUsd || 0) + (metrics.thinkingCostUsd || 0)),
+                   metrics.subagentTokens > 0 ? formatTokenCompact(metrics.subagentTokens) + ' sub-agent' : '',
+                   metrics.editorTokens > 0 ? formatTokenCompact(metrics.editorTokens) + ' editor' : '',
+                   formatUsd((metrics.outputCostUsd || 0) + (metrics.thinkingCostUsd || 0) + (metrics.subagentCostUsd || 0) + (metrics.editorCostUsd || 0)),
                  ]))
           + '    </div>'
           + '  </div>'
+          +      renderTokenBreakdown(metrics)
           + '  <button class="timeline-button" data-action="save-prompt" data-source-id="' + escapeHtml(chat.sourceId) + '" data-chat-id="' + escapeHtml(chat.id) + '" data-turn-id="' + escapeHtml(turn.id) + '">Save prompt</button>'
           + '</div>';
       }).join('') + '</div>';

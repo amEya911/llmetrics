@@ -12,6 +12,7 @@ import {
   readMergedSqliteKeyMap,
 } from './stateSqlite';
 import {
+  BLOCK_TYPES,
   BlockType,
   ConversationChat,
   ConversationCollection,
@@ -1042,6 +1043,14 @@ export class ConversationStoreWatcher implements vscode.Disposable {
           content: thinking,
           isStreaming: isAntigravityArtifactStreaming(thinkingArtifact),
         },
+        'agent-subagent': {
+          content: '',
+          isStreaming: false,
+        },
+        'agent-editor': {
+          content: '',
+          isStreaming: false,
+        },
         'agent-output': {
           content: output,
           isStreaming: isAntigravityArtifactStreaming(outputArtifact),
@@ -1079,6 +1088,14 @@ export class ConversationStoreWatcher implements vscode.Disposable {
           content: thinking,
           isStreaming: isRecentWrite && !output && Boolean(thinking),
         },
+        'agent-subagent': {
+          content: '',
+          isStreaming: false,
+        },
+        'agent-editor': {
+          content: '',
+          isStreaming: false,
+        },
         'agent-output': {
           content: output,
           isStreaming: isRecentWrite && Boolean(output),
@@ -1095,7 +1112,9 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     createdAt: number,
     updatedAt: number
   ): ConversationTurn {
-    const isComplete = Boolean(blocks['agent-output'].content);
+    const isComplete = BLOCK_TYPES
+      .filter((blockType) => blockType !== 'user-input')
+      .some((blockType) => Boolean(blocks[blockType].content.trim()));
 
     return {
       id: turnId,
