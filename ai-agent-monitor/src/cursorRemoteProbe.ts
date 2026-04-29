@@ -65,6 +65,8 @@ interface InterceptedTurnComplete {
 interface ParsedRequestPayload {
   prompt?: string;
   requestText?: string;
+  editorInputText?: string;
+  editorOutputText?: string;
   model?: string;
   modelConfidence: ModelConfidence;
   chatId?: string;
@@ -76,9 +78,17 @@ interface ResponsePiece {
   content: string;
 }
 
+type ResponsePieceKind = ResponsePiece['kind'];
+
+interface ContentBlockState {
+  kind: ResponsePieceKind;
+  closed: boolean;
+}
+
 interface InterceptedRequestState extends InterceptedTurnStart {
   thinking: string;
   output: string;
+  contentBlocks: Map<string, ContentBlockState>;
   fallbackOutput: string;
   promptConfidence: PromptCaptureConfidence;
   didComplete: boolean;
@@ -146,6 +156,12 @@ interface PendingCursorTurnSeed {
   observedAt: number;
 }
 
+interface PendingCursorCmdKContextSeed {
+  text: string;
+  observedAt: number;
+  relativePath?: string;
+}
+
 const GLOBAL_STATE_KEY = '__aiTokenAnalyticsCursorRemoteProbe';
 const WRAPPED_RESPONSE = Symbol('ai-token-analytics.cursor-remote.response');
 const WRAPPED_CLIENT_REQUEST = Symbol('ai-token-analytics.cursor-remote.client-request');
@@ -193,6 +209,7 @@ class CursorRemoteProbe {
   private readonly activeRequests = new Map<string, InterceptedRequestState>();
   private readonly responseStreams = new Map<string, ResponseStreamStats>();
   private readonly pendingCursorTurnSeeds = new Map<string, PendingCursorTurnSeed>();
+  private latestCursorCmdKContextSeed?: PendingCursorCmdKContextSeed;
   private readonly undiciCaptures = new WeakMap<object, UndiciRequestCapture>();
   private readonly prototypeClientRequestCaptures =
     new WeakMap<httpTypes.ClientRequest, PrototypeClientRequestCapture>();
@@ -264,6 +281,7 @@ class CursorRemoteProbe {
     this.subscribeUndiciDiagnostics();
     this.patchCursorConnectTransportProvider();
     this.tryWrapExistingCursorTransportCandidates();
+    this.installAlwaysLocalInternalTransportHooks();
 
     if (!this.undiciRequestCreateChannel) {
       this.patchFetch();
@@ -567,47 +585,29 @@ class CursorRemoteProbe {
         ownProperties: true,
         generatePreview: false,
       });
-      const bundleScopeObjectId = scopesProperties?.result?.result
-        ?.find((property: any) => property?.name === '1')
-        ?.value?.objectId;
-      if (!bundleScopeObjectId) {
-        throw new Error('Cursor always-local webpack scope was not available.');
-      }
+      const scopeEntries = scopesProperties?.result?.result ?? [];
+      let handlerClassObjectId: string | undefined;
+      for (const scopeEntry of scopeEntries) {
+        const scopeObjectId = scopeEntry?.value?.objectId;
+        if (!scopeObjectId) {
+          continue;
+        }
 
-      const bundleScopeProperties = await call('Runtime.getProperties', {
-        objectId: bundleScopeObjectId,
-        ownProperties: true,
-        generatePreview: false,
-      });
-      const internalRequireObjectId = bundleScopeProperties?.result?.result
-        ?.find((property: any) => property?.name === 'n')
-        ?.value?.objectId;
-      if (!internalRequireObjectId) {
-        throw new Error('Cursor always-local internal webpack require() was not available.');
+        const scopeProperties = await call('Runtime.getProperties', {
+          objectId: scopeObjectId,
+          ownProperties: true,
+          generatePreview: false,
+        });
+        const scopeResult = scopeProperties?.result?.result ?? [];
+        handlerClassObjectId = scopeResult
+          .find((property: any) => property?.name === 'iwt')
+          ?.value?.objectId;
+        if (handlerClassObjectId) {
+          break;
+        }
       }
-
-      const transportModule = await call('Runtime.callFunctionOn', {
-        objectId: internalRequireObjectId,
-        functionDeclaration: 'function(moduleId) { return this(moduleId); }',
-        arguments: [{ value: 2006 }],
-        returnByValue: false,
-        awaitPromise: true,
-      });
-      const transportModuleObjectId = transportModule?.result?.result?.objectId;
-      if (!transportModuleObjectId) {
-        throw new Error('Cursor always-local transport module 2006 was not reachable.');
-      }
-
-      const transportModuleProperties = await call('Runtime.getProperties', {
-        objectId: transportModuleObjectId,
-        ownProperties: true,
-        generatePreview: false,
-      });
-      const handlerClassObjectId = transportModuleProperties?.result?.result
-        ?.find((property: any) => property?.name === 'AiConnectTransportHandler')
-        ?.value?.objectId;
       if (!handlerClassObjectId) {
-        throw new Error('Cursor always-local AiConnectTransportHandler export was not reachable.');
+        throw new Error('Cursor always-local iwt transport handler class was not reachable.');
       }
 
       const handlerClassProperties = await call('Runtime.getProperties', {
@@ -747,6 +747,7 @@ class CursorRemoteProbe {
     source: string
   ): unknown {
     const invocation = this.describeCursorConnectInvocation(transport, kind, args, source);
+    this.rememberCursorCmdKContextSeed(invocation);
     this.rememberCursorTurnSeed(invocation);
     const shouldCapture = this.shouldCaptureCursorConnectInvocation(invocation);
     const interceptedRequestId = shouldCapture
@@ -834,12 +835,17 @@ class CursorRemoteProbe {
   private shouldCaptureCursorConnectInvocation(invocation: CursorConnectInvocation): boolean {
     const normalizedService = invocation.serviceName.toLowerCase();
     const normalizedMethod = invocation.methodName.toLowerCase();
+    if (this.isCursorCppEditHistoryStatusMethod(invocation.methodName)) {
+      return false;
+    }
+
     return normalizedService.includes('chatservice')
       || normalizedService.includes('agentservice')
       || (normalizedService.includes('backgroundcomposerservice') && !normalizedMethod.includes('list'))
       || normalizedService.includes('diff')
       || normalizedService.includes('edit')
       || normalizedService.includes('cpp')
+      || normalizedMethod.includes('cpp')
       || normalizedMethod.includes('streamunifiedchatwithtools')
       || normalizedMethod.includes('streamconversation')
       || normalizedMethod.includes('attachbackgroundcomposer')
@@ -855,6 +861,10 @@ class CursorRemoteProbe {
     invocation: CursorConnectInvocation,
     payload: ParsedRequestPayload
   ): InterceptedRequestType {
+    if (this.isCursorCppAppendMethod(invocation.methodName) || this.isCursorStreamCppMethod(invocation.methodName)) {
+      return 'editor';
+    }
+
     const haystack = [
       invocation.source,
       invocation.serviceName,
@@ -911,9 +921,12 @@ class CursorRemoteProbe {
     const requestId = this.createRequestId();
     const url = this.buildCursorConnectUrl(invocation);
     const requestType = this.classifyCursorConnectInvocation(invocation, payload);
-    const requestText = requestType === 'primary'
+    const requestText = this.normalizeCursorRequestText(requestType === 'primary'
       ? payload.prompt?.trim() ?? ''
-      : payload.requestText?.trim() ?? payload.prompt?.trim() ?? '';
+      : payload.editorInputText?.trim()
+        ?? payload.requestText?.trim()
+        ?? payload.prompt?.trim()
+        ?? '');
     const hasPrompt = Boolean(payload.prompt?.trim());
     const state: InterceptedRequestState = {
       requestId,
@@ -927,7 +940,8 @@ class CursorRemoteProbe {
       startedAt: Date.now(),
       isStreaming: true,
       thinking: '',
-      output: '',
+      output: payload.editorOutputText?.trim() ?? '',
+      contentBlocks: new Map(),
       fallbackOutput: '',
       promptConfidence: hasPrompt ? 'exact' : 'none',
       didComplete: false,
@@ -969,6 +983,30 @@ class CursorRemoteProbe {
         startedAt: state.startedAt,
         isStreaming: state.isStreaming,
       });
+      if (state.thinking) {
+        this.writeEvent({
+          phase: 'turn-chunk',
+          role: this.options.role,
+          pid: process.pid,
+          requestId: state.requestId,
+          provider: state.provider,
+          requestType: state.requestType,
+          kind: 'agent-thinking',
+          content: state.thinking,
+        });
+      }
+      if (state.output) {
+        this.writeEvent({
+          phase: 'turn-chunk',
+          role: this.options.role,
+          pid: process.pid,
+          requestId: state.requestId,
+          provider: state.provider,
+          requestType: state.requestType,
+          kind: 'agent-output',
+          content: state.output,
+        });
+      }
     } else {
       this.writeDiagnostic({
         phase: 'cursor-connect-request-no-prompt',
@@ -1019,6 +1057,46 @@ class CursorRemoteProbe {
       role: this.options.role,
       pid: process.pid,
     });
+  }
+
+  private rememberCursorCmdKContextSeed(invocation: CursorConnectInvocation): void {
+    const normalizedService = invocation.serviceName.toLowerCase();
+    const normalizedMethod = invocation.methodName.toLowerCase();
+    if (!normalizedService.includes('cmdkservice') || normalizedMethod !== 'rerankcmdkcontext') {
+      return;
+    }
+
+    const seed = this.extractCursorCmdKContextSeed(invocation.plainInput ?? invocation.input);
+    if (!seed) {
+      return;
+    }
+
+    this.latestCursorCmdKContextSeed = {
+      ...seed,
+      observedAt: Date.now(),
+    };
+
+    this.writeDiagnostic({
+      phase: 'cursor-editor-operation',
+      source: 'cmdk-context',
+      relativePath: seed.relativePath,
+      inputChars: seed.text.length,
+      role: this.options.role,
+      pid: process.pid,
+    });
+  }
+
+  private getRecentCursorCmdKContextSeed(): PendingCursorCmdKContextSeed | undefined {
+    const seed = this.latestCursorCmdKContextSeed;
+    if (!seed) {
+      return undefined;
+    }
+
+    if (Date.now() - seed.observedAt > 30 * 1000) {
+      return undefined;
+    }
+
+    return seed;
   }
 
   private consumeCursorTurnSeed(invocation: CursorConnectInvocation): PendingCursorTurnSeed | undefined {
@@ -1212,7 +1290,7 @@ class CursorRemoteProbe {
           serializedMessage
         );
         this.inspectCursorConnectStreamMessage(requestId, plainMessage);
-        const pieces = this.extractCursorConnectResponsePieces(plainMessage);
+        const pieces = this.extractCursorConnectResponsePieces(plainMessage, requestId);
         for (const piece of pieces) {
           this.appendResponsePiece(requestId, piece);
         }
@@ -1389,6 +1467,39 @@ class CursorRemoteProbe {
       const fallbackOutput = this.extractCursorAssistantFallbackFromStreamMessage(message);
       if (fallbackOutput) {
         state.fallbackOutput = fallbackOutput;
+      }
+    }
+
+    const cursorEditorMessage = this.extractCursorCmdKEditorMessage(message);
+    if (cursorEditorMessage) {
+      const previousRequestType = state.requestType;
+      if (state.requestType !== 'editor') {
+        state.requestType = 'editor';
+      }
+      if (!state.prompt.trim()) {
+        const cmdKContextSeed = this.getRecentCursorCmdKContextSeed();
+        if (cmdKContextSeed) {
+          state.prompt = cmdKContextSeed.text;
+          state.promptConfidence = 'strong';
+        }
+      }
+
+      if (cursorEditorMessage.stage !== 'delta' || previousRequestType !== 'editor') {
+        this.writeDiagnostic({
+          phase: 'cursor-editor-operation',
+          source: 'stream-cmdk',
+          requestId,
+          previousRequestType,
+          requestType: state.requestType,
+          stage: cursorEditorMessage.stage,
+          inputChars: state.prompt.length,
+          startLineNumber: cursorEditorMessage.startLineNumber,
+          maxEndLineNumberExclusive: cursorEditorMessage.maxEndLineNumberExclusive,
+          endLineNumberExclusive: cursorEditorMessage.endLineNumberExclusive,
+          outputChars: cursorEditorMessage.text?.length ?? 0,
+          role: this.options.role,
+          pid: process.pid,
+        });
       }
     }
 
@@ -1799,10 +1910,159 @@ class CursorRemoteProbe {
     return trimmed && trimmed.length <= 120 ? trimmed : undefined;
   }
 
+  private extractCursorCppAppendActivity(
+    methodName: string,
+    value: unknown
+  ): { editorInputText?: string; editorOutputText?: string } | undefined {
+    if (!this.isCursorCppAppendMethod(methodName)) {
+      return undefined;
+    }
+
+    const rawChanges = this.findBytesByKeys(value, ['changes']);
+    if (!rawChanges || rawChanges.length === 0) {
+      return undefined;
+    }
+
+    const decoded = this.decodeCursorEditHistoryAppendChanges(rawChanges);
+    const editorInputText = decoded.startingModelValue?.trim() || undefined;
+    const editorOutputText = decoded.changeTexts
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0)
+      .join('\n');
+
+    this.writeDiagnostic({
+      phase: 'cursor-editor-operation',
+      source: 'cpp-append',
+      methodName,
+      relativePath: decoded.relativePath,
+      uri: decoded.uri,
+      inputChars: editorInputText?.length ?? 0,
+      outputChars: editorOutputText.length,
+      changeCount: decoded.changeTexts.length,
+      role: this.options.role,
+      pid: process.pid,
+    });
+
+    return editorInputText || editorOutputText
+      ? {
+        editorInputText,
+        editorOutputText: editorOutputText || undefined,
+      }
+      : undefined;
+  }
+
+  private extractCursorCmdKEditorMessage(
+    value: unknown
+  ): {
+    stage: 'start' | 'delta' | 'end';
+    text?: string;
+    startLineNumber?: number;
+    maxEndLineNumberExclusive?: number;
+    endLineNumberExclusive?: number;
+  } | undefined {
+    if (!value || typeof value !== 'object') {
+      return undefined;
+    }
+
+    const realResponse = (value as Record<string, unknown>).realResponse;
+    if (!realResponse || typeof realResponse !== 'object') {
+      return undefined;
+    }
+
+    const editStart = (realResponse as Record<string, unknown>).editStart;
+    if (editStart && typeof editStart === 'object') {
+      return {
+        stage: 'start',
+        startLineNumber: this.asFiniteNumber((editStart as any).startLineNumber),
+        maxEndLineNumberExclusive: this.asFiniteNumber((editStart as any).maxEndLineNumberExclusive),
+      };
+    }
+
+    const editStream = (realResponse as Record<string, unknown>).editStream;
+    if (editStream !== undefined) {
+      const text = this.readTextLike((editStream as any)?.text ?? editStream);
+      return {
+        stage: 'delta',
+        text: text || undefined,
+      };
+    }
+
+    const editEnd = (realResponse as Record<string, unknown>).editEnd;
+    if (editEnd && typeof editEnd === 'object') {
+      return {
+        stage: 'end',
+        endLineNumberExclusive: this.asFiniteNumber((editEnd as any).endLineNumberExclusive),
+      };
+    }
+
+    return undefined;
+  }
+
+  private extractCursorCmdKContextSeed(
+    value: unknown
+  ): { text: string; relativePath?: string } | undefined {
+    if (!value || typeof value !== 'object') {
+      return undefined;
+    }
+
+    const contextItems = Array.isArray((value as any).contextItems)
+      ? (value as any).contextItems
+      : [];
+    let bestText = '';
+    let bestRelativePath: string | undefined;
+
+    for (const entry of contextItems) {
+      const immediateContext = entry?.contextItem?.cmdKImmediateContext
+        ?? entry?.cmdKImmediateContext
+        ?? entry?.contextItem?.cmdKCurrentFile
+        ?? entry?.cmdKCurrentFile;
+      if (!immediateContext || typeof immediateContext !== 'object') {
+        continue;
+      }
+
+      const lines = Array.isArray((immediateContext as any).lines)
+        ? (immediateContext as any).lines
+        : [];
+      const text = lines
+        .map((lineEntry: any) => typeof lineEntry?.line === 'string' ? lineEntry.line : '')
+        .join('\n')
+        .trim();
+      if (!text || text.length <= bestText.length) {
+        continue;
+      }
+
+      bestText = text;
+      bestRelativePath = typeof (immediateContext as any).relativeWorkspacePath === 'string'
+        ? (immediateContext as any).relativeWorkspacePath
+        : undefined;
+    }
+
+    return bestText
+      ? {
+        text: bestText,
+        relativePath: bestRelativePath,
+      }
+      : undefined;
+  }
+
+  private normalizeCursorRequestText(value: string): string {
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === '{}' || trimmed === '[]' || trimmed === 'null' || trimmed === 'undefined') {
+      return '';
+    }
+
+    return value;
+  }
+
   private parseCursorConnectPayload(invocation: CursorConnectInvocation): ParsedRequestPayload {
     const value = invocation.plainInput ?? invocation.input;
+    const cppAppendActivity = this.extractCursorCppAppendActivity(
+      invocation.methodName,
+      invocation.input
+    );
     const prompt = this.extractPromptFromCandidates([value]);
-    const requestText = prompt
+    const requestText = cppAppendActivity?.editorInputText
+      ?? prompt
       ?? this.extractRequestTextFromCandidates([value])
       ?? this.previewUnknown(value);
     const model = this.findStringByKeys(value, [
@@ -1836,6 +2096,8 @@ class CursorRemoteProbe {
     return {
       prompt,
       requestText,
+      editorInputText: cppAppendActivity?.editorInputText,
+      editorOutputText: cppAppendActivity?.editorOutputText,
       model,
       modelConfidence: model ? 'exact' : 'unknown',
       chatId: chatId && chatId.trim().length <= 200 ? chatId.trim() : undefined,
@@ -1856,10 +2118,20 @@ class CursorRemoteProbe {
     return `https://${host.replace(/\/+$/, '')}/${invocation.serviceName}/${invocation.methodName}`;
   }
 
-  private extractCursorConnectResponsePieces(value: unknown): ResponsePiece[] {
+  private extractCursorConnectResponsePieces(value: unknown, requestId?: string): ResponsePiece[] {
     const plainValue = this.coerceToPlainObject(value);
     if (!plainValue || typeof plainValue !== 'object') {
       return [];
+    }
+
+    const cursorEditorMessage = this.extractCursorCmdKEditorMessage(plainValue);
+    if (cursorEditorMessage) {
+      return this.compactPieces([
+        {
+          kind: 'agent-output',
+          content: cursorEditorMessage.text,
+        },
+      ]);
     }
 
     const interactionUpdate = (plainValue as Record<string, unknown>).interactionUpdate;
@@ -1887,7 +2159,7 @@ class CursorRemoteProbe {
         case 'done':
           return [];
         default: {
-          const nestedPieces = this.extractResponsePiecesFromJson(envelope.value);
+          const nestedPieces = this.extractResponsePiecesFromJson(envelope.value, requestId);
           if (nestedPieces.length > 0) {
             return nestedPieces;
           }
@@ -1895,7 +2167,7 @@ class CursorRemoteProbe {
       }
     }
 
-    return this.extractResponsePiecesFromJson(plainValue);
+    return this.extractResponsePiecesFromJson(plainValue, requestId);
   }
 
   private extractCursorInteractionUpdatePieces(value: unknown): ResponsePiece[] {
@@ -2696,7 +2968,7 @@ class CursorRemoteProbe {
     if (!isStreaming) {
       const body = Buffer.from(await response.arrayBuffer());
       this.writeResponseChunkDiagnostic(requestId, 'fetch', url, contentType, body);
-      const pieces = this.extractResponsePiecesFromBody(body, contentType);
+      const pieces = this.extractResponsePiecesFromBody(body, contentType, requestId);
       for (const piece of pieces) {
         this.appendResponsePiece(requestId, piece);
       }
@@ -2724,7 +2996,7 @@ class CursorRemoteProbe {
         const chunk = Buffer.from(value);
         this.writeResponseChunkDiagnostic(requestId, 'fetch', url, contentType, chunk);
         buffer = Buffer.concat([buffer, chunk]);
-        const extracted = this.extractConnectStreamingPieces(buffer, false);
+        const extracted = this.extractConnectStreamingPieces(buffer, false, requestId);
         buffer = extracted.remainder;
 
         for (const piece of extracted.pieces) {
@@ -2733,7 +3005,7 @@ class CursorRemoteProbe {
       }
 
       if (buffer.length > 0) {
-        const finalPieces = this.extractConnectStreamingPieces(buffer, true);
+        const finalPieces = this.extractConnectStreamingPieces(buffer, true, requestId);
         for (const piece of finalPieces.pieces) {
           this.appendResponsePiece(requestId, piece);
         }
@@ -2756,7 +3028,7 @@ class CursorRemoteProbe {
       const chunk = Buffer.from(value);
       this.writeResponseChunkDiagnostic(requestId, 'fetch', url, contentType, chunk);
       buffer += decoder.decode(value, { stream: true });
-      const extracted = this.extractStreamingPieces(buffer, false);
+      const extracted = this.extractStreamingPieces(buffer, false, requestId);
       buffer = extracted.remainder;
 
       for (const piece of extracted.pieces) {
@@ -2765,7 +3037,7 @@ class CursorRemoteProbe {
     }
 
     buffer += decoder.decode();
-    const finalPieces = this.extractStreamingPieces(buffer, true);
+    const finalPieces = this.extractStreamingPieces(buffer, true, requestId);
     for (const piece of finalPieces.pieces) {
       this.appendResponsePiece(requestId, piece);
     }
@@ -2843,6 +3115,7 @@ class CursorRemoteProbe {
     body: string | Buffer
   ): InterceptedRequestState | undefined {
     const payload = this.parseRequestPayload(body, url, headers);
+    const promptCandidate = this.resolveNetworkRequestPrompt(provider, url, payload);
     this.maybeUpdateCursorModelHintFromRequest(provider, url, body);
     this.writeDiagnostic({
       phase: 'request',
@@ -2852,7 +3125,7 @@ class CursorRemoteProbe {
       headers,
       body: this.serializeBodyForLog(body, headers['content-type'] ?? ''),
       bodyPreview: this.previewBody(body, headers['content-type'] ?? ''),
-      hasPrompt: Boolean(payload.prompt?.trim()),
+      hasPrompt: Boolean(promptCandidate.prompt),
       model: payload.model,
       chatId: payload.chatId,
       role: this.options.role,
@@ -2865,9 +3138,9 @@ class CursorRemoteProbe {
     }
     const requestId = this.createRequestId();
     const requestText = requestType === 'primary'
-      ? payload.prompt?.trim() ?? ''
-      : payload.requestText?.trim() ?? payload.prompt?.trim() ?? '';
-    const hasPrompt = Boolean(payload.prompt?.trim());
+      ? promptCandidate.prompt
+      : payload.requestText?.trim() ?? promptCandidate.prompt;
+    const hasPrompt = Boolean(promptCandidate.prompt);
     const state: InterceptedRequestState = {
       requestId,
       provider,
@@ -2881,14 +3154,16 @@ class CursorRemoteProbe {
       isStreaming: payload.isStreaming,
       thinking: '',
       output: '',
+      contentBlocks: new Map(),
       fallbackOutput: '',
-      promptConfidence: hasPrompt ? 'exact' : 'none',
+      promptConfidence: promptCandidate.confidence,
       didComplete: false,
-      didStartEvent: hasPrompt || requestType !== 'primary',
+      didStartEvent: requestType !== 'primary'
+        || (hasPrompt && this.isPromptReadyForEmission(promptCandidate.confidence)),
     };
 
     this.activeRequests.set(requestId, state);
-    if (hasPrompt || requestType !== 'primary') {
+    if (state.didStartEvent) {
       this.writeEvent({
         phase: 'turn-start',
         role: this.options.role,
@@ -3020,7 +3295,7 @@ class CursorRemoteProbe {
         (chunk) => {
           this.writeResponseChunkDiagnostic(requestId, transport, url, contentType, chunk);
           buffer = Buffer.concat([buffer, chunk]);
-          const extracted = this.extractConnectStreamingPieces(buffer, false);
+          const extracted = this.extractConnectStreamingPieces(buffer, false, requestId);
           buffer = extracted.remainder;
 
           for (const piece of extracted.pieces) {
@@ -3029,7 +3304,7 @@ class CursorRemoteProbe {
         },
         (reason) => {
           if (buffer.length > 0) {
-            const extracted = this.extractConnectStreamingPieces(buffer, true);
+            const extracted = this.extractConnectStreamingPieces(buffer, true, requestId);
             for (const piece of extracted.pieces) {
               this.appendResponsePiece(requestId, piece);
             }
@@ -3048,7 +3323,7 @@ class CursorRemoteProbe {
       (text) => {
         this.writeResponseChunkDiagnostic(requestId, transport, url, contentType, text);
         buffer += text;
-        const extracted = this.extractStreamingPieces(buffer, false);
+        const extracted = this.extractStreamingPieces(buffer, false, requestId);
         buffer = extracted.remainder;
 
         for (const piece of extracted.pieces) {
@@ -3057,7 +3332,7 @@ class CursorRemoteProbe {
       },
       (reason) => {
         if (buffer) {
-          const extracted = this.extractStreamingPieces(buffer, true);
+          const extracted = this.extractStreamingPieces(buffer, true, requestId);
           for (const piece of extracted.pieces) {
             this.appendResponsePiece(requestId, piece);
           }
@@ -3087,7 +3362,7 @@ class CursorRemoteProbe {
         },
         (reason) => {
           const body = Buffer.concat(chunks);
-          const pieces = this.extractResponsePiecesFromBody(body, contentType);
+          const pieces = this.extractResponsePiecesFromBody(body, contentType, requestId);
           for (const piece of pieces) {
             this.appendResponsePiece(requestId, piece);
           }
@@ -3107,7 +3382,7 @@ class CursorRemoteProbe {
         body += text;
       },
       (reason) => {
-        const pieces = this.extractResponsePieces(body);
+        const pieces = this.extractResponsePieces(body, requestId);
         for (const piece of pieces) {
           this.appendResponsePiece(requestId, piece);
         }
@@ -3260,7 +3535,8 @@ class CursorRemoteProbe {
   ): ParsedRequestPayload {
     const parsedCandidates = this.parseBodyCandidates(body, headers);
     const cursorProxy = this.parseCursorProxyMetadata(headers);
-    const prompt = this.extractPromptFromCandidates(parsedCandidates);
+    const prompt = this.extractPromptFromCandidates(parsedCandidates)
+      ?? this.extractCursorProtoPrompt(body, url, headers);
     const requestText = prompt ?? this.extractRequestTextFromCandidates(parsedCandidates)
       ?? this.extractRequestTextFallback(body, headers);
     const bodyModel = this.findStringByKeys(parsedCandidates, [
@@ -3427,8 +3703,94 @@ class CursorRemoteProbe {
     return text.match(/[\x20-\x7E]{4,}/g) ?? [];
   }
 
+  private resolveNetworkRequestPrompt(
+    provider: string,
+    url: string,
+    payload: ParsedRequestPayload
+  ): PromptExtractionResult {
+    const exactPrompt = payload.prompt?.trim();
+    if (exactPrompt) {
+      return {
+        prompt: exactPrompt,
+        confidence: 'exact',
+      };
+    }
+
+    const fallbackPrompt = payload.requestText?.trim();
+    if (provider === 'Cursor' && this.isCursorNameTabUrl(url) && fallbackPrompt) {
+      return {
+        prompt: fallbackPrompt,
+        confidence: 'strong',
+      };
+    }
+
+    return {
+      prompt: '',
+      confidence: 'none',
+    };
+  }
+
+  private extractCursorProtoPrompt(
+    body: string | Buffer,
+    url: string,
+    headers: Record<string, string>
+  ): string | undefined {
+    if (!this.isCursorNameTabUrl(url) || !this.isProtoContentType(headers['content-type'] ?? '')) {
+      return undefined;
+    }
+
+    const text = Buffer.isBuffer(body)
+      ? body.toString('utf8')
+      : body;
+    const lexicalPrompt = this.extractCursorLexicalText(text);
+    if (lexicalPrompt) {
+      return lexicalPrompt;
+    }
+
+    for (const candidate of this.extractPrintableBodyStrings(body)) {
+      const prompt = this.sanitizeCursorPromptText(candidate);
+      if (prompt && prompt !== 'default' && !prompt.startsWith('{')) {
+        return prompt;
+      }
+    }
+
+    return undefined;
+  }
+
+  private isProtoContentType(contentType: string): boolean {
+    return /application\/proto/i.test(contentType);
+  }
+
+  private isCursorNameTabUrl(url: string): boolean {
+    return /aiservice\/nametab/i.test(url);
+  }
+
+  private isCursorCppEditHistoryStatusUrl(url: string): boolean {
+    return /aiservice\/cppedithistorystatus/i.test(url);
+  }
+
+  private isCursorCppAppendUrl(url: string): boolean {
+    return /aiservice\/cppappend/i.test(url);
+  }
+
+  private isCursorStreamCppUrl(url: string): boolean {
+    return /aiservice\/streamcpp/i.test(url);
+  }
+
+  private isCursorCppEditHistoryStatusMethod(methodName: string): boolean {
+    return methodName.trim().toLowerCase() === 'cppedithistorystatus';
+  }
+
+  private isCursorCppAppendMethod(methodName: string): boolean {
+    return methodName.trim().toLowerCase() === 'cppappend';
+  }
+
+  private isCursorStreamCppMethod(methodName: string): boolean {
+    return methodName.trim().toLowerCase() === 'streamcpp';
+  }
+
   private isCursorTurnUrl(url: string): boolean {
-    return /agentservice\/run|chatservice|streamconversation|backgroundcomposer/i.test(url);
+    return /agentservice\/run|chatservice|streamconversation|backgroundcomposer|aiservice\/nametab/i.test(url);
   }
 
   private classifyRequest(
@@ -3438,6 +3800,10 @@ class CursorRemoteProbe {
     headers: Record<string, string>,
     payload: ParsedRequestPayload
   ): InterceptedRequestType {
+    if (provider === 'Cursor' && this.isCursorStreamCppUrl(url)) {
+      return 'editor';
+    }
+
     const normalizedUrl = url.toLowerCase();
     const haystack = [
       transport,
@@ -3464,7 +3830,16 @@ class CursorRemoteProbe {
       return 'subagent';
     }
 
-    if (provider === 'Cursor' && !payload.prompt?.trim() && !this.isCursorTurnUrl(url)) {
+    if (provider === 'Cursor' && this.isCursorNameTabUrl(url)) {
+      return 'primary';
+    }
+
+    if (
+      provider === 'Cursor'
+      && !payload.prompt?.trim()
+      && !payload.requestText?.trim()
+      && !this.isCursorTurnUrl(url)
+    ) {
       return 'subagent';
     }
 
@@ -3483,8 +3858,12 @@ class CursorRemoteProbe {
     }
 
     if (provider === 'Cursor') {
+      if (this.isCursorCppEditHistoryStatusUrl(url) || this.isCursorCppAppendUrl(url)) {
+        return false;
+      }
+
       return requestType === 'editor'
-        || /chatservice|streamconversation|agentservice\/run|attachbackgroundcomposer/.test(normalizedUrl);
+        || /chatservice|streamconversation|agentservice\/run|attachbackgroundcomposer|aiservice\/nametab/.test(normalizedUrl);
     }
 
     return requestType !== 'primary';
@@ -3698,7 +4077,8 @@ class CursorRemoteProbe {
 
   private extractStreamingPieces(
     buffer: string,
-    flush: boolean
+    flush: boolean,
+    requestId?: string
   ): { pieces: ResponsePiece[]; remainder: string } {
     const normalized = buffer.replace(/\r\n/g, '\n');
     const lines = normalized.split('\n');
@@ -3711,43 +4091,45 @@ class CursorRemoteProbe {
         continue;
       }
 
-      pieces.push(...this.parseStreamingLine(line));
+      pieces.push(...this.parseStreamingLine(line, requestId));
     }
 
     if (flush && remainder.trim()) {
-      pieces.push(...this.parseStreamingLine(remainder.trim()));
+      pieces.push(...this.parseStreamingLine(remainder.trim(), requestId));
     }
 
     return { pieces, remainder };
   }
 
-  private parseStreamingLine(line: string): ResponsePiece[] {
+  private parseStreamingLine(line: string, requestId?: string): ResponsePiece[] {
     if (line === '[DONE]' || line === 'data: [DONE]') {
       return [];
     }
 
     if (line.startsWith('data:')) {
-      return this.extractResponsePieces(line.slice(5).trim());
+      return this.extractResponsePieces(line.slice(5).trim(), requestId);
     }
 
-    return this.extractResponsePieces(line);
+    return this.extractResponsePieces(line, requestId);
   }
 
   private extractResponsePiecesFromBody(
     body: Buffer,
-    contentType: string
+    contentType: string,
+    requestId?: string
   ): ResponsePiece[] {
     if (this.isConnectJsonContentType(contentType)) {
       return this.extractConnectJsonPayloadTexts(body)
-        .flatMap((payload) => this.extractResponsePieces(payload));
+        .flatMap((payload) => this.extractResponsePieces(payload, requestId));
     }
 
-    return this.extractResponsePieces(body.toString('utf8'));
+    return this.extractResponsePieces(body.toString('utf8'), requestId);
   }
 
   private extractConnectStreamingPieces(
     buffer: Buffer,
-    flush: boolean
+    flush: boolean,
+    requestId?: string
   ): { pieces: ResponsePiece[]; remainder: Buffer } {
     const pieces: ResponsePiece[] = [];
     let offset = 0;
@@ -3766,7 +4148,7 @@ class CursorRemoteProbe {
         continue;
       }
 
-      pieces.push(...this.extractResponsePieces(payload.toString('utf8')));
+      pieces.push(...this.extractResponsePieces(payload.toString('utf8'), requestId));
     }
 
     return {
@@ -3775,7 +4157,7 @@ class CursorRemoteProbe {
     };
   }
 
-  private extractResponsePieces(raw: string): ResponsePiece[] {
+  private extractResponsePieces(raw: string, requestId?: string): ResponsePiece[] {
     const trimmed = raw.trim();
     if (!trimmed || trimmed === '[DONE]') {
       return [];
@@ -3783,24 +4165,47 @@ class CursorRemoteProbe {
 
     try {
       const parsed = JSON.parse(trimmed);
-      return this.extractResponsePiecesFromJson(parsed);
+      return this.extractResponsePiecesFromJson(parsed, requestId);
     } catch {
       return [{ kind: 'agent-output', content: raw }];
     }
   }
 
-  private extractResponsePiecesFromJson(value: any): ResponsePiece[] {
+  private extractResponsePiecesFromJson(value: any, requestId?: string): ResponsePiece[] {
     if (!value || typeof value !== 'object') {
       return [];
     }
 
+    const state = requestId ? this.activeRequests.get(requestId) : undefined;
+
+    if (value.type === 'content_block_start' && value.content_block && state) {
+      const blockId = this.contentBlockId(value);
+      state.contentBlocks.set(blockId, {
+        kind: this.kindForContentBlock(value.content_block),
+        closed: false,
+      });
+      return [];
+    }
+
     if (value.type === 'content_block_delta' && value.delta) {
+      const blockId = this.contentBlockId(value);
+      const blockState = state?.contentBlocks.get(blockId);
+      const deltaKind = this.kindForContentBlock(value.delta);
       return this.compactPieces([
         {
-          kind: value.delta?.type === 'thinking_delta' ? 'agent-thinking' : 'agent-output',
+          kind: blockState?.kind ?? deltaKind,
           content: this.readTextLike(value.delta?.thinking ?? value.delta?.text ?? value.delta?.content),
         },
       ]);
+    }
+
+    if (this.isContentBlockStop(value) && state) {
+      const blockId = this.contentBlockId(value);
+      const blockState = state.contentBlocks.get(blockId);
+      if (blockState) {
+        blockState.closed = true;
+      }
+      return [];
     }
 
     if (Array.isArray(value.content)) {
@@ -3835,7 +4240,7 @@ class CursorRemoteProbe {
         case 'done':
           return [];
         default: {
-          const nested = this.extractResponsePiecesFromJson(envelope.value);
+          const nested = this.extractResponsePiecesFromJson(envelope.value, requestId);
           if (nested.length > 0) {
             return nested;
           }
@@ -3895,7 +4300,7 @@ class CursorRemoteProbe {
     }
 
     if (value.response?.output) {
-      return this.extractResponsePiecesFromJson({ output: value.response.output });
+      return this.extractResponsePiecesFromJson({ output: value.response.output }, requestId);
     }
 
     return this.compactPieces([
@@ -3904,7 +4309,40 @@ class CursorRemoteProbe {
       { kind: 'agent-output', content: this.readTextLike(value.output) },
       { kind: 'agent-output', content: this.readTextLike(value.result) },
       { kind: 'agent-output', content: this.readTextLike(value.generated_text) },
+      { kind: 'agent-output', content: this.readTextLike(value.generatedText) },
+      { kind: 'agent-output', content: this.readTextLike(value.insertedText) },
+      { kind: 'agent-output', content: this.readTextLike(value.replacementText) },
+      { kind: 'agent-output', content: this.readTextLike(value.patch) },
+      { kind: 'agent-output', content: this.readTextLike(value.diff) },
+      { kind: 'agent-output', content: this.readTextLike(value.edits) },
     ]);
+  }
+
+  private contentBlockId(value: any): string {
+    const index = value?.index ?? value?.content_block?.index ?? value?.block?.index ?? value?.id;
+    return index === undefined || index === null ? '0' : String(index);
+  }
+
+  private kindForContentBlock(value: any): ResponsePieceKind {
+    const type = String(value?.type ?? value?.blockType ?? value?.kind ?? '').toLowerCase();
+    if (
+      type.includes('thinking')
+      || type.includes('reasoning')
+      || type.includes('thought')
+      || value?.thinking !== undefined
+      || value?.reasoning !== undefined
+    ) {
+      return 'agent-thinking';
+    }
+
+    return 'agent-output';
+  }
+
+  private isContentBlockStop(value: any): boolean {
+    const type = String(value?.type ?? '').toLowerCase();
+    return type === 'content_block_stop'
+      || type === 'content_block_end'
+      || type === 'content_block_done';
   }
 
   private compactPieces(
@@ -3960,6 +4398,53 @@ class CursorRemoteProbe {
     }
 
     return '';
+  }
+
+  private asFiniteNumber(value: unknown): number | undefined {
+    return typeof value === 'number' && Number.isFinite(value)
+      ? value
+      : undefined;
+  }
+
+  private findBytesByKeys(
+    value: unknown,
+    keys: string[],
+    depth = 0
+  ): Uint8Array | undefined {
+    if (!value || depth > 5) {
+      return undefined;
+    }
+
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        const nested = this.findBytesByKeys(entry, keys, depth + 1);
+        if (nested) {
+          return nested;
+        }
+      }
+      return undefined;
+    }
+
+    if (typeof value !== 'object') {
+      return undefined;
+    }
+
+    for (const key of keys) {
+      const candidate = (value as Record<string, unknown>)[key];
+      const bytes = this.coerceToUint8Array(candidate);
+      if (bytes && bytes.length > 0) {
+        return bytes;
+      }
+    }
+
+    for (const nested of Object.values(value as Record<string, unknown>)) {
+      const result = this.findBytesByKeys(nested, keys, depth + 1);
+      if (result) {
+        return result;
+      }
+    }
+
+    return undefined;
   }
 
   private getCaseEnvelope(
@@ -4026,6 +4511,193 @@ class CursorRemoteProbe {
     }
 
     return undefined;
+  }
+
+  private coerceToUint8Array(value: unknown): Uint8Array | undefined {
+    if (!value) {
+      return undefined;
+    }
+
+    if (value instanceof Uint8Array) {
+      return value;
+    }
+
+    if (Buffer.isBuffer(value)) {
+      return new Uint8Array(value);
+    }
+
+    if (ArrayBuffer.isView(value)) {
+      return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    }
+
+    if (value instanceof ArrayBuffer) {
+      return new Uint8Array(value);
+    }
+
+    if (typeof value === 'string') {
+      try {
+        return new Uint8Array(Buffer.from(value, 'base64'));
+      } catch {
+        return undefined;
+      }
+    }
+
+    return undefined;
+  }
+
+  private decodeCursorEditHistoryAppendChanges(buffer: Uint8Array): {
+    startingModelValue?: string;
+    relativePath?: string;
+    uri?: string;
+    changeTexts: string[];
+  } {
+    let startingModelValue: string | undefined;
+    let relativePath: string | undefined;
+    let uri: string | undefined;
+    const changeTexts: string[] = [];
+
+    this.walkProtoMessage(buffer, (fieldNumber, wireType, value) => {
+      if (wireType !== 2 || !(value instanceof Uint8Array)) {
+        return;
+      }
+
+      if (fieldNumber === 3) {
+        startingModelValue = this.safeUtf8(value);
+        return;
+      }
+
+      if (fieldNumber === 5) {
+        relativePath = this.safeUtf8(value);
+        return;
+      }
+
+      if (fieldNumber === 14) {
+        uri = this.safeUtf8(value);
+        return;
+      }
+
+      if (fieldNumber === 4) {
+        const text = this.decodeCursorModelChangeText(value);
+        if (text) {
+          changeTexts.push(text);
+        }
+      }
+    });
+
+    return {
+      startingModelValue,
+      relativePath,
+      uri,
+      changeTexts,
+    };
+  }
+
+  private decodeCursorModelChangeText(buffer: Uint8Array): string | undefined {
+    let text: string | undefined;
+
+    this.walkProtoMessage(buffer, (fieldNumber, wireType, value) => {
+      if (text || fieldNumber !== 1 || wireType !== 2 || !(value instanceof Uint8Array)) {
+        return;
+      }
+
+      text = this.safeUtf8(value);
+    });
+
+    return text?.trim() ? text : undefined;
+  }
+
+  private walkProtoMessage(
+    buffer: Uint8Array,
+    visitor: (fieldNumber: number, wireType: number, value: number | bigint | Uint8Array) => void
+  ): void {
+    let offset = 0;
+    while (offset < buffer.length) {
+      const tag = this.readProtoVarint(buffer, offset);
+      if (!tag) {
+        break;
+      }
+      offset = tag.nextOffset;
+      const fieldNumber = Number(tag.value >> 3n);
+      const wireType = Number(tag.value & 7n);
+
+      switch (wireType) {
+        case 0: {
+          const value = this.readProtoVarint(buffer, offset);
+          if (!value) {
+            return;
+          }
+          offset = value.nextOffset;
+          visitor(fieldNumber, wireType, value.value);
+          break;
+        }
+        case 1: {
+          if (offset + 8 > buffer.length) {
+            return;
+          }
+          offset += 8;
+          break;
+        }
+        case 2: {
+          const length = this.readProtoVarint(buffer, offset);
+          if (!length) {
+            return;
+          }
+          offset = length.nextOffset;
+          const size = Number(length.value);
+          if (!Number.isFinite(size) || size < 0 || offset + size > buffer.length) {
+            return;
+          }
+          const value = buffer.subarray(offset, offset + size);
+          offset += size;
+          visitor(fieldNumber, wireType, value);
+          break;
+        }
+        case 5: {
+          if (offset + 4 > buffer.length) {
+            return;
+          }
+          offset += 4;
+          break;
+        }
+        default:
+          return;
+      }
+    }
+  }
+
+  private readProtoVarint(
+    buffer: Uint8Array,
+    startOffset: number
+  ): { value: bigint; nextOffset: number } | undefined {
+    let offset = startOffset;
+    let shift = 0n;
+    let value = 0n;
+
+    while (offset < buffer.length) {
+      const byte = BigInt(buffer[offset]);
+      value |= (byte & 0x7fn) << shift;
+      offset += 1;
+      if ((byte & 0x80n) === 0n) {
+        return {
+          value,
+          nextOffset: offset,
+        };
+      }
+      shift += 7n;
+      if (shift > 63n) {
+        return undefined;
+      }
+    }
+
+    return undefined;
+  }
+
+  private safeUtf8(value: Uint8Array): string {
+    try {
+      return Buffer.from(value).toString('utf8');
+    } catch {
+      return '';
+    }
   }
 
   private isConnectTransport(value: unknown): value is {

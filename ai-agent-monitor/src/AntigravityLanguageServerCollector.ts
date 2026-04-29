@@ -1,6 +1,7 @@
 import * as http2 from 'http2';
 import { execFile as execFileCallback } from 'child_process';
 import { promises as fs } from 'fs';
+import * as fsSync from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { promisify } from 'util';
@@ -15,6 +16,12 @@ const STREAM_AGENT_STATE_UPDATES_PATH = '/exa.language_server_pb.LanguageServerS
 const DISCOVERY_INTERVAL_MS = 2_000;
 const SEARCH_INTERVAL_MS = 3_000;
 const STREAM_RETRY_MS = 3_000;
+const STREAM_STARTUP_STALL_MS = 4_000;
+const BRAIN_COMPLETION_GRACE_MS = 30_000;
+const BRAIN_IDLE_AUTOCOMPLETE_MS = 15_000;
+const BRAIN_LIVE_DISCOVERY_MAX_AGE_MS = 10 * 60 * 1000;
+const MAX_ACTIVE_STREAM_TARGETS = 12;
+const MAX_BRAIN_DISCOVERY_CONVERSATIONS = 12;
 const CONNECT_END_STREAM_FLAG = 0x02;
 const PS_OUTPUT_MAX_BUFFER = 4 * 1024 * 1024;
 
@@ -29,8 +36,9 @@ interface CollectorOptions {
 interface LanguageServerClientInfo {
   csrfToken: string;
   port: number;
-  source: 'runtime' | 'logs' | 'process-log';
+  source: 'runtime' | 'process' | 'logs' | 'process-log';
   discoveredAt: number;
+  processId?: number;
 }
 
 interface SearchConversationsResponse {
@@ -58,6 +66,7 @@ interface ActiveRunState {
   executionId: string;
   prompt?: string;
   promptStartedAt?: number;
+  promptStepIndex?: number;
   lastUpdatedAt?: number;
   thinking?: string;
   subagent?: string;
@@ -71,8 +80,36 @@ interface ActiveRunState {
   contextWindowTokens?: number;
   startedEmitted: boolean;
   completed: boolean;
+  completionRequestedAt?: number;
   capturedTokenUsage: Required<Pick<CapturedTokenUsage, 'thinkingTokens' | 'subagentTokens' | 'editorTokens' | 'outputTokens'>>;
-  countedStepKeys: Set<string>;
+  stepTokenContributions: Map<string, StepTokenContribution>;
+}
+
+interface StepTokenContribution {
+  thinkingTokens: number;
+  subagentTokens: number;
+  editorTokens: number;
+  outputTokens: number;
+}
+
+interface BrainFallbackSnapshot {
+  prompt?: string;
+  promptStartedAt?: number;
+  promptStepIndex?: number;
+  thinking?: string;
+  editor?: string;
+  output?: string;
+  updatedAt?: number;
+}
+
+interface OverviewLogEntry {
+  stepIndex?: number;
+  source?: string;
+  type?: string;
+  status?: string;
+  createdAt?: number;
+  content?: string;
+  toolCalls: Array<{ name?: string; args?: Record<string, unknown> }>;
 }
 
 interface StreamState {
@@ -81,6 +118,9 @@ interface StreamState {
   request: http2.ClientHttp2Stream;
   buffer: Buffer;
   receivedData: boolean;
+  openedAt: number;
+  closed: boolean;
+  finish: (error?: unknown) => void;
 }
 
 interface LogCandidate {
@@ -88,12 +128,14 @@ interface LogCandidate {
   port: number;
   discoveredAt: number;
   source?: 'logs' | 'process-log';
+  processId?: number;
 }
 
 interface ProcessCandidate {
   pid: number;
   csrfToken: string;
   discoveredAt: number;
+  port?: number;
 }
 
 export interface AntigravityConversationSummaryEvent {
@@ -213,6 +255,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
     }
 
     const now = Date.now();
+    this.closeSilentStreams(now);
 
     if (!this.clientInfo && !this.discoveryInFlight) {
       this.discoveryInFlight = true;
@@ -231,6 +274,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
     }
 
     if (!this.clientInfo || this.searchInFlight || now - this.lastSearchAt < SEARCH_INTERVAL_MS) {
+      await this.syncBrainFallbacks();
       return;
     }
 
@@ -240,19 +284,24 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
     } finally {
       this.searchInFlight = false;
     }
+
+    await this.syncBrainFallbacks();
+  }
+
+  private closeSilentStreams(now = Date.now()): void {
+    for (const stream of this.activeStreams.values()) {
+      if (stream.closed || stream.receivedData || now - stream.openedAt < STREAM_STARTUP_STALL_MS) {
+        continue;
+      }
+
+      this.output.appendLine(
+        `[antigravity-ls] Stream for ${stream.conversationId} produced no data after ${Math.round((now - stream.openedAt) / 1000)}s; retrying.`
+      );
+      stream.finish();
+    }
   }
 
   private async validateOrRediscoverClientInfo(): Promise<void> {
-    if (this.clientInfo) {
-      try {
-        await this.requestJson(HEARTBEAT_PATH, {});
-        this.lastDiscoveryAt = Date.now();
-        return;
-      } catch {
-        this.clientInfo = undefined;
-      }
-    }
-
     await this.discoverClientInfo();
   }
 
@@ -287,7 +336,22 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       candidates.push(runtimeCandidate);
     }
 
-    const logCandidates = await this.readLogCandidates();
+    const processCandidates = await this.readProcessCandidates();
+    for (const candidate of processCandidates.values()) {
+      if (!candidate.port) {
+        continue;
+      }
+
+      candidates.push({
+        csrfToken: candidate.csrfToken,
+        port: candidate.port,
+        source: 'process',
+        discoveredAt: candidate.discoveredAt,
+        processId: candidate.pid,
+      });
+    }
+
+    const logCandidates = await this.readLogCandidates(processCandidates);
     for (const candidate of logCandidates) {
       candidates.push({
         ...candidate,
@@ -295,13 +359,57 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       });
     }
 
+    if (this.clientInfo) {
+      candidates.push(this.clientInfo);
+    }
+
     const deduped = new Map<string, LanguageServerClientInfo>();
     for (const candidate of candidates) {
-      deduped.set(`${candidate.port}:${candidate.csrfToken}`, candidate);
+      const key = `${candidate.port}:${candidate.csrfToken}`;
+      const existing = deduped.get(key);
+      if (!existing || this.compareClientCandidates(candidate, existing) < 0) {
+        deduped.set(key, candidate);
+      }
     }
 
     return [...deduped.values()]
-      .sort((left, right) => right.discoveredAt - left.discoveredAt);
+      .sort((left, right) => this.compareClientCandidates(left, right));
+  }
+
+  private compareClientCandidates(
+    left: LanguageServerClientInfo,
+    right: LanguageServerClientInfo
+  ): number {
+    const sourceDelta = this.clientCandidatePriority(right.source) - this.clientCandidatePriority(left.source);
+    if (sourceDelta !== 0) {
+      return sourceDelta;
+    }
+
+    const discoveryDelta = right.discoveredAt - left.discoveredAt;
+    if (discoveryDelta !== 0) {
+      return discoveryDelta;
+    }
+
+    const processDelta = (right.processId ?? 0) - (left.processId ?? 0);
+    if (processDelta !== 0) {
+      return processDelta;
+    }
+
+    return right.port - left.port;
+  }
+
+  private clientCandidatePriority(source: LanguageServerClientInfo['source']): number {
+    switch (source) {
+      case 'runtime':
+        return 4;
+      case 'process':
+        return 3;
+      case 'process-log':
+        return 2;
+      case 'logs':
+      default:
+        return 1;
+    }
   }
 
   private readRuntimeClientCandidate(): LanguageServerClientInfo | undefined {
@@ -356,7 +464,9 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
     return undefined;
   }
 
-  private async readLogCandidates(): Promise<LogCandidate[]> {
+  private async readLogCandidates(
+    processCandidates?: Map<number, ProcessCandidate>
+  ): Promise<LogCandidate[]> {
     const roots = [
       path.join(os.homedir(), 'Library', 'Application Support', 'Antigravity', 'logs'),
       path.join(os.homedir(), 'Library', 'Application Support', 'Anti-Gravity', 'logs'),
@@ -364,7 +474,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       path.join(os.homedir(), '.config', 'Anti-Gravity', 'logs'),
     ];
 
-    const processCandidates = await this.readProcessCandidates();
+    const indexedProcessCandidates = processCandidates ?? await this.readProcessCandidates();
     const candidates: LogCandidate[] = [];
     for (const root of roots) {
       let entries: string[];
@@ -379,7 +489,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
         const exthostPath = path.join(root, entry, 'window1', 'exthost', 'google.antigravity', 'Antigravity.log');
 
         candidates.push(...await this.readLsMainCandidates(lsMainPath));
-        candidates.push(...await this.readExthostCandidates(exthostPath, processCandidates));
+        candidates.push(...await this.readExthostCandidates(exthostPath, indexedProcessCandidates));
       }
     }
 
@@ -407,6 +517,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
         }
 
         const csrfToken = command.match(/--csrf_token\s+([a-f0-9-]+)/i)?.[1];
+        const port = command.match(/--https_server_port\s+(\d+)/i)?.[1];
         if (!csrfToken) {
           continue;
         }
@@ -415,6 +526,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
           pid,
           csrfToken,
           discoveredAt: now,
+          port: port ? Number(port) : undefined,
         });
       }
 
@@ -485,6 +597,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
         port,
         discoveredAt: Math.max(stats.mtimeMs, processCandidate.discoveredAt),
         source: 'process-log',
+        processId: pid,
       });
     }
 
@@ -506,7 +619,9 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       .map((workspacePath) => path.basename(workspacePath).toLowerCase())
       .filter(Boolean);
 
-    const results = Array.isArray(response.results) ? response.results : [];
+    const results = dedupeSearchConversationResults(
+      Array.isArray(response.results) ? response.results : []
+    );
     const relevantResults = results.filter((result) => {
       if (!workspaceBasenames.length) {
         return true;
@@ -520,8 +635,16 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       );
     });
     const chosenResults = relevantResults.length > 0 ? relevantResults : results;
+    const summaryResults = dedupeSearchConversationResults([
+      ...chosenResults,
+      ...results.slice(0, MAX_ACTIVE_STREAM_TARGETS),
+    ]);
+    const streamResults = dedupeSearchConversationResults([
+      ...results.slice(0, MAX_ACTIVE_STREAM_TARGETS),
+      ...chosenResults,
+    ]);
 
-    for (const result of chosenResults) {
+    for (const result of summaryResults) {
       if (!result.cascadeId) {
         continue;
       }
@@ -551,7 +674,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
     if (preferredConversationId) {
       targetIds.add(preferredConversationId);
     }
-    for (const result of chosenResults.slice(0, 1)) {
+    for (const result of streamResults.slice(0, MAX_ACTIVE_STREAM_TARGETS)) {
       if (result.cascadeId) {
         targetIds.add(result.cascadeId);
       }
@@ -593,9 +716,19 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       request,
       buffer: Buffer.alloc(0),
       receivedData: false,
+      openedAt: Date.now(),
+      closed: false,
+      finish: () => undefined,
     };
 
     this.activeStreams.set(conversationId, streamState);
+    const summary = this.summaries.get(conversationId);
+    const summaryLabel = [summary?.title, summary?.workspaceName]
+      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      .join(' | ');
+    this.output.appendLine(
+      `[antigravity-ls] Stream opened for ${conversationId}${summaryLabel ? ` (${summaryLabel})` : ''}.`
+    );
 
     let statusCode = 200;
     const errorChunks: Buffer[] = [];
@@ -613,6 +746,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       }
 
       streamState.receivedData = true;
+      streamState.openedAt = Date.now();
       streamState.buffer = Buffer.concat([streamState.buffer, buffer]);
       streamState.buffer = this.consumeConnectEnvelopes(streamState.buffer, (message) => {
         this.handleStreamMessage(conversationId, message);
@@ -620,6 +754,10 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
     });
 
     const finish = (error?: unknown) => {
+      if (streamState.closed) {
+        return;
+      }
+      streamState.closed = true;
       this.activeStreams.delete(conversationId);
       this.nextStreamAttemptAt.set(conversationId, Date.now() + STREAM_RETRY_MS);
 
@@ -654,6 +792,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
         );
       }
     };
+    streamState.finish = finish;
 
     request.on('error', finish);
     request.on('end', () => finish());
@@ -984,7 +1123,31 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       return;
     }
 
+    const firstCompletionRequest = !run.completionRequestedAt;
+    run.completionRequestedAt = run.completionRequestedAt ?? Date.now();
+    this.syncBrainFallbackForRunSync(run);
+    if (this.shouldDelayCompletion(run)) {
+      if (firstCompletionRequest) {
+        this.output.appendLine(
+          `[antigravity-ls] Delaying completion for ${conversationId} while recent brain activity is still arriving.`
+        );
+      }
+      return;
+    }
+
+    this.emitRunCompletionNow(conversationId, run);
+  }
+
+  private emitRunCompletionNow(
+    conversationId: string,
+    run: ActiveRunState
+  ): void {
+    if (run.completed) {
+      return;
+    }
+
     run.completed = true;
+    run.completionRequestedAt = undefined;
     const updatedAt = run.lastUpdatedAt ?? run.promptStartedAt ?? Date.now();
     this._onTurnUpdate.fire({
       conversationId,
@@ -1003,6 +1166,329 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       capturedTokenUsage: { ...run.capturedTokenUsage },
       isComplete: true,
     });
+  }
+
+  private async syncBrainFallbacks(): Promise<void> {
+    const candidateConversationIds = this.collectBrainFallbackCandidateConversationIds();
+    for (const conversationId of candidateConversationIds) {
+      try {
+        await this.syncBrainFallbackForConversation(conversationId);
+      } catch (error) {
+        this.output.appendLine(
+          `[antigravity-ls] Brain fallback discovery failed for ${conversationId}: ${formatError(error)}`
+        );
+      }
+    }
+
+    const activeRuns = [...this.runStates.values()].filter((run) =>
+      run.startedEmitted
+      && (!run.completed || Boolean(run.completionRequestedAt))
+    );
+
+    for (const run of activeRuns) {
+      try {
+        await this.syncBrainFallbackForRun(run);
+        if (run.completionRequestedAt && !this.shouldDelayCompletion(run)) {
+          this.emitRunCompletionNow(run.conversationId, run);
+        } else if (!run.completionRequestedAt && this.shouldAutoCompleteBrainRecoveredRun(run)) {
+          this.output.appendLine(
+            `[antigravity-ls] Auto-finalizing idle brain-backed run for ${run.conversationId}.`
+          );
+          this.emitRunCompletionNow(run.conversationId, run);
+        }
+      } catch (error) {
+        this.output.appendLine(
+          `[antigravity-ls] Brain fallback sync failed for ${run.conversationId}: ${formatError(error)}`
+        );
+      }
+    }
+  }
+
+  private collectBrainFallbackCandidateConversationIds(): string[] {
+    const conversationIds = new Set<string>();
+    const preferredConversationId = this.getPreferredConversationId?.();
+    if (preferredConversationId) {
+      conversationIds.add(preferredConversationId);
+    }
+
+    const recentSummaries = [...this.summaries.values()]
+      .sort((left, right) => (right.lastModifiedAt ?? 0) - (left.lastModifiedAt ?? 0))
+      .slice(0, MAX_BRAIN_DISCOVERY_CONVERSATIONS);
+    for (const summary of recentSummaries) {
+      conversationIds.add(summary.conversationId);
+    }
+
+    for (const run of this.runStates.values()) {
+      conversationIds.add(run.conversationId);
+    }
+
+    return [...conversationIds];
+  }
+
+  private async syncBrainFallbackForConversation(conversationId: string): Promise<void> {
+    const snapshot = await loadBrainFallbackSnapshot(conversationId);
+    if (!snapshot) {
+      return;
+    }
+
+    const summary = this.summaries.get(conversationId);
+    const run = this.findOrCreateRunForBrainSnapshot(conversationId, snapshot, summary);
+    if (!run) {
+      return;
+    }
+
+    this.applyBrainFallbackSnapshot(run, snapshot, false);
+  }
+
+  private findOrCreateRunForBrainSnapshot(
+    conversationId: string,
+    snapshot: BrainFallbackSnapshot,
+    summary: ConversationSummary | undefined
+  ): ActiveRunState | undefined {
+    const prompt = normalizeBrainFallbackText(snapshot.prompt);
+    if (!prompt) {
+      return undefined;
+    }
+
+    const normalizedPrompt = prompt.toLowerCase();
+    const candidates = [...this.runStates.values()]
+      .filter((run) => run.conversationId === conversationId)
+      .sort((left, right) => (right.promptStartedAt ?? 0) - (left.promptStartedAt ?? 0));
+    const matchingRun = candidates.find((run) => {
+      if (
+        snapshot.promptStepIndex !== undefined
+        && run.promptStepIndex !== undefined
+        && snapshot.promptStepIndex === run.promptStepIndex
+      ) {
+        return true;
+      }
+
+      if (
+        snapshot.promptStartedAt !== undefined
+        && run.promptStartedAt !== undefined
+        && Math.abs(snapshot.promptStartedAt - run.promptStartedAt) <= 2_000
+      ) {
+        return !run.prompt || normalizeBrainFallbackText(run.prompt).toLowerCase() === normalizedPrompt;
+      }
+
+      return !run.completed
+        && Boolean(run.prompt)
+        && normalizeBrainFallbackText(run.prompt).toLowerCase() === normalizedPrompt;
+    });
+    if (matchingRun) {
+      if (snapshot.promptStepIndex !== undefined) {
+        matchingRun.promptStepIndex = snapshot.promptStepIndex;
+      }
+      return matchingRun;
+    }
+
+    const snapshotActivityAt = snapshot.updatedAt ?? snapshot.promptStartedAt ?? 0;
+    if (snapshotActivityAt > 0 && Date.now() - snapshotActivityAt > BRAIN_LIVE_DISCOVERY_MAX_AGE_MS) {
+      return undefined;
+    }
+
+    const executionId = `brain:${conversationId}:${snapshot.promptStepIndex ?? snapshot.promptStartedAt ?? Date.now()}`;
+    const run = this.ensureRunState(conversationId, executionId);
+    run.prompt = prompt;
+    run.promptStartedAt = snapshot.promptStartedAt ?? run.promptStartedAt ?? Date.now();
+    run.promptStepIndex = snapshot.promptStepIndex ?? run.promptStepIndex;
+    run.title = summary?.title ?? run.title;
+    run.subtitle = summary?.snippet ?? run.subtitle;
+
+    if (!run.startedEmitted) {
+      run.startedEmitted = true;
+      this.output.appendLine(
+        `[antigravity-ls] Live turn recovered from brain overview for ${conversationId}.`
+      );
+      this._onTurnStart.fire({
+        conversationId,
+        executionId,
+        prompt,
+        startedAt: run.promptStartedAt,
+        title: run.title,
+        subtitle: run.subtitle,
+        model: run.model,
+        modelConfidence: run.modelConfidence,
+        contextUsagePercent: run.contextUsagePercent,
+        contextWindowTokens: run.contextWindowTokens,
+      });
+    }
+
+    return run;
+  }
+
+  private shouldAutoCompleteBrainRecoveredRun(run: ActiveRunState): boolean {
+    if (run.completed || !run.startedEmitted || run.completionRequestedAt) {
+      return false;
+    }
+
+    const latestActivityAt = run.lastUpdatedAt ?? run.promptStartedAt ?? 0;
+    if (!latestActivityAt || Date.now() - latestActivityAt < BRAIN_IDLE_AUTOCOMPLETE_MS) {
+      return false;
+    }
+
+    return Boolean(
+      normalizeBrainFallbackText(run.editor)
+      || normalizeBrainFallbackText(run.output)
+    );
+  }
+
+  private shouldDelayCompletion(run: ActiveRunState): boolean {
+    if (!run.completionRequestedAt) {
+      return false;
+    }
+
+    const latestActivityAt = Math.max(
+      run.lastUpdatedAt ?? 0,
+      run.promptStartedAt ?? 0,
+      run.completionRequestedAt
+    );
+    return Date.now() - latestActivityAt < BRAIN_COMPLETION_GRACE_MS;
+  }
+
+  private async syncBrainFallbackForRun(run: ActiveRunState): Promise<void> {
+    const snapshot = await loadBrainFallbackSnapshot(run.conversationId);
+    if (!snapshot) {
+      return;
+    }
+
+    this.applyBrainFallbackSnapshot(run, snapshot, false);
+  }
+
+  private syncBrainFallbackForRunSync(run: ActiveRunState): void {
+    const snapshot = loadBrainFallbackSnapshotSync(run.conversationId);
+    if (!snapshot) {
+      return;
+    }
+
+    this.applyBrainFallbackSnapshot(run, snapshot, true);
+  }
+
+  private applyBrainFallbackSnapshot(
+    run: ActiveRunState,
+    snapshot: BrainFallbackSnapshot,
+    forceLog: boolean
+  ): void {
+    let changed = false;
+    let tokenChanged = false;
+
+    if (!run.prompt && snapshot.prompt) {
+      run.prompt = snapshot.prompt;
+      changed = true;
+    }
+    if (!run.promptStartedAt && snapshot.promptStartedAt) {
+      run.promptStartedAt = snapshot.promptStartedAt;
+    }
+    if (snapshot.promptStepIndex !== undefined && run.promptStepIndex !== snapshot.promptStepIndex) {
+      run.promptStepIndex = snapshot.promptStepIndex;
+    }
+
+    if (snapshot.thinking && snapshot.thinking !== run.thinking) {
+      run.thinking = snapshot.thinking;
+      changed = true;
+    }
+    if (snapshot.editor && snapshot.editor !== run.editor) {
+      run.editor = snapshot.editor;
+      changed = true;
+    }
+    if (snapshot.output && snapshot.output !== run.output) {
+      run.output = snapshot.output;
+      changed = true;
+    }
+    if (snapshot.updatedAt && (!run.lastUpdatedAt || snapshot.updatedAt > run.lastUpdatedAt)) {
+      run.lastUpdatedAt = snapshot.updatedAt;
+    }
+
+    tokenChanged = this.applySyntheticTextContribution(
+      run,
+      'brain-fallback-thinking',
+      {
+        thinkingTokens: estimateTextTokenCount(snapshot.thinking),
+        subagentTokens: 0,
+        editorTokens: 0,
+        outputTokens: 0,
+      }
+    ) || tokenChanged;
+    tokenChanged = this.applySyntheticTextContribution(
+      run,
+      'brain-fallback-editor',
+      {
+        thinkingTokens: 0,
+        subagentTokens: 0,
+        editorTokens: estimateTextTokenCount(snapshot.editor),
+        outputTokens: 0,
+      }
+    ) || tokenChanged;
+    tokenChanged = this.applySyntheticTextContribution(
+      run,
+      'brain-fallback-output',
+      {
+        thinkingTokens: 0,
+        subagentTokens: 0,
+        editorTokens: 0,
+        outputTokens: estimateTextTokenCount(snapshot.output),
+      }
+    ) || tokenChanged;
+
+    if (!changed && !tokenChanged) {
+      return;
+    }
+
+    if (forceLog || snapshot.thinking || snapshot.editor || snapshot.output) {
+      this.output.appendLine(
+        `[antigravity-ls] Recovered brain fallback for ${run.conversationId}: thinking=${estimateTextTokenCount(snapshot.thinking)} editor=${estimateTextTokenCount(snapshot.editor)} output=${estimateTextTokenCount(snapshot.output)}`
+      );
+    }
+
+    if (!run.completed && run.startedEmitted) {
+      this._onTurnUpdate.fire({
+        conversationId: run.conversationId,
+        executionId: run.executionId,
+        updatedAt: run.lastUpdatedAt ?? run.promptStartedAt ?? Date.now(),
+        title: run.title,
+        subtitle: run.subtitle,
+        model: run.model,
+        modelConfidence: run.modelConfidence,
+        contextUsagePercent: run.contextUsagePercent,
+        contextWindowTokens: run.contextWindowTokens,
+        thinking: run.thinking,
+        subagent: run.subagent,
+        editor: run.editor,
+        output: run.output,
+        capturedTokenUsage: { ...run.capturedTokenUsage },
+        isComplete: false,
+      });
+    }
+  }
+
+  private applySyntheticTextContribution(
+    run: ActiveRunState,
+    stepKey: string,
+    nextContribution: StepTokenContribution
+  ): boolean {
+    const previousContribution = run.stepTokenContributions.get(stepKey) ?? emptyStepTokenContribution();
+    if (stepTokenContributionEquals(previousContribution, nextContribution)) {
+      return false;
+    }
+
+    run.capturedTokenUsage.thinkingTokens = Math.max(
+      0,
+      run.capturedTokenUsage.thinkingTokens + nextContribution.thinkingTokens - previousContribution.thinkingTokens
+    );
+    run.capturedTokenUsage.subagentTokens = Math.max(
+      0,
+      run.capturedTokenUsage.subagentTokens + nextContribution.subagentTokens - previousContribution.subagentTokens
+    );
+    run.capturedTokenUsage.editorTokens = Math.max(
+      0,
+      run.capturedTokenUsage.editorTokens + nextContribution.editorTokens - previousContribution.editorTokens
+    );
+    run.capturedTokenUsage.outputTokens = Math.max(
+      0,
+      run.capturedTokenUsage.outputTokens + nextContribution.outputTokens - previousContribution.outputTokens
+    );
+    run.stepTokenContributions.set(stepKey, nextContribution);
+    return true;
   }
 
   private emitLateTurnStartIfNeeded(
@@ -1062,7 +1548,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
         editorTokens: 0,
         outputTokens: 0,
       },
-      countedStepKeys: new Set<string>(),
+      stepTokenContributions: new Map<string, StepTokenContribution>(),
     };
     this.runStates.set(key, next);
     return next;
@@ -1074,42 +1560,104 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
     kind: 'primary' | 'subagent' | 'editor'
   ): boolean {
     const stepKey = buildCountedStepKey(step);
-    if (!stepKey || run.countedStepKeys.has(stepKey)) {
+    if (!stepKey) {
       return false;
     }
 
     const metadata = step?.metadata ?? {};
-    let changed = false;
+    const previousContribution = run.stepTokenContributions.get(stepKey) ?? emptyStepTokenContribution();
+    const nextContribution = emptyStepTokenContribution();
+    let usedEstimatedTokens = false;
 
     if (kind === 'primary') {
-      const usage = metadata?.modelUsage ?? {};
-      const totalOutputTokens = toNumber(usage?.outputTokens) ?? 0;
-      const thinkingTokens = toNumber(usage?.thinkingOutputTokens) ?? 0;
-      const responseTokens = toNumber(usage?.responseOutputTokens);
+      const usage = metadata?.modelUsage
+        ?? step?.plannerResponse?.modelUsage
+        ?? step?.plannerResponse?.usage
+        ?? step?.plannerResponse?.usageMetadata
+        ?? {};
+      const totalOutputTokens = firstFiniteNumber(
+        usage?.outputTokens,
+        usage?.outputTokenCount,
+        usage?.candidatesTokenCount,
+        usage?.completionTokens,
+        usage?.completion_tokens
+      ) ?? 0;
+      const thinkingTokens = firstFiniteNumber(
+        usage?.thinkingOutputTokens,
+        usage?.thinkingTokens,
+        usage?.reasoningTokens,
+        usage?.reasoningOutputTokens,
+        usage?.thoughtsTokenCount,
+        usage?.candidatesTokensDetails?.thoughtsTokenCount,
+        usage?.completionTokensDetails?.reasoningTokens,
+        usage?.completion_tokens_details?.reasoning_tokens
+      ) ?? 0;
+      const responseTokens = firstFiniteNumber(
+        usage?.responseOutputTokens,
+        usage?.responseTokens,
+        usage?.textOutputTokens,
+        usage?.visibleOutputTokens
+      );
       const outputTokens = responseTokens ?? Math.max(0, totalOutputTokens - thinkingTokens);
-
-      if (thinkingTokens > 0 || outputTokens > 0) {
-        run.capturedTokenUsage.thinkingTokens += thinkingTokens;
-        run.capturedTokenUsage.outputTokens += outputTokens;
-        changed = true;
-      }
+      const thinkingText = extractPlannerThinking(step?.plannerResponse);
+      const outputText = extractPlannerResponse(step?.plannerResponse);
+      nextContribution.thinkingTokens = thinkingTokens > 0
+        ? thinkingTokens
+        : estimateTextTokenCount(thinkingText);
+      nextContribution.outputTokens = outputTokens > 0
+        ? outputTokens
+        : estimateTextTokenCount(outputText);
+      usedEstimatedTokens = (
+        (nextContribution.thinkingTokens > 0 && thinkingTokens === 0)
+        || (nextContribution.outputTokens > 0 && outputTokens === 0)
+      );
     } else {
-      const toolTokens = toNumber(metadata?.toolCallOutputTokens) ?? 0;
-      if (toolTokens > 0) {
-        if (kind === 'editor') {
-          run.capturedTokenUsage.editorTokens += toolTokens;
-        } else {
-          run.capturedTokenUsage.subagentTokens += toolTokens;
-        }
-        changed = true;
+      const toolTokens = firstFiniteNumber(
+        metadata?.toolCallOutputTokens,
+        metadata?.toolOutputTokens,
+        metadata?.outputTokens
+      ) ?? 0;
+      const auxiliaryText = extractAuxiliaryStepText(step);
+      const estimatedTokens = toolTokens > 0
+        ? toolTokens
+        : estimateTextTokenCount(auxiliaryText);
+      if (kind === 'editor') {
+        nextContribution.editorTokens = estimatedTokens;
+      } else {
+        nextContribution.subagentTokens = estimatedTokens;
       }
+      usedEstimatedTokens = estimatedTokens > 0 && toolTokens === 0;
     }
 
-    if (changed) {
-      run.countedStepKeys.add(stepKey);
+    if (stepTokenContributionEquals(previousContribution, nextContribution)) {
+      return false;
     }
 
-    return changed;
+    run.capturedTokenUsage.thinkingTokens = Math.max(
+      0,
+      run.capturedTokenUsage.thinkingTokens + nextContribution.thinkingTokens - previousContribution.thinkingTokens
+    );
+    run.capturedTokenUsage.subagentTokens = Math.max(
+      0,
+      run.capturedTokenUsage.subagentTokens + nextContribution.subagentTokens - previousContribution.subagentTokens
+    );
+    run.capturedTokenUsage.editorTokens = Math.max(
+      0,
+      run.capturedTokenUsage.editorTokens + nextContribution.editorTokens - previousContribution.editorTokens
+    );
+    run.capturedTokenUsage.outputTokens = Math.max(
+      0,
+      run.capturedTokenUsage.outputTokens + nextContribution.outputTokens - previousContribution.outputTokens
+    );
+    run.stepTokenContributions.set(stepKey, nextContribution);
+
+    if (usedEstimatedTokens) {
+      this.output.appendLine(
+        `[antigravity-ls] Estimated ${kind} tokens from text for step ${stepKey}: thinking=${nextContribution.thinkingTokens} subagent=${nextContribution.subagentTokens} editor=${nextContribution.editorTokens} output=${nextContribution.outputTokens}`
+      );
+    }
+
+    return true;
   }
 
   private extractExecutionId(value: any): string | undefined {
@@ -1259,6 +1807,11 @@ function extractPlannerResponse(plannerResponse: any): string | undefined {
     }
   }
 
+  const typedContent = extractTypedPlannerContent(plannerResponse, 'output');
+  if (typedContent) {
+    return typedContent;
+  }
+
   return undefined;
 }
 
@@ -1276,6 +1829,96 @@ function extractPlannerThinking(plannerResponse: any): string | undefined {
     }
   }
 
+  const typedContent = extractTypedPlannerContent(plannerResponse, 'thinking');
+  if (typedContent) {
+    return typedContent;
+  }
+
+  return undefined;
+}
+
+function extractTypedPlannerContent(
+  value: any,
+  target: 'thinking' | 'output'
+): string | undefined {
+  const pieces: string[] = [];
+  collectTypedPlannerContent(value, target, undefined, pieces, new Set());
+  const content = pieces
+    .map((piece) => piece.trim())
+    .filter(Boolean)
+    .join('\n\n')
+    .trim();
+  return content || undefined;
+}
+
+function collectTypedPlannerContent(
+  value: any,
+  target: 'thinking' | 'output',
+  inheritedKind: 'thinking' | 'output' | undefined,
+  pieces: string[],
+  seen: Set<any>
+): void {
+  if (value === undefined || value === null) {
+    return;
+  }
+
+  if (typeof value === 'string') {
+    if (inheritedKind === target) {
+      pieces.push(value);
+    }
+    return;
+  }
+
+  if (typeof value !== 'object' || seen.has(value)) {
+    return;
+  }
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectTypedPlannerContent(item, target, inheritedKind, pieces, seen);
+    }
+    return;
+  }
+
+  const localKind = classifyPlannerContentKind(value) ?? inheritedKind;
+  const textFields = target === 'thinking'
+    ? ['thinking', 'reasoning', 'reasoningText', 'thought', 'thoughts']
+    : ['modifiedResponse', 'response', 'output', 'text', 'content'];
+
+  for (const key of textFields) {
+    const fieldValue = value?.[key];
+    const fieldKind = localKind ?? classifyPlannerContentKey(key);
+    if (typeof fieldValue === 'string' && fieldKind === target) {
+      pieces.push(fieldValue);
+    }
+  }
+
+  for (const [key, fieldValue] of Object.entries(value)) {
+    const keyKind = classifyPlannerContentKey(key);
+    collectTypedPlannerContent(fieldValue, target, keyKind ?? localKind, pieces, seen);
+  }
+}
+
+function classifyPlannerContentKind(value: any): 'thinking' | 'output' | undefined {
+  const type = String(value?.type ?? value?.kind ?? value?.blockType ?? '').toLowerCase();
+  if (/(?:thinking|reasoning|thought)/.test(type)) {
+    return 'thinking';
+  }
+  if (/(?:text|output|response|message|content)/.test(type)) {
+    return 'output';
+  }
+  return undefined;
+}
+
+function classifyPlannerContentKey(key: string): 'thinking' | 'output' | undefined {
+  const normalized = key.toLowerCase();
+  if (/(?:thinking|reasoning|thought)/.test(normalized)) {
+    return 'thinking';
+  }
+  if (/(?:modifiedresponse|response|output|text|content)/.test(normalized)) {
+    return 'output';
+  }
   return undefined;
 }
 
@@ -1338,6 +1981,13 @@ function readNestedText(value: unknown): string | undefined {
     }
   }
 
+  for (const key of ['generatedText', 'insertedText', 'newText', 'replacementText', 'edits', 'changes', 'appliedPatch']) {
+    const text = readNestedText((value as Record<string, unknown>)[key]);
+    if (text) {
+      return text;
+    }
+  }
+
   return undefined;
 }
 
@@ -1368,6 +2018,402 @@ function stepTimestamp(metadata: any): number | undefined {
   }
 
   return undefined;
+}
+
+async function loadBrainFallbackSnapshot(
+  conversationId: string
+): Promise<BrainFallbackSnapshot | undefined> {
+  const brainDir = path.join(os.homedir(), '.gemini', 'antigravity', 'brain', conversationId);
+  const overviewPath = path.join(brainDir, '.system_generated', 'logs', 'overview.txt');
+
+  const [overviewRaw, brainEntries] = await Promise.all([
+    safeReadUtf8(overviewPath),
+    safeReadDirEntries(brainDir),
+  ]);
+  if (!overviewRaw) {
+    return undefined;
+  }
+
+  const artifactEntries = await Promise.all(
+    brainEntries
+      .filter((entry) =>
+        entry.isFile()
+        && !entry.name.startsWith('.')
+        && !entry.name.endsWith('.metadata.json')
+        && !entry.name.includes('.resolved')
+      )
+      .map(async (entry) => {
+        const filePath = path.join(brainDir, entry.name);
+        const [content, stats] = await Promise.all([
+          safeReadUtf8(filePath),
+          safeStat(filePath),
+        ]);
+        return {
+          baseName: entry.name,
+          filePath,
+          content: normalizeBrainFallbackText(content),
+          updatedAt: stats?.mtimeMs ?? 0,
+        };
+      })
+  );
+
+  return buildBrainFallbackSnapshot(overviewRaw, artifactEntries);
+}
+
+function loadBrainFallbackSnapshotSync(
+  conversationId: string
+): BrainFallbackSnapshot | undefined {
+  const brainDir = path.join(os.homedir(), '.gemini', 'antigravity', 'brain', conversationId);
+  const overviewPath = path.join(brainDir, '.system_generated', 'logs', 'overview.txt');
+  if (!fsSync.existsSync(overviewPath)) {
+    return undefined;
+  }
+
+  let overviewRaw = '';
+  try {
+    overviewRaw = fsSync.readFileSync(overviewPath, 'utf8');
+  } catch {
+    return undefined;
+  }
+
+  let brainEntries: fsSync.Dirent[] = [];
+  try {
+    brainEntries = fsSync.readdirSync(brainDir, { withFileTypes: true });
+  } catch {
+    brainEntries = [];
+  }
+
+  const artifactEntries = brainEntries
+    .filter((entry) =>
+      entry.isFile()
+      && !entry.name.startsWith('.')
+      && !entry.name.endsWith('.metadata.json')
+      && !entry.name.includes('.resolved')
+    )
+    .map((entry) => {
+      const filePath = path.join(brainDir, entry.name);
+      let content = '';
+      let updatedAt = 0;
+      try {
+        content = fsSync.readFileSync(filePath, 'utf8');
+      } catch {
+        content = '';
+      }
+      try {
+        updatedAt = fsSync.statSync(filePath).mtimeMs;
+      } catch {
+        updatedAt = 0;
+      }
+
+      return {
+        baseName: entry.name,
+        filePath,
+        content: normalizeBrainFallbackText(content),
+        updatedAt,
+      };
+    });
+
+  return buildBrainFallbackSnapshot(overviewRaw, artifactEntries);
+}
+
+function buildBrainFallbackSnapshot(
+  overviewRaw: string,
+  artifactEntries: Array<{ baseName: string; filePath: string; content: string; updatedAt: number }>
+): BrainFallbackSnapshot | undefined {
+  const steps = parseOverviewLogEntries(overviewRaw);
+  if (steps.length === 0) {
+    return undefined;
+  }
+
+  let lastUserInputIndex = -1;
+  for (let index = 0; index < steps.length; index += 1) {
+    if (steps[index]?.type === 'USER_INPUT' && steps[index]?.source?.startsWith('USER')) {
+      lastUserInputIndex = index;
+    }
+  }
+  if (lastUserInputIndex < 0) {
+    return undefined;
+  }
+
+  const turnSteps = steps.slice(lastUserInputIndex);
+  const promptStep = turnSteps[0];
+  const prompt = extractOverviewPrompt(promptStep?.content);
+  let thinking = '';
+  let editor = '';
+  let output = '';
+  let updatedAt = promptStep?.createdAt ?? 0;
+
+  for (const step of turnSteps.slice(1)) {
+    updatedAt = Math.max(updatedAt, step.createdAt ?? 0);
+    if (step.type !== 'PLANNER_RESPONSE' || step.status !== 'DONE') {
+      continue;
+    }
+
+    const stepContent = normalizeBrainFallbackText(step.content);
+    if (stepContent) {
+      output = mergeStepText(output, stepContent);
+    }
+
+    for (const toolCall of step.toolCalls) {
+      if (classifyOverviewToolCall(toolCall) !== 'editor') {
+        continue;
+      }
+
+      const toolText = buildOverviewToolCallText(toolCall);
+      if (toolText) {
+        editor = mergeStepText(editor, toolText);
+      }
+    }
+
+    const referencedArtifacts = step.toolCalls
+      .flatMap((toolCall) => resolveOverviewToolCallTarget(toolCall))
+      .flatMap((toolTarget) => artifactEntries.filter((artifact) => artifact.filePath === toolTarget.filePath))
+      .sort((left, right) => left.baseName.localeCompare(right.baseName));
+
+    for (const artifact of referencedArtifacts) {
+      updatedAt = Math.max(updatedAt, artifact.updatedAt);
+      if (!artifact.content) {
+        continue;
+      }
+
+      if (classifyBrainFallbackArtifact(artifact.baseName, artifact.filePath) === 'thinking') {
+        thinking = mergeStepText(thinking, artifact.content);
+        continue;
+      }
+
+      output = mergeStepText(output, artifact.content);
+    }
+  }
+
+  const normalizedThinking = normalizeBrainFallbackText(thinking);
+  const normalizedEditor = normalizeBrainFallbackText(editor);
+  const normalizedOutput = normalizeBrainFallbackText(output);
+  const normalizedPrompt = normalizeBrainFallbackText(prompt);
+  if (!normalizedPrompt && !normalizedThinking && !normalizedEditor && !normalizedOutput) {
+    return undefined;
+  }
+
+  return {
+    prompt: normalizedPrompt || undefined,
+    promptStartedAt: promptStep?.createdAt,
+    promptStepIndex: promptStep?.stepIndex,
+    thinking: normalizedThinking || undefined,
+    editor: normalizedEditor || undefined,
+    output: normalizedOutput || undefined,
+    updatedAt: updatedAt || undefined,
+  };
+}
+
+function parseOverviewLogEntries(overviewRaw: string): OverviewLogEntry[] {
+  return overviewRaw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        return [{
+          stepIndex: typeof parsed.step_index === 'number' && Number.isFinite(parsed.step_index)
+            ? parsed.step_index
+            : undefined,
+          source: typeof parsed.source === 'string' ? parsed.source : undefined,
+          type: typeof parsed.type === 'string' ? parsed.type : undefined,
+          status: typeof parsed.status === 'string' ? parsed.status : undefined,
+          createdAt: toTimestamp(parsed.created_at),
+          content: typeof parsed.content === 'string' ? parsed.content : undefined,
+          toolCalls: Array.isArray(parsed.tool_calls)
+            ? parsed.tool_calls
+              .filter((toolCall): toolCall is { name?: string; args?: Record<string, unknown> } =>
+                Boolean(toolCall) && typeof toolCall === 'object'
+              )
+            : [],
+        }];
+      } catch {
+        return [];
+      }
+    });
+}
+
+function extractOverviewPrompt(content: string | undefined): string | undefined {
+  if (!content) {
+    return undefined;
+  }
+
+  const match = content.match(/<USER_REQUEST>\s*([\s\S]*?)\s*<\/USER_REQUEST>/i);
+  if (match?.[1]) {
+    return normalizeBrainFallbackText(match[1]);
+  }
+
+  return normalizeBrainFallbackText(content);
+}
+
+function resolveOverviewToolCallTarget(
+  toolCall: { name?: string; args?: Record<string, unknown> }
+): Array<{ filePath: string }> {
+  if (!toolCall?.args || typeof toolCall.args !== 'object') {
+    return [];
+  }
+
+  const candidates = [
+    toolCall.args.TargetFile,
+    toolCall.args.AbsolutePath,
+    toolCall.args.FilePath,
+    toolCall.args.Path,
+  ];
+
+  return candidates
+    .map((candidate) => decodeOverviewScalar(candidate))
+    .filter((candidate): candidate is string => Boolean(candidate))
+    .map((filePath) => ({ filePath }));
+}
+
+function classifyOverviewToolCall(
+  toolCall: { name?: string; args?: Record<string, unknown> }
+): 'editor' | undefined {
+  if (!toolCall?.name) {
+    return undefined;
+  }
+
+  if (isOverviewBrainArtifactToolCall(toolCall)) {
+    return undefined;
+  }
+
+  const normalized = toolCall.name.toLowerCase();
+  if (/(?:replace|rewrite|edit|patch|diff|apply|update|modify|write|append)/.test(normalized)) {
+    return 'editor';
+  }
+
+  return undefined;
+}
+
+function isOverviewBrainArtifactToolCall(
+  toolCall: { name?: string; args?: Record<string, unknown> }
+): boolean {
+  const args = toolCall.args ?? {};
+  if (decodeOverviewBoolean(args.IsArtifact)) {
+    return true;
+  }
+
+  return resolveOverviewToolCallTarget(toolCall)
+    .some((target) => target.filePath.toLowerCase().includes('/.gemini/antigravity/brain/'));
+}
+
+function buildOverviewToolCallText(
+  toolCall: { name?: string; args?: Record<string, unknown> }
+): string | undefined {
+  const args = toolCall.args ?? {};
+  const parts: string[] = [];
+  const targetFile = resolveOverviewToolCallTarget(toolCall)[0]?.filePath;
+
+  if (toolCall.name) {
+    parts.push(toolCall.name);
+  }
+  if (targetFile) {
+    parts.push(targetFile);
+  }
+
+  for (const key of [
+    'Instruction',
+    'Description',
+    'toolAction',
+    'toolSummary',
+    'ReplacementContent',
+    'CodeContent',
+    'NewContent',
+    'TargetContent',
+    'Patch',
+    'Diff',
+    'Content',
+  ]) {
+    const value = decodeOverviewScalar(args[key]);
+    if (value) {
+      parts.push(value);
+    }
+  }
+
+  const content = parts
+    .map((part) => normalizeBrainFallbackText(part))
+    .filter(Boolean)
+    .join('\n\n')
+    .trim();
+  return content || undefined;
+}
+
+function decodeOverviewScalar(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (typeof parsed === 'string') {
+        return parsed;
+      }
+    } catch {
+      // Fall through to plain-string handling.
+    }
+  }
+
+  return trimmed;
+}
+
+function decodeOverviewBoolean(value: unknown): boolean {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  const decoded = decodeOverviewScalar(value);
+  return decoded?.toLowerCase() === 'true';
+}
+
+function classifyBrainFallbackArtifact(
+  baseName: string,
+  filePath: string
+): 'thinking' | 'output' {
+  const normalizedBaseName = baseName.toLowerCase();
+  const normalizedPath = filePath.toLowerCase();
+  if (
+    normalizedBaseName.includes('plan')
+    || normalizedPath.includes('implementation_plan')
+  ) {
+    return 'thinking';
+  }
+
+  return 'output';
+}
+
+function normalizeBrainFallbackText(value: string | undefined): string {
+  return (value ?? '').replace(/\r\n/g, '\n').trim();
+}
+
+async function safeReadUtf8(filePath: string): Promise<string | undefined> {
+  try {
+    return await fs.readFile(filePath, 'utf8');
+  } catch {
+    return undefined;
+  }
+}
+
+async function safeReadDirEntries(dirPath: string): Promise<fsSync.Dirent[]> {
+  try {
+    return await fs.readdir(dirPath, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+}
+
+async function safeStat(filePath: string): Promise<fsSync.Stats | undefined> {
+  try {
+    return await fs.stat(filePath);
+  } catch {
+    return undefined;
+  }
 }
 
 function buildCountedStepKey(step: any): string | undefined {
@@ -1410,6 +2456,66 @@ function toNumber(value: unknown): number | undefined {
   }
 
   return undefined;
+}
+
+function firstFiniteNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    const parsed = toNumber(value);
+    if (parsed !== undefined) {
+      return parsed;
+    }
+  }
+
+  return undefined;
+}
+
+function estimateTextTokenCount(value: string | undefined): number {
+  const normalized = value?.trim() ?? '';
+  if (!normalized) {
+    return 0;
+  }
+
+  return Math.max(1, Math.round(normalized.length / 4));
+}
+
+function emptyStepTokenContribution(): StepTokenContribution {
+  return {
+    thinkingTokens: 0,
+    subagentTokens: 0,
+    editorTokens: 0,
+    outputTokens: 0,
+  };
+}
+
+function stepTokenContributionEquals(
+  left: StepTokenContribution,
+  right: StepTokenContribution
+): boolean {
+  return left.thinkingTokens === right.thinkingTokens
+    && left.subagentTokens === right.subagentTokens
+    && left.editorTokens === right.editorTokens
+    && left.outputTokens === right.outputTokens;
+}
+
+function dedupeSearchConversationResults(
+  results: SearchConversationResult[]
+): SearchConversationResult[] {
+  const seen = new Set<string>();
+  const deduped: SearchConversationResult[] = [];
+
+  for (const result of results) {
+    const cascadeId = typeof result?.cascadeId === 'string'
+      ? result.cascadeId.trim()
+      : '';
+    if (!cascadeId || seen.has(cascadeId)) {
+      continue;
+    }
+
+    seen.add(cascadeId);
+    deduped.push(result);
+  }
+
+  return deduped;
 }
 
 function sanitizeTitle(value: unknown): string | undefined {

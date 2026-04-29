@@ -600,10 +600,14 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       : Promise.resolve({});
     const workspaceValuesPromise = Promise.all(
       workspaceDbPaths.map(async (workspaceDbPath) => {
-        const values = await readMergedSqliteKeyMap(workspaceDbPath, ['memento/antigravity.jetskiArtifactsEditor']);
+        const values = await readMergedSqliteKeyMap(workspaceDbPath, [
+          'memento/antigravity.jetskiArtifactsEditor',
+          'memento/workbench.parts.editor',
+        ]);
         return {
           dbPath: workspaceDbPath,
-          rawValue: values['memento/antigravity.jetskiArtifactsEditor'],
+          jetskiRawValue: values['memento/antigravity.jetskiArtifactsEditor'],
+          workbenchEditorRawValue: values['memento/workbench.parts.editor'],
           updatedAt: await latestSqliteWriteMs(workspaceDbPath),
         };
       })
@@ -616,20 +620,24 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     const liveUserStatus = await getLiveAntigravityUserStatus();
 
     const preferredWorkspaceSelection = workspaceSelections.find((selection) =>
-      Boolean(selection.rawValue)
+      Boolean(selection.jetskiRawValue || selection.workbenchEditorRawValue)
       && preferredWorkspaceDbPath
       && pathsEqual(selection.dbPath, preferredWorkspaceDbPath)
     );
     const freshestWorkspaceSelection = workspaceSelections
-      .filter((selection) => Boolean(selection.rawValue))
+      .filter((selection) => Boolean(selection.jetskiRawValue || selection.workbenchEditorRawValue))
       .sort((left, right) => right.updatedAt - left.updatedAt)[0];
-    const jetskiRaw = preferredWorkspaceSelection?.rawValue ?? freshestWorkspaceSelection?.rawValue;
 
     const summaries = parseAntigravitySummaryEntries(
       globalValues['antigravityUnifiedStateSync.trajectorySummaries'],
       workspacePaths
     );
-    const selectedChatId = parseAntigravitySelectedChatId(jetskiRaw);
+    const selectedChatId = parseAntigravitySelectedChatId(
+      preferredWorkspaceSelection?.workbenchEditorRawValue
+        ?? freshestWorkspaceSelection?.workbenchEditorRawValue,
+      preferredWorkspaceSelection?.jetskiRawValue
+        ?? freshestWorkspaceSelection?.jetskiRawValue
+    );
     const model = extractAntigravitySelectedModelName(
       globalValues['antigravityUnifiedStateSync.modelPreferences'],
       liveUserStatus ?? globalValues['antigravityUnifiedStateSync.userStatus']
@@ -1255,6 +1263,85 @@ function extractPrintableRuns(value: string): string[] {
 }
 
 function parseAntigravitySelectedChatId(
+  workbenchEditorRawValue: string | undefined,
+  jetskiRawValue: string | undefined
+): string | undefined {
+  return parseAntigravitySelectedChatIdFromWorkbenchEditor(workbenchEditorRawValue)
+    ?? parseAntigravitySelectedChatIdFromJetskiState(jetskiRawValue);
+}
+
+function parseAntigravitySelectedChatIdFromWorkbenchEditor(
+  rawValue: string | undefined
+): string | undefined {
+  if (!rawValue) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(rawValue) as {
+      'editorpart.state'?: {
+        serializedGrid?: {
+          root?: unknown;
+        };
+      };
+    };
+
+    const editors = collectWorkbenchEditors(parsed['editorpart.state']?.serializedGrid?.root);
+    for (const editor of editors) {
+      if (editor?.id !== 'antigravity.artifactsEditorInput' || typeof editor.value !== 'string') {
+        continue;
+      }
+
+      const match = editor.value.match(/\/brain\/([0-9a-f-]{36})\//i);
+      if (match) {
+        return match[1];
+      }
+    }
+  } catch {
+    // Fall back to the older jetski selection state.
+  }
+
+  return undefined;
+}
+
+function collectWorkbenchEditors(root: unknown): Array<{ id?: string; value?: string }> {
+  const collected: Array<{ id?: string; value?: string }> = [];
+  const stack: unknown[] = [root];
+
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || typeof node !== 'object') {
+      continue;
+    }
+
+    const data = (node as any).data;
+    if (Array.isArray(data)) {
+      for (const child of data) {
+        stack.push(child);
+      }
+    }
+
+    const editors = Array.isArray(data?.editors) ? data.editors : undefined;
+    if (!editors) {
+      continue;
+    }
+
+    for (const editor of editors) {
+      if (!editor || typeof editor !== 'object') {
+        continue;
+      }
+
+      collected.push({
+        id: typeof (editor as any).id === 'string' ? (editor as any).id : undefined,
+        value: typeof (editor as any).value === 'string' ? (editor as any).value : undefined,
+      });
+    }
+  }
+
+  return collected;
+}
+
+function parseAntigravitySelectedChatIdFromJetskiState(
   rawValue: string | undefined
 ): string | undefined {
   if (!rawValue) {

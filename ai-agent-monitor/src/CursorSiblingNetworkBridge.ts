@@ -483,47 +483,29 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
         ownProperties: true,
         generatePreview: false,
       });
-      const bundleScopeObjectId = scopesProperties?.result?.result
-        ?.find((property: any) => property?.name === '1')
-        ?.value?.objectId;
-      if (!bundleScopeObjectId) {
-        throw new Error('Cursor always-local webpack scope was not available.');
-      }
+      const scopeEntries = scopesProperties?.result?.result ?? [];
+      let handlerClassObjectId: string | undefined;
+      for (const scopeEntry of scopeEntries) {
+        const scopeObjectId = scopeEntry?.value?.objectId;
+        if (!scopeObjectId) {
+          continue;
+        }
 
-      const bundleScopeProperties = await client.sendCommand('Runtime.getProperties', {
-        objectId: bundleScopeObjectId,
-        ownProperties: true,
-        generatePreview: false,
-      });
-      const internalRequireObjectId = bundleScopeProperties?.result?.result
-        ?.find((property: any) => property?.name === 'n')
-        ?.value?.objectId;
-      if (!internalRequireObjectId) {
-        throw new Error('Cursor always-local internal webpack require() was not available.');
+        const scopeProperties = await client.sendCommand('Runtime.getProperties', {
+          objectId: scopeObjectId,
+          ownProperties: true,
+          generatePreview: false,
+        });
+        const scopeResult = scopeProperties?.result?.result ?? [];
+        handlerClassObjectId = scopeResult
+          .find((property: any) => property?.name === 'iwt')
+          ?.value?.objectId;
+        if (handlerClassObjectId) {
+          break;
+        }
       }
-
-      const transportModule = await client.sendCommand('Runtime.callFunctionOn', {
-        objectId: internalRequireObjectId,
-        functionDeclaration: 'function(moduleId) { return this(moduleId); }',
-        arguments: [{ value: 2006 }],
-        returnByValue: false,
-        awaitPromise: true,
-      });
-      const transportModuleObjectId = transportModule?.result?.result?.objectId;
-      if (!transportModuleObjectId) {
-        throw new Error('Cursor always-local transport module 2006 was not reachable.');
-      }
-
-      const transportModuleProperties = await client.sendCommand('Runtime.getProperties', {
-        objectId: transportModuleObjectId,
-        ownProperties: true,
-        generatePreview: false,
-      });
-      const handlerClassObjectId = transportModuleProperties?.result?.result
-        ?.find((property: any) => property?.name === 'AiConnectTransportHandler')
-        ?.value?.objectId;
       if (!handlerClassObjectId) {
-        throw new Error('Cursor always-local AiConnectTransportHandler export was not reachable.');
+        throw new Error('Cursor always-local iwt transport handler class was not reachable.');
       }
 
       const handlerClassProperties = await client.sendCommand('Runtime.getProperties', {

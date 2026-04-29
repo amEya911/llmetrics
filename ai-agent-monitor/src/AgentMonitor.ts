@@ -53,6 +53,8 @@ const BUDGET_SETTINGS_KEY = 'aiAgentMonitor.budgetSettings';
 const SESSION_SUMMARIES_KEY = 'aiAgentMonitor.sessionSummaries';
 const CURSOR_APP_STATE_KEY = 'src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser';
 const LIVE_TURN_SETTLE_MS = 10_000;
+const ANTIGRAVITY_SELECTION_LOCK_MS = 2 * 60_000;
+const ANTIGRAVITY_LATE_UPDATE_GRACE_MS = 60_000;
 
 const SOURCE_LABELS: Record<'cursor' | 'antigravity' | 'manual', string> = {
   cursor: 'Cursor',
@@ -102,16 +104,21 @@ interface AntigravityRequestBinding {
   chatId: string;
   turnId: string;
   requestType: InterceptedRequestType;
+  liveTurnKey: string;
+  childTurnId?: string;
 }
 
 interface CursorRequestBinding {
   chatId: string;
   turnId: string;
   requestType: InterceptedRequestType;
+  liveTurnKey: string;
+  childTurnId?: string;
 }
 
 interface LiveTurnState {
   sourceId: 'cursor' | 'antigravity';
+  chatKey: string;
   chatId: string;
   turnId: string;
   pendingRequestIds: Set<string>;
@@ -158,7 +165,9 @@ export class AgentMonitor implements vscode.Disposable {
   private readonly cursorRequestBindings = new Map<string, CursorRequestBinding>();
   private readonly antigravityLiveChats = new Map<string, ConversationChat>();
   private readonly antigravityRequestBindings = new Map<string, AntigravityRequestBinding>();
+  private readonly antigravityBindingCleanupHandles = new Map<string, NodeJS.Timeout>();
   private readonly liveTurns = new Map<string, LiveTurnState>();
+  private readonly currentLiveTurnKeys = new Map<string, string>();
   private readonly sourceCollections = new Map<'cursor' | 'antigravity', ConversationCollection>();
   private readonly sourceAttention = new Map<'cursor' | 'antigravity', SourceAttentionState>();
 
@@ -179,6 +188,7 @@ export class AgentMonitor implements vscode.Disposable {
   private lastAlertIds = new Set<string>();
   private cursorSelectedChatId?: string;
   private antigravitySelectedChatId?: string;
+  private antigravitySelectedChatLockedUntil = 0;
 
   private cursorInProcessInterceptor?: NetworkInterceptor;
   private cursorInterceptor?: CursorSiblingNetworkBridge;
@@ -262,6 +272,7 @@ export class AgentMonitor implements vscode.Disposable {
   clearBlocks(): void {
     this.flushNetworkEmit();
     this.clearLiveTurnState();
+    this.clearAntigravityBindingCleanups();
     this.runtimeChats.clear();
     this.cursorLiveChats.clear();
     this.cursorRequestBindings.clear();
@@ -278,6 +289,7 @@ export class AgentMonitor implements vscode.Disposable {
     this.groqInsightChatKey = undefined;
     this.cursorSelectedChatId = undefined;
     this.antigravitySelectedChatId = undefined;
+    this.antigravitySelectedChatLockedUntil = 0;
 
     for (const sourceId of ['cursor', 'antigravity'] as const) {
       const previous = this.sourceAttention.get(sourceId);
@@ -414,6 +426,7 @@ export class AgentMonitor implements vscode.Disposable {
   dispose(): void {
     this.flushNetworkEmit();
     this.clearLiveTurnState();
+    this.clearAntigravityBindingCleanups();
     const finalSnapshot = this.lastSnapshot ?? this.buildSnapshot();
     this.persistCompletedSessionIfNeeded(
       this.lastSnapshot,
@@ -545,7 +558,7 @@ export class AgentMonitor implements vscode.Disposable {
       title: summarizeForTitle(turnStart.prompt),
       subtitle: summarizeForSubtitle(turnStart.prompt),
     });
-    const { turn } = this.bindLiveRequest(
+    const { turn, state } = this.bindLiveRequest(
       'cursor',
       chat,
       turnStart.requestId,
@@ -553,13 +566,30 @@ export class AgentMonitor implements vscode.Disposable {
       turnStart.startedAt,
       turnStart.requestType === 'primary' && Boolean(turnStart.prompt.trim())
     );
+    const childTurn = turnStart.requestType === 'primary'
+      ? undefined
+      : this.ensureChildTurn(chat, turn, {
+        requestId: turnStart.requestId,
+        requestType: turnStart.requestType,
+        timestamp: turnStart.startedAt,
+        model: turnStart.model,
+        modelConfidence: turnStart.modelConfidence,
+      });
 
     this.cursorRequestBindings.set(turnStart.requestId, {
       chatId,
       turnId: turn.id,
       requestType: turnStart.requestType,
+      liveTurnKey: state.liveTurnKey,
+      childTurnId: childTurn?.id,
     });
     this.cursorSelectedChatId = chatId;
+
+    if (childTurn) {
+      this.output.appendLine(
+        `[cursor-live] Child turn created type=${turnStart.requestType} parent=${turn.id} request=${turnStart.requestId}`
+      );
+    }
 
     if (turnStart.requestType === 'primary' && turnStart.prompt.trim()) {
       this.setBlockContent(
@@ -570,14 +600,22 @@ export class AgentMonitor implements vscode.Disposable {
         false,
         turnStart.startedAt
       );
-    } else {
-      this.appendRequestTextToBlock(
+    } else if (childTurn && turnStart.prompt.trim()) {
+      this.setTurnBlockContent(
         chat,
-        turn.id,
-        turnStart.requestType,
+        childTurn,
+        'user-input',
         turnStart.prompt,
-        turnStart.startedAt
+        false,
+        turnStart.startedAt,
+        turn
       );
+      if (turnStart.requestType === 'editor') {
+        childTurn.capturedTokenUsage = {
+          ...childTurn.capturedTokenUsage,
+          editorInputTokens: estimateQuickTokens(turnStart.prompt),
+        };
+      }
     }
 
     if (turnStart.model) {
@@ -585,6 +623,10 @@ export class AgentMonitor implements vscode.Disposable {
       chat.modelConfidence = turnStart.modelConfidence;
       turn.model = turnStart.model;
       turn.modelConfidence = turnStart.modelConfidence;
+      if (childTurn) {
+        childTurn.model = turnStart.model;
+        childTurn.modelConfidence = turnStart.modelConfidence;
+      }
     }
 
     this.activeChatKey = `cursor:${chat.id}`;
@@ -607,12 +649,21 @@ export class AgentMonitor implements vscode.Disposable {
       return;
     }
 
-    this.appendBlockContent(
+    const { parentTurn, targetTurn } = this.resolveBoundTurn(chat, binding);
+    this.appendTurnBlockContent(
       chat,
-      binding.turnId,
+      targetTurn,
       this.blockTypeForRequestType(binding.requestType, turnChunk.kind),
-      turnChunk.content
+      turnChunk.content,
+      Date.now(),
+      parentTurn
     );
+    if (binding.requestType === 'editor') {
+      targetTurn.capturedTokenUsage = {
+        ...targetTurn.capturedTokenUsage,
+        editorOutputTokens: estimateQuickTokens(targetTurn.blocks['agent-editor'].content),
+      };
+    }
 
     this.scheduleNetworkEmit();
   }
@@ -632,29 +683,31 @@ export class AgentMonitor implements vscode.Disposable {
       return;
     }
 
-    const turn = this.mustGetTurn(chat, binding.turnId);
+    const { parentTurn, targetTurn } = this.resolveBoundTurn(chat, binding);
     if (turnComplete.model) {
       chat.model = turnComplete.model;
       chat.modelConfidence = turnComplete.modelConfidence;
-      turn.model = turnComplete.model;
-      turn.modelConfidence = turnComplete.modelConfidence;
+      parentTurn.model = turnComplete.model;
+      parentTurn.modelConfidence = turnComplete.modelConfidence;
+      targetTurn.model = turnComplete.model;
+      targetTurn.modelConfidence = turnComplete.modelConfidence;
     }
 
     if (binding.requestType === 'primary') {
-      if (turnComplete.thinking || !turn.blocks['agent-thinking'].content) {
+      if (turnComplete.thinking || !targetTurn.blocks['agent-thinking'].content) {
         this.setBlockContent(
           chat,
-          turn.id,
+          targetTurn.id,
           'agent-thinking',
           turnComplete.thinking,
           false,
           turnComplete.completedAt
         );
       }
-      if (turnComplete.output || !turn.blocks['agent-output'].content) {
+      if (turnComplete.output || !targetTurn.blocks['agent-output'].content) {
         this.setBlockContent(
           chat,
-          turn.id,
+          targetTurn.id,
           'agent-output',
           turnComplete.output,
           false,
@@ -662,7 +715,31 @@ export class AgentMonitor implements vscode.Disposable {
         );
       }
     } else {
-      this.touchTurn(chat, turn, turnComplete.completedAt);
+      const blockType = this.blockTypeForRequestType(binding.requestType, 'agent-output');
+      if (turnComplete.output && !targetTurn.blocks[blockType].content) {
+        this.setTurnBlockContent(
+          chat,
+          targetTurn,
+          blockType,
+          turnComplete.output,
+          false,
+          turnComplete.completedAt,
+          parentTurn
+        );
+      }
+      if (binding.requestType === 'editor') {
+        targetTurn.capturedTokenUsage = {
+          ...targetTurn.capturedTokenUsage,
+          editorOutputTokens: estimateQuickTokens(targetTurn.blocks['agent-editor'].content),
+        };
+      }
+      for (const blockType of BLOCK_TYPES) {
+        targetTurn.blocks[blockType].isStreaming = false;
+      }
+      targetTurn.isComplete = BLOCK_TYPES
+        .filter((blockType) => blockType !== 'user-input')
+        .some((blockType) => Boolean(targetTurn.blocks[blockType].content.trim()));
+      this.touchTurn(chat, parentTurn, turnComplete.completedAt);
     }
 
     this.settleLiveRequest('cursor', this.cursorLiveChats, turnComplete.requestId, binding, turnComplete.completedAt);
@@ -748,7 +825,7 @@ export class AgentMonitor implements vscode.Disposable {
         contextUsagePercent: turnStart.contextUsagePercent,
         contextWindowTokens: turnStart.contextWindowTokens,
       });
-      const { turn } = this.bindLiveRequest(
+      const { turn, state } = this.bindLiveRequest(
         'antigravity',
         chat,
         turnStart.executionId,
@@ -761,8 +838,10 @@ export class AgentMonitor implements vscode.Disposable {
         chatId,
         turnId: turn.id,
         requestType: 'primary',
+        liveTurnKey: state.liveTurnKey,
       });
-      this.antigravitySelectedChatId = chatId;
+      this.clearAntigravityBindingCleanup(turnStart.executionId);
+      this.pinAntigravitySelectedChat(chatId, turnStart.startedAt);
 
       this.setBlockContent(
         chat,
@@ -863,8 +942,8 @@ export class AgentMonitor implements vscode.Disposable {
       if (turnUpdate.isComplete) {
         this.flushNetworkEmit();
         this.settleLiveRequest('antigravity', this.antigravityLiveChats, turnUpdate.executionId, binding, turnUpdate.updatedAt);
-        this.antigravityRequestBindings.delete(turnUpdate.executionId);
-        this.antigravitySelectedChatId = binding.chatId;
+        this.scheduleAntigravityBindingCleanup(turnUpdate.executionId);
+        this.pinAntigravitySelectedChat(binding.chatId, turnUpdate.updatedAt);
         this.activeChatKey = `antigravity:${binding.chatId}`;
         this.activeChatEngagedAt = turnUpdate.updatedAt;
         this.refreshAntigravityCollection();
@@ -917,7 +996,16 @@ export class AgentMonitor implements vscode.Disposable {
     }
 
     if (sourceId === 'antigravity') {
-      this.antigravitySelectedChatId = decorated.selectedChatId ?? this.antigravitySelectedChatId;
+      if (
+        decorated.selectedChatId
+        && (
+          !this.antigravitySelectedChatId
+          || decorated.selectedChatId === this.antigravitySelectedChatId
+          || Date.now() >= this.antigravitySelectedChatLockedUntil
+        )
+      ) {
+        this.antigravitySelectedChatId = decorated.selectedChatId;
+      }
     }
     if (sourceId === 'cursor') {
       this.cursorSelectedChatId = decorated.selectedChatId ?? this.cursorSelectedChatId;
@@ -1399,6 +1487,48 @@ export class AgentMonitor implements vscode.Disposable {
       ?? this.createAntigravityLiveChatId();
   }
 
+  private pinAntigravitySelectedChat(chatId: string, engagedAt = Date.now()): void {
+    this.antigravitySelectedChatId = chatId;
+    this.antigravitySelectedChatLockedUntil = engagedAt + ANTIGRAVITY_SELECTION_LOCK_MS;
+  }
+
+  private scheduleAntigravityBindingCleanup(executionId: string): void {
+    this.clearAntigravityBindingCleanup(executionId);
+
+    const handle = setTimeout(() => {
+      const activeHandle = this.antigravityBindingCleanupHandles.get(executionId);
+      if (activeHandle !== handle) {
+        return;
+      }
+
+      this.antigravityBindingCleanupHandles.delete(executionId);
+      if (this.antigravityRequestBindings.delete(executionId)) {
+        this.output.appendLine(
+          `[antigravity-live] Released execution binding ${executionId} after waiting for late updates.`
+        );
+      }
+    }, ANTIGRAVITY_LATE_UPDATE_GRACE_MS);
+
+    this.antigravityBindingCleanupHandles.set(executionId, handle);
+  }
+
+  private clearAntigravityBindingCleanup(executionId: string): void {
+    const handle = this.antigravityBindingCleanupHandles.get(executionId);
+    if (!handle) {
+      return;
+    }
+
+    clearTimeout(handle);
+    this.antigravityBindingCleanupHandles.delete(executionId);
+  }
+
+  private clearAntigravityBindingCleanups(): void {
+    for (const handle of this.antigravityBindingCleanupHandles.values()) {
+      clearTimeout(handle);
+    }
+    this.antigravityBindingCleanupHandles.clear();
+  }
+
   private ensureAntigravityLiveChat(
     chatId: string,
     options: {
@@ -1490,10 +1620,19 @@ export class AgentMonitor implements vscode.Disposable {
       }
     }
     this.liveTurns.clear();
+    this.currentLiveTurnKeys.clear();
   }
 
-  private liveTurnKey(sourceId: 'cursor' | 'antigravity', chatId: string): string {
+  private liveChatKey(sourceId: 'cursor' | 'antigravity', chatId: string): string {
     return `${sourceId}:${chatId}`;
+  }
+
+  private buildLiveTurnKey(
+    sourceId: 'cursor' | 'antigravity',
+    chatId: string,
+    turnId: string
+  ): string {
+    return `${sourceId}:${chatId}:${turnId}`;
   }
 
   private ensureLiveTurn(
@@ -1502,8 +1641,11 @@ export class AgentMonitor implements vscode.Disposable {
     startedAt: number,
     forceNew = false
   ): ConversationTurn {
-    const key = this.liveTurnKey(sourceId, chat.id);
-    const existing = this.liveTurns.get(key);
+    const chatKey = this.liveChatKey(sourceId, chat.id);
+    const activeLiveTurnKey = this.currentLiveTurnKeys.get(chatKey);
+    const existing = activeLiveTurnKey
+      ? this.liveTurns.get(activeLiveTurnKey)
+      : undefined;
     if (existing && !forceNew) {
       if (existing.settleHandle) {
         clearTimeout(existing.settleHandle);
@@ -1515,19 +1657,30 @@ export class AgentMonitor implements vscode.Disposable {
     if (existing) {
       if (existing.settleHandle) {
         clearTimeout(existing.settleHandle);
+        existing.settleHandle = undefined;
       }
-      this.logTurnBreakdown(sourceId, chat, existing.turnId, 'superseded-by-new-prompt');
-      this.finalizeTurn(chat, existing.turnId, startedAt);
-      this.liveTurns.delete(key);
+
+      if (existing.pendingRequestIds.size === 0) {
+        this.logTurnBreakdown(sourceId, chat, existing.turnId, 'superseded-by-new-prompt');
+        this.finalizeTurn(chat, existing.turnId, startedAt);
+        this.liveTurns.delete(activeLiveTurnKey!);
+      } else {
+        this.output.appendLine(
+          `[${sourceId}-live] New prompt started while turn ${existing.turnId} still had ${existing.pendingRequestIds.size} pending request(s); isolating prior streams.`
+        );
+      }
     }
 
     const turn = this.createRuntimeTurn(chat, { timestamp: startedAt });
-    this.liveTurns.set(key, {
+    const liveTurnKey = this.buildLiveTurnKey(sourceId, chat.id, turn.id);
+    this.liveTurns.set(liveTurnKey, {
       sourceId,
+      chatKey,
       chatId: chat.id,
       turnId: turn.id,
       pendingRequestIds: new Set(),
     });
+    this.currentLiveTurnKeys.set(chatKey, liveTurnKey);
     return turn;
   }
 
@@ -1538,15 +1691,23 @@ export class AgentMonitor implements vscode.Disposable {
     requestType: InterceptedRequestType,
     startedAt: number,
     forceNewTurn = false
-  ): { turn: ConversationTurn; state: LiveTurnState } {
+  ): { turn: ConversationTurn; state: LiveTurnState & { liveTurnKey: string } } {
     const turn = this.ensureLiveTurn(sourceId, chat, startedAt, forceNewTurn);
-    const key = this.liveTurnKey(sourceId, chat.id);
-    const state = this.liveTurns.get(key);
-    if (!state) {
-      throw new Error(`Missing live turn state for ${key}`);
+    const chatKey = this.liveChatKey(sourceId, chat.id);
+    const liveTurnKey = this.currentLiveTurnKeys.get(chatKey);
+    const baseState = liveTurnKey
+      ? this.liveTurns.get(liveTurnKey)
+      : undefined;
+    if (!baseState || !liveTurnKey) {
+      throw new Error(`Missing live turn state for ${chatKey}`);
     }
 
-    state.pendingRequestIds.add(requestId);
+    const state: LiveTurnState & { liveTurnKey: string } = {
+      ...baseState,
+      liveTurnKey,
+    };
+
+    baseState!.pendingRequestIds.add(requestId);
     return { turn, state };
   }
 
@@ -1554,11 +1715,10 @@ export class AgentMonitor implements vscode.Disposable {
     sourceId: 'cursor' | 'antigravity',
     chatMap: Map<string, ConversationChat>,
     requestId: string,
-    binding: { chatId: string; turnId: string },
+    binding: { chatId: string; turnId: string; liveTurnKey: string },
     completedAt: number
   ): void {
-    const key = this.liveTurnKey(sourceId, binding.chatId);
-    const state = this.liveTurns.get(key);
+    const state = this.liveTurns.get(binding.liveTurnKey);
     if (!state || state.turnId !== binding.turnId) {
       return;
     }
@@ -1573,7 +1733,7 @@ export class AgentMonitor implements vscode.Disposable {
     }
 
     state.settleHandle = setTimeout(() => {
-      const latest = this.liveTurns.get(key);
+      const latest = this.liveTurns.get(binding.liveTurnKey);
       if (!latest || latest.turnId !== binding.turnId || latest.pendingRequestIds.size > 0) {
         return;
       }
@@ -1583,7 +1743,10 @@ export class AgentMonitor implements vscode.Disposable {
         this.logTurnBreakdown(sourceId, chat, binding.turnId, 'settled');
         this.finalizeTurn(chat, binding.turnId, completedAt);
       }
-      this.liveTurns.delete(key);
+      this.liveTurns.delete(binding.liveTurnKey);
+      if (this.currentLiveTurnKeys.get(state.chatKey) === binding.liveTurnKey) {
+        this.currentLiveTurnKeys.delete(state.chatKey);
+      }
       this.scheduleNetworkEmit();
     }, LIVE_TURN_SETTLE_MS);
   }
@@ -1630,19 +1793,65 @@ export class AgentMonitor implements vscode.Disposable {
     }
 
     const inputTokens = estimateQuickTokens(turn.blocks['user-input'].content);
-    const thinkingTokens = turn.capturedTokenUsage?.thinkingTokens
-      ?? estimateQuickTokens(turn.blocks['agent-thinking'].content);
-    const subagentTokens = turn.capturedTokenUsage?.subagentTokens
-      ?? estimateQuickTokens(turn.blocks['agent-subagent'].content);
-    const editorTokens = turn.capturedTokenUsage?.editorTokens
-      ?? estimateQuickTokens(turn.blocks['agent-editor'].content);
-    const outputTokens = turn.capturedTokenUsage?.outputTokens
-      ?? estimateQuickTokens(turn.blocks['agent-output'].content);
+    let thinkingTokens = this.resolveQuickTokenCount(turn, 'thinkingTokens', 'agent-thinking');
+    let subagentTokens = this.resolveQuickTokenCount(turn, 'subagentTokens', 'agent-subagent');
+    let editorTokens = this.resolveQuickTokenCount(turn, 'editorTokens', 'agent-editor');
+    let outputTokens = this.resolveQuickTokenCount(turn, 'outputTokens', 'agent-output');
+
+    for (const childTurn of turn.childTurns ?? []) {
+      const childThinkingTokens = this.resolveQuickTokenCount(childTurn, 'thinkingTokens', 'agent-thinking');
+      const childSubagentTokens = this.resolveQuickTokenCount(childTurn, 'subagentTokens', 'agent-subagent');
+      const childEditorTokens = this.resolveQuickEditorOutputTokenCount(childTurn);
+      const childOutputTokens = this.resolveQuickTokenCount(childTurn, 'outputTokens', 'agent-output');
+      const childInputTokens = childTurn.capturedTokenUsage?.editorInputTokens
+        ?? childTurn.capturedTokenUsage?.inputTokens
+        ?? estimateQuickTokens(childTurn.blocks['user-input'].content);
+      let childTotalTokens = childThinkingTokens + childSubagentTokens + childEditorTokens + childOutputTokens;
+      thinkingTokens += childThinkingTokens;
+      subagentTokens += childSubagentTokens;
+      editorTokens += childEditorTokens;
+      outputTokens += childOutputTokens;
+      if (childTurn.requestType === 'editor') {
+        editorTokens += childInputTokens;
+        childTotalTokens += childInputTokens;
+      } else if (childTurn.requestType === 'subagent') {
+        subagentTokens += childInputTokens;
+        childTotalTokens += childInputTokens;
+      }
+
+      if (childTotalTokens > 0) {
+        this.output.appendLine(
+          `[${sourceId}-live] Child finalized type=${childTurn.requestType ?? 'primary'} request=${childTurn.requestId ?? childTurn.id} input=${childInputTokens} thinking=${childThinkingTokens} subagent=${childSubagentTokens} editor=${childEditorTokens} output=${childOutputTokens} total=${childTotalTokens}`
+        );
+      }
+    }
     const totalTokens = inputTokens + thinkingTokens + subagentTokens + editorTokens + outputTokens;
 
     this.output.appendLine(
       `[${sourceId}-live] Turn finalized (${reason}) input=${inputTokens} thinking=${thinkingTokens} subagent=${subagentTokens} editor=${editorTokens} output=${outputTokens} total=${totalTokens}`
     );
+  }
+
+  private resolveQuickTokenCount(
+    turn: ConversationTurn,
+    key: 'thinkingTokens' | 'subagentTokens' | 'editorTokens' | 'outputTokens',
+    blockType: BlockType
+  ): number {
+    const capturedValue = turn.capturedTokenUsage?.[key];
+    if (typeof capturedValue === 'number' && Number.isFinite(capturedValue) && capturedValue > 0) {
+      return capturedValue;
+    }
+
+    return estimateQuickTokens(turn.blocks[blockType].content);
+  }
+
+  private resolveQuickEditorOutputTokenCount(turn: ConversationTurn): number {
+    const capturedOutput = turn.capturedTokenUsage?.editorOutputTokens;
+    if (typeof capturedOutput === 'number' && Number.isFinite(capturedOutput) && capturedOutput > 0) {
+      return capturedOutput;
+    }
+
+    return this.resolveQuickTokenCount(turn, 'editorTokens', 'agent-editor');
   }
 
   private mergeCapturedTokenUsage(
@@ -1685,6 +1894,41 @@ export class AgentMonitor implements vscode.Disposable {
     chat.turns.push(turn);
     chat.updatedAt = now;
     return turn;
+  }
+
+  private ensureChildTurn(
+    chat: ConversationChat,
+    parentTurn: ConversationTurn,
+    options: {
+      requestId: string;
+      requestType: InterceptedRequestType;
+      timestamp: number;
+      model?: string;
+      modelConfidence?: ModelConfidence;
+    }
+  ): ConversationTurn {
+    parentTurn.childTurns ??= [];
+    const existing = parentTurn.childTurns.find((candidate) => candidate.requestId === options.requestId);
+    if (existing) {
+      return existing;
+    }
+
+    const childTurn: ConversationTurn = {
+      id: `${parentTurn.id}:child:${options.requestId}`,
+      parentTurnId: parentTurn.id,
+      requestId: options.requestId,
+      requestType: options.requestType,
+      createdAt: options.timestamp,
+      updatedAt: options.timestamp,
+      isComplete: false,
+      blocks: createEmptyBlocks(),
+      model: options.model,
+      modelConfidence: options.modelConfidence,
+    };
+
+    parentTurn.childTurns.push(childTurn);
+    this.touchTurn(chat, parentTurn, options.timestamp);
+    return childTurn;
   }
 
   private applyAntigravityLiveChatMetadata(
@@ -1772,6 +2016,62 @@ export class AgentMonitor implements vscode.Disposable {
     return turn;
   }
 
+  private getChildTurn(parentTurn: ConversationTurn, childTurnId: string | undefined): ConversationTurn | undefined {
+    if (!childTurnId) {
+      return undefined;
+    }
+
+    return parentTurn.childTurns?.find((candidate) => candidate.id === childTurnId);
+  }
+
+  private resolveBoundTurn(
+    chat: ConversationChat,
+    binding: { turnId: string; childTurnId?: string }
+  ): { parentTurn: ConversationTurn; targetTurn: ConversationTurn } {
+    const parentTurn = this.mustGetTurn(chat, binding.turnId);
+    const targetTurn = this.getChildTurn(parentTurn, binding.childTurnId) ?? parentTurn;
+    return { parentTurn, targetTurn };
+  }
+
+  private setTurnBlockContent(
+    chat: ConversationChat,
+    turn: ConversationTurn,
+    blockType: BlockType,
+    content: string,
+    isStreaming = false,
+    updatedAt = Date.now(),
+    presentationTurn = turn
+  ): void {
+    turn.blocks[blockType].content = content;
+    turn.blocks[blockType].isStreaming = isStreaming;
+    this.updateChatPresentationFromBlock(chat, blockType, content);
+    this.touchTurn(chat, presentationTurn, updatedAt);
+    if (presentationTurn !== turn) {
+      turn.updatedAt = updatedAt;
+    }
+  }
+
+  private appendTurnBlockContent(
+    chat: ConversationChat,
+    turn: ConversationTurn,
+    blockType: BlockType,
+    delta: string,
+    updatedAt = Date.now(),
+    presentationTurn = turn
+  ): void {
+    if (!delta) {
+      return;
+    }
+
+    turn.blocks[blockType].content += delta;
+    turn.blocks[blockType].isStreaming = true;
+    this.updateChatPresentationFromBlock(chat, blockType, turn.blocks[blockType].content);
+    this.touchTurn(chat, presentationTurn, updatedAt);
+    if (presentationTurn !== turn) {
+      turn.updatedAt = updatedAt;
+    }
+  }
+
   private setBlockContent(
     chat: ConversationChat,
     turnId: string,
@@ -1781,10 +2081,7 @@ export class AgentMonitor implements vscode.Disposable {
     updatedAt = Date.now()
   ): void {
     const turn = this.mustGetTurn(chat, turnId);
-    turn.blocks[blockType].content = content;
-    turn.blocks[blockType].isStreaming = isStreaming;
-    this.updateChatPresentationFromBlock(chat, blockType, content);
-    this.touchTurn(chat, turn, updatedAt);
+    this.setTurnBlockContent(chat, turn, blockType, content, isStreaming, updatedAt);
   }
 
   private appendBlockContent(
@@ -1799,10 +2096,7 @@ export class AgentMonitor implements vscode.Disposable {
     }
 
     const turn = this.mustGetTurn(chat, turnId);
-    turn.blocks[blockType].content += delta;
-    turn.blocks[blockType].isStreaming = true;
-    this.updateChatPresentationFromBlock(chat, blockType, turn.blocks[blockType].content);
-    this.touchTurn(chat, turn, updatedAt);
+    this.appendTurnBlockContent(chat, turn, blockType, delta, updatedAt);
   }
 
   private finalizeTurn(chat: ConversationChat, turnId: string, completedAt = Date.now()): void {

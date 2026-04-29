@@ -80,9 +80,17 @@ interface ResponsePiece {
   content: string;
 }
 
+type ResponsePieceKind = ResponsePiece['kind'];
+
+interface ContentBlockState {
+  kind: ResponsePieceKind;
+  closed: boolean;
+}
+
 interface InterceptedRequestState extends InterceptedTurnStart {
   thinking: string;
   output: string;
+  contentBlocks: Map<string, ContentBlockState>;
   didComplete: boolean;
 }
 
@@ -1532,7 +1540,7 @@ export class NetworkInterceptor implements vscode.Disposable {
 
     if (!isStreaming) {
       const body = Buffer.from(await response.arrayBuffer());
-      const pieces = this.extractResponsePiecesFromBody(body, contentType);
+      const pieces = this.extractResponsePiecesFromBody(body, contentType, requestId);
       for (const piece of pieces) {
         this.appendResponsePiece(requestId, piece);
       }
@@ -1559,7 +1567,7 @@ export class NetworkInterceptor implements vscode.Disposable {
         }
 
         buffer = Buffer.concat([buffer, Buffer.from(value)]);
-        const extracted = this.extractConnectStreamingPieces(buffer, false);
+        const extracted = this.extractConnectStreamingPieces(buffer, false, requestId);
         buffer = extracted.remainder;
 
         for (const piece of extracted.pieces) {
@@ -1568,7 +1576,7 @@ export class NetworkInterceptor implements vscode.Disposable {
       }
 
       if (buffer.length > 0) {
-        const finalPieces = this.extractConnectStreamingPieces(buffer, true);
+        const finalPieces = this.extractConnectStreamingPieces(buffer, true, requestId);
         for (const piece of finalPieces.pieces) {
           this.appendResponsePiece(requestId, piece);
         }
@@ -1589,7 +1597,7 @@ export class NetworkInterceptor implements vscode.Disposable {
       }
 
       buffer += decoder.decode(value, { stream: true });
-      const extracted = this.extractStreamingPieces(buffer, false);
+      const extracted = this.extractStreamingPieces(buffer, false, requestId);
       buffer = extracted.remainder;
 
       for (const piece of extracted.pieces) {
@@ -1598,7 +1606,7 @@ export class NetworkInterceptor implements vscode.Disposable {
     }
 
     buffer += decoder.decode();
-    const finalPieces = this.extractStreamingPieces(buffer, true);
+    const finalPieces = this.extractStreamingPieces(buffer, true, requestId);
     for (const piece of finalPieces.pieces) {
       this.appendResponsePiece(requestId, piece);
     }
@@ -1676,7 +1684,7 @@ export class NetworkInterceptor implements vscode.Disposable {
         (chunk) => {
           this.debugResponseChunk(requestId, contentType, chunk);
           buffer = Buffer.concat([buffer, chunk]);
-          const extracted = this.extractConnectStreamingPieces(buffer, false);
+          const extracted = this.extractConnectStreamingPieces(buffer, false, requestId);
           buffer = extracted.remainder;
 
           for (const piece of extracted.pieces) {
@@ -1685,7 +1693,7 @@ export class NetworkInterceptor implements vscode.Disposable {
         },
         (reason) => {
           if (buffer.length > 0) {
-            const extracted = this.extractConnectStreamingPieces(buffer, true);
+            const extracted = this.extractConnectStreamingPieces(buffer, true, requestId);
             for (const piece of extracted.pieces) {
               this.appendResponsePiece(requestId, piece);
             }
@@ -1704,7 +1712,7 @@ export class NetworkInterceptor implements vscode.Disposable {
       (text) => {
         this.debugResponseChunk(requestId, contentType, text);
         buffer += text;
-        const extracted = this.extractStreamingPieces(buffer, false);
+        const extracted = this.extractStreamingPieces(buffer, false, requestId);
         buffer = extracted.remainder;
 
         for (const piece of extracted.pieces) {
@@ -1713,7 +1721,7 @@ export class NetworkInterceptor implements vscode.Disposable {
       },
       (reason) => {
         if (buffer) {
-          const extracted = this.extractStreamingPieces(buffer, true);
+          const extracted = this.extractStreamingPieces(buffer, true, requestId);
           for (const piece of extracted.pieces) {
             this.appendResponsePiece(requestId, piece);
           }
@@ -1740,7 +1748,7 @@ export class NetworkInterceptor implements vscode.Disposable {
           chunks.push(chunk);
         },
         (reason) => {
-          const pieces = this.extractResponsePiecesFromBody(Buffer.concat(chunks), contentType);
+          const pieces = this.extractResponsePiecesFromBody(Buffer.concat(chunks), contentType, requestId);
           for (const piece of pieces) {
             this.appendResponsePiece(requestId, piece);
           }
@@ -1760,7 +1768,7 @@ export class NetworkInterceptor implements vscode.Disposable {
         body += text;
       },
       (reason) => {
-        const pieces = this.extractResponsePieces(body);
+        const pieces = this.extractResponsePieces(body, requestId);
         for (const piece of pieces) {
           this.appendResponsePiece(requestId, piece);
         }
@@ -1918,7 +1926,7 @@ export class NetworkInterceptor implements vscode.Disposable {
       return undefined;
     }
     const requestText = requestType === 'primary'
-      ? payload.prompt?.trim() ?? ''
+      ? payload.prompt?.trim() ?? payload.requestText?.trim() ?? ''
       : payload.requestText?.trim() ?? payload.prompt?.trim() ?? '';
 
     const requestId = this.createRequestId();
@@ -1935,6 +1943,7 @@ export class NetworkInterceptor implements vscode.Disposable {
       isStreaming: payload.isStreaming,
       thinking: '',
       output: '',
+      contentBlocks: new Map(),
       didComplete: false,
     };
 
@@ -2339,7 +2348,8 @@ export class NetworkInterceptor implements vscode.Disposable {
   ): ParsedRequestPayload {
     const parsedCandidates = this.parseBodyCandidates(body, headers);
     const cursorProxy = this.parseCursorProxyMetadata(headers);
-    const prompt = this.extractPromptFromCandidates(parsedCandidates);
+    const prompt = this.extractPromptFromCandidates(parsedCandidates)
+      ?? this.extractCursorProtoPrompt(body, url, headers);
     const requestText = prompt ?? this.extractRequestTextFromCandidates(parsedCandidates)
       ?? this.extractRequestTextFallback(body, headers);
     const bodyModel = this.findStringByKeys(parsedCandidates, [
@@ -2396,6 +2406,10 @@ export class NetworkInterceptor implements vscode.Disposable {
     headers: Record<string, string>,
     payload: ParsedRequestPayload
   ): InterceptedRequestType {
+    if (provider === 'Cursor' && this.isCursorStreamCppUrl(url)) {
+      return 'editor';
+    }
+
     const normalizedUrl = url.toLowerCase();
     const requestText = `${payload.requestText ?? ''} ${payload.prompt ?? ''}`.toLowerCase();
     const headerText = Object.entries(headers)
@@ -2418,7 +2432,16 @@ export class NetworkInterceptor implements vscode.Disposable {
       return 'subagent';
     }
 
-    if (provider === 'Cursor' && !payload.prompt?.trim() && !this.isCursorTurnUrl(url)) {
+    if (provider === 'Cursor' && this.isCursorNameTabUrl(url)) {
+      return 'primary';
+    }
+
+    if (
+      provider === 'Cursor'
+      && !payload.prompt?.trim()
+      && !payload.requestText?.trim()
+      && !this.isCursorTurnUrl(url)
+    ) {
       return 'subagent';
     }
 
@@ -2437,8 +2460,12 @@ export class NetworkInterceptor implements vscode.Disposable {
     }
 
     if (provider === 'Cursor') {
+      if (this.isCursorCppEditHistoryStatusUrl(url) || this.isCursorCppAppendUrl(url)) {
+        return false;
+      }
+
       return requestType === 'editor'
-        || /chatservice|streamconversation|agentservice\/run|attachbackgroundcomposer/.test(normalizedUrl);
+        || /chatservice|streamconversation|agentservice\/run|attachbackgroundcomposer|aiservice\/nametab/.test(normalizedUrl);
     }
 
     if (provider === 'Antigravity') {
@@ -2630,6 +2657,13 @@ export class NetworkInterceptor implements vscode.Disposable {
     return filtered.join('\n').slice(0, 4000);
   }
 
+  private extractPrintableBodyStrings(body: string | Buffer): string[] {
+    const text = Buffer.isBuffer(body)
+      ? body.toString('utf8')
+      : body;
+    return text.match(/[\x20-\x7E]{4,}/g) ?? [];
+  }
+
   private extractPrompt(parsed: any): string | undefined {
     if (!parsed || typeof parsed !== 'object') {
       return undefined;
@@ -2670,8 +2704,76 @@ export class NetworkInterceptor implements vscode.Disposable {
     return undefined;
   }
 
+  private extractCursorProtoPrompt(
+    body: string | Buffer,
+    url: string,
+    headers: Record<string, string>
+  ): string | undefined {
+    if (!this.isCursorNameTabUrl(url) || !this.isProtoContentType(headers['content-type'] ?? '')) {
+      return undefined;
+    }
+
+    for (const candidate of this.extractPrintableBodyStrings(body)) {
+      const prompt = this.sanitizeCursorPromptText(candidate);
+      if (prompt && prompt !== 'default' && !prompt.startsWith('{')) {
+        return prompt;
+      }
+    }
+
+    return undefined;
+  }
+
+  private sanitizeCursorPromptText(value: string | undefined): string | undefined {
+    const trimmed = value?.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+
+    if (
+      trimmed.startsWith('{')
+      || trimmed.startsWith('file://')
+      || /^[0-9a-f-]{20,}$/i.test(trimmed)
+      || trimmed === 'default'
+      || this.looksLikeFileSystemPath(trimmed)
+    ) {
+      return undefined;
+    }
+
+    return trimmed;
+  }
+
+  private looksLikeFileSystemPath(value: string): boolean {
+    const unquoted = value.replace(/^['"]+|['"]+$/g, '').trim();
+    if (!unquoted) {
+      return false;
+    }
+
+    return /^\/(?:[^/\r\n]+\/)+[^/\r\n]*$/.test(unquoted)
+      || /^[A-Za-z]:\\(?:[^\\\r\n]+\\)+[^\\\r\n]*$/.test(unquoted);
+  }
+
+  private isProtoContentType(contentType: string): boolean {
+    return /application\/proto/i.test(contentType);
+  }
+
+  private isCursorNameTabUrl(url: string): boolean {
+    return /aiservice\/nametab/i.test(url);
+  }
+
+  private isCursorCppEditHistoryStatusUrl(url: string): boolean {
+    return /aiservice\/cppedithistorystatus/i.test(url);
+  }
+
+  private isCursorCppAppendUrl(url: string): boolean {
+    return /aiservice\/cppappend/i.test(url);
+  }
+
+  private isCursorStreamCppUrl(url: string): boolean {
+    return /aiservice\/streamcpp/i.test(url);
+  }
+
   private isCursorTurnUrl(url: string): boolean {
-    return /agentservice\/run|chatservice|streamconversation|backgroundcomposer/i.test(url);
+    return /agentservice\/run|chatservice|streamconversation|backgroundcomposer|aiservice\/nametab/i.test(url);
   }
 
   private extractLastUserMessage(messages: unknown): string | undefined {
@@ -2701,7 +2803,8 @@ export class NetworkInterceptor implements vscode.Disposable {
 
   private extractStreamingPieces(
     buffer: string,
-    flush: boolean
+    flush: boolean,
+    requestId?: string
   ): { pieces: ResponsePiece[]; remainder: string } {
     const normalized = buffer.replace(/\r\n/g, '\n');
     const lines = normalized.split('\n');
@@ -2714,43 +2817,45 @@ export class NetworkInterceptor implements vscode.Disposable {
         continue;
       }
 
-      pieces.push(...this.parseStreamingLine(line));
+      pieces.push(...this.parseStreamingLine(line, requestId));
     }
 
     if (flush && remainder.trim()) {
-      pieces.push(...this.parseStreamingLine(remainder.trim()));
+      pieces.push(...this.parseStreamingLine(remainder.trim(), requestId));
     }
 
     return { pieces, remainder };
   }
 
-  private parseStreamingLine(line: string): ResponsePiece[] {
+  private parseStreamingLine(line: string, requestId?: string): ResponsePiece[] {
     if (line === '[DONE]' || line === 'data: [DONE]') {
       return [];
     }
 
     if (line.startsWith('data:')) {
-      return this.extractResponsePieces(line.slice(5).trim());
+      return this.extractResponsePieces(line.slice(5).trim(), requestId);
     }
 
-    return this.extractResponsePieces(line);
+    return this.extractResponsePieces(line, requestId);
   }
 
   private extractResponsePiecesFromBody(
     body: Buffer,
-    contentType: string
+    contentType: string,
+    requestId?: string
   ): ResponsePiece[] {
     if (this.isConnectJsonContentType(contentType)) {
       return this.extractConnectJsonPayloadTexts(body)
-        .flatMap((payload) => this.extractResponsePieces(payload));
+        .flatMap((payload) => this.extractResponsePieces(payload, requestId));
     }
 
-    return this.extractResponsePieces(body.toString('utf8'));
+    return this.extractResponsePieces(body.toString('utf8'), requestId);
   }
 
   private extractConnectStreamingPieces(
     buffer: Buffer,
-    flush: boolean
+    flush: boolean,
+    requestId?: string
   ): { pieces: ResponsePiece[]; remainder: Buffer } {
     const pieces: ResponsePiece[] = [];
     let offset = 0;
@@ -2769,7 +2874,7 @@ export class NetworkInterceptor implements vscode.Disposable {
         continue;
       }
 
-      pieces.push(...this.extractResponsePieces(payload.toString('utf8')));
+      pieces.push(...this.extractResponsePieces(payload.toString('utf8'), requestId));
     }
 
     return {
@@ -2778,7 +2883,7 @@ export class NetworkInterceptor implements vscode.Disposable {
     };
   }
 
-  private extractResponsePieces(raw: string): ResponsePiece[] {
+  private extractResponsePieces(raw: string, requestId?: string): ResponsePiece[] {
     const trimmed = raw.trim();
     if (!trimmed || trimmed === '[DONE]') {
       return [];
@@ -2786,24 +2891,47 @@ export class NetworkInterceptor implements vscode.Disposable {
 
     try {
       const parsed = JSON.parse(trimmed);
-      return this.extractResponsePiecesFromJson(parsed);
+      return this.extractResponsePiecesFromJson(parsed, requestId);
     } catch {
       return [{ kind: 'agent-output', content: raw }];
     }
   }
 
-  private extractResponsePiecesFromJson(value: any): ResponsePiece[] {
+  private extractResponsePiecesFromJson(value: any, requestId?: string): ResponsePiece[] {
     if (!value || typeof value !== 'object') {
       return [];
     }
 
+    const state = requestId ? this.activeRequests.get(requestId) : undefined;
+
+    if (value.type === 'content_block_start' && value.content_block && state) {
+      const blockId = this.contentBlockId(value);
+      state.contentBlocks.set(blockId, {
+        kind: this.kindForContentBlock(value.content_block),
+        closed: false,
+      });
+      return [];
+    }
+
     if (value.type === 'content_block_delta' && value.delta) {
+      const blockId = this.contentBlockId(value);
+      const blockState = state?.contentBlocks.get(blockId);
+      const deltaKind = this.kindForContentBlock(value.delta);
       return this.compactPieces([
         {
-          kind: value.delta?.type === 'thinking_delta' ? 'agent-thinking' : 'agent-output',
+          kind: blockState?.kind ?? deltaKind,
           content: this.readTextLike(value.delta?.thinking ?? value.delta?.text ?? value.delta?.content),
         },
       ]);
+    }
+
+    if (this.isContentBlockStop(value) && state) {
+      const blockId = this.contentBlockId(value);
+      const blockState = state.contentBlocks.get(blockId);
+      if (blockState) {
+        blockState.closed = true;
+      }
+      return [];
     }
 
     if (Array.isArray(value.content)) {
@@ -2870,7 +2998,7 @@ export class NetworkInterceptor implements vscode.Disposable {
     }
 
     if (value.response?.output) {
-      return this.extractResponsePiecesFromJson({ output: value.response.output });
+      return this.extractResponsePiecesFromJson({ output: value.response.output }, requestId);
     }
 
     return this.compactPieces([
@@ -2879,7 +3007,40 @@ export class NetworkInterceptor implements vscode.Disposable {
       { kind: 'agent-output', content: this.readTextLike(value.output) },
       { kind: 'agent-output', content: this.readTextLike(value.result) },
       { kind: 'agent-output', content: this.readTextLike(value.generated_text) },
+      { kind: 'agent-output', content: this.readTextLike(value.generatedText) },
+      { kind: 'agent-output', content: this.readTextLike(value.insertedText) },
+      { kind: 'agent-output', content: this.readTextLike(value.replacementText) },
+      { kind: 'agent-output', content: this.readTextLike(value.patch) },
+      { kind: 'agent-output', content: this.readTextLike(value.diff) },
+      { kind: 'agent-output', content: this.readTextLike(value.edits) },
     ]);
+  }
+
+  private contentBlockId(value: any): string {
+    const index = value?.index ?? value?.content_block?.index ?? value?.block?.index ?? value?.id;
+    return index === undefined || index === null ? '0' : String(index);
+  }
+
+  private kindForContentBlock(value: any): ResponsePieceKind {
+    const type = String(value?.type ?? value?.blockType ?? value?.kind ?? '').toLowerCase();
+    if (
+      type.includes('thinking')
+      || type.includes('reasoning')
+      || type.includes('thought')
+      || value?.thinking !== undefined
+      || value?.reasoning !== undefined
+    ) {
+      return 'agent-thinking';
+    }
+
+    return 'agent-output';
+  }
+
+  private isContentBlockStop(value: any): boolean {
+    const type = String(value?.type ?? '').toLowerCase();
+    return type === 'content_block_stop'
+      || type === 'content_block_end'
+      || type === 'content_block_done';
   }
 
   private compactPieces(pieces: Array<{ kind: 'agent-thinking' | 'agent-output'; content?: string }>): ResponsePiece[] {

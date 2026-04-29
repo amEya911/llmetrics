@@ -32,6 +32,8 @@ export interface ConversationSegment {
 
 export interface CapturedTokenUsage {
   inputTokens?: number;
+  editorInputTokens?: number;
+  editorOutputTokens?: number;
   thinkingTokens?: number;
   subagentTokens?: number;
   editorTokens?: number;
@@ -113,10 +115,14 @@ export interface SessionMetrics {
 
 export interface ConversationTurn {
   id: string;
+  parentTurnId?: string;
+  requestId?: string;
+  requestType?: InterceptedRequestType;
   createdAt: number;
   updatedAt: number;
   isComplete: boolean;
   blocks: Record<BlockType, ConversationSegment>;
+  childTurns?: ConversationTurn[];
   capturedTokenUsage?: CapturedTokenUsage;
   model?: string;
   modelConfidence?: ModelConfidence;
