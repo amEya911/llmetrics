@@ -839,6 +839,10 @@ class CursorRemoteProbe {
       return false;
     }
 
+    if (providerLooksLikeCursorNewChatNudge(normalizedService, normalizedMethod)) {
+      return false;
+    }
+
     return normalizedService.includes('chatservice')
       || normalizedService.includes('agentservice')
       || (normalizedService.includes('backgroundcomposerservice') && !normalizedMethod.includes('list'))
@@ -921,12 +925,7 @@ class CursorRemoteProbe {
     const requestId = this.createRequestId();
     const url = this.buildCursorConnectUrl(invocation);
     const requestType = this.classifyCursorConnectInvocation(invocation, payload);
-    const requestText = this.normalizeCursorRequestText(requestType === 'primary'
-      ? payload.prompt?.trim() ?? ''
-      : payload.editorInputText?.trim()
-        ?? payload.requestText?.trim()
-        ?? payload.prompt?.trim()
-        ?? '');
+    const requestText = this.pickCursorConnectRequestText(payload, requestType);
     const hasPrompt = Boolean(payload.prompt?.trim());
     const state: InterceptedRequestState = {
       requestId,
@@ -2052,6 +2051,27 @@ class CursorRemoteProbe {
     }
 
     return value;
+  }
+
+  private pickCursorConnectRequestText(
+    payload: ParsedRequestPayload,
+    requestType: InterceptedRequestType
+  ): string {
+    if (requestType === 'primary') {
+      return this.normalizeCursorRequestText(payload.prompt?.trim() ?? '');
+    }
+
+    const editorInputText = this.normalizeCursorRequestText(payload.editorInputText?.trim() ?? '');
+    if (editorInputText) {
+      return editorInputText;
+    }
+
+    const requestText = this.normalizeCursorRequestText(payload.requestText?.trim() ?? '');
+    if (requestText) {
+      return requestText;
+    }
+
+    return this.normalizeCursorRequestText(payload.prompt?.trim() ?? '');
   }
 
   private parseCursorConnectPayload(invocation: CursorConnectInvocation): ParsedRequestPayload {
@@ -3853,6 +3873,10 @@ class CursorRemoteProbe {
     payload: ParsedRequestPayload
   ): boolean {
     const normalizedUrl = url.toLowerCase();
+    if (provider === 'Cursor' && this.isCursorNameTabUrl(url)) {
+      return false;
+    }
+
     if (payload.prompt?.trim()) {
       return true;
     }
@@ -6067,6 +6091,14 @@ class CursorRemoteProbe {
       pid: process.pid,
     });
   }
+}
+
+function providerLooksLikeCursorNewChatNudge(
+  normalizedService: string,
+  normalizedMethod: string
+): boolean {
+  return normalizedService.includes('agentservice')
+    && normalizedMethod === 'getnewchatnudgeparameterizedmodelpicker';
 }
 
 function appendJsonLine(filePath: string, payload: Record<string, unknown>): void {

@@ -14,10 +14,12 @@ import {
 import {
   analyzeChatWithGroq,
   generateFullSessionAnalysis,
+  getAnalysisProviderState,
   renderFullSessionAnalysisHtml,
 } from './groqClient';
 import {
   buildAppStoragePathCandidates,
+  extractCursorActiveComposerIds,
   firstExistingPath,
   formatError,
   readMergedSqliteKeyMap,
@@ -53,6 +55,10 @@ const BUDGET_SETTINGS_KEY = 'aiAgentMonitor.budgetSettings';
 const SESSION_SUMMARIES_KEY = 'aiAgentMonitor.sessionSummaries';
 const CURSOR_APP_STATE_KEY = 'src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser';
 const LIVE_TURN_SETTLE_MS = 10_000;
+const CURSOR_PROVISIONAL_CHAT_GRACE_MS = 45_000;
+const CURSOR_SELECTION_REFRESH_ATTEMPTS = 5;
+const CURSOR_SELECTION_REFRESH_DELAY_MS = 160;
+const CURSOR_TAB_SELECTION_POLL_MS = 250;
 const ANTIGRAVITY_SELECTION_LOCK_MS = 2 * 60_000;
 const ANTIGRAVITY_LATE_UPDATE_GRACE_MS = 60_000;
 
@@ -110,10 +116,27 @@ interface AntigravityRequestBinding {
 
 interface CursorRequestBinding {
   chatId: string;
+  chatConfidence: 'explicit' | 'selection';
+  selectionSource: CursorSelectionSource;
   turnId: string;
   requestType: InterceptedRequestType;
   liveTurnKey: string;
   childTurnId?: string;
+}
+
+type CursorSelectionSource =
+  | 'explicit'
+  | 'tab'
+  | 'provisional-tab'
+  | 'pinned'
+  | 'store'
+  | 'open-turn'
+  | 'ephemeral';
+
+interface CursorTabSelection {
+  chatId?: string;
+  isNewChat: boolean;
+  label?: string;
 }
 
 interface LiveTurnState {
@@ -159,6 +182,7 @@ export class AgentMonitor implements vscode.Disposable {
   private readonly appLabel: string;
   private cursorDiagnosticLogPath?: string;
   private cursorDiagnosticWrite: Promise<void> = Promise.resolve();
+  private cursorTabSelectionPollHandle?: NodeJS.Timeout;
 
   private readonly runtimeChats = new Map<string, ConversationChat>();
   private readonly cursorLiveChats = new Map<string, ConversationChat>();
@@ -187,6 +211,8 @@ export class AgentMonitor implements vscode.Disposable {
   private activeChatEngagedAt = 0;
   private lastAlertIds = new Set<string>();
   private cursorSelectedChatId?: string;
+  private cursorActiveNewChatChatId?: string;
+  private cursorTabIsNewChat = false;
   private antigravitySelectedChatId?: string;
   private antigravitySelectedChatLockedUntil = 0;
 
@@ -232,6 +258,7 @@ export class AgentMonitor implements vscode.Disposable {
 
     if (this.hostApp === 'cursor') {
       this.startCursorNetworkInterceptor();
+      this.startCursorTabSelectionPoll();
     } else if (this.hostApp === 'antigravity') {
       this.startAntigravityCollector();
     }
@@ -288,6 +315,8 @@ export class AgentMonitor implements vscode.Disposable {
     this.currentGroqInsights = [];
     this.groqInsightChatKey = undefined;
     this.cursorSelectedChatId = undefined;
+    this.cursorActiveNewChatChatId = undefined;
+    this.cursorTabIsNewChat = false;
     this.antigravitySelectedChatId = undefined;
     this.antigravitySelectedChatLockedUntil = 0;
 
@@ -328,13 +357,13 @@ export class AgentMonitor implements vscode.Disposable {
       return;
     }
 
-    if (!snapshot.hasGroqKey) {
+    if (!snapshot.analysisProvider.hasAnyKey) {
       const selection = await vscode.window.showInformationMessage(
-        'Set a Groq API key to enable full session analysis.',
+        'Set a Gemini or Groq API key to enable full session analysis. Gemini is preferred when both are configured.',
         'Open Settings'
       );
       if (selection === 'Open Settings') {
-        void vscode.commands.executeCommand('workbench.action.openSettings', 'aiAgentMonitor.groqApiKey');
+        void vscode.commands.executeCommand('workbench.action.openSettings', 'aiAgentMonitor.geminiApiKey');
       }
       return;
     }
@@ -420,6 +449,9 @@ export class AgentMonitor implements vscode.Disposable {
       case 'generateSessionAnalysis':
         void this.generateSessionAnalysisReport();
         return;
+      case 'openApiKeySettings':
+        void vscode.commands.executeCommand('workbench.action.openSettings', 'aiAgentMonitor.geminiApiKey');
+        return;
     }
   }
 
@@ -427,6 +459,10 @@ export class AgentMonitor implements vscode.Disposable {
     this.flushNetworkEmit();
     this.clearLiveTurnState();
     this.clearAntigravityBindingCleanups();
+    if (this.cursorTabSelectionPollHandle) {
+      clearInterval(this.cursorTabSelectionPollHandle);
+      this.cursorTabSelectionPollHandle = undefined;
+    }
     const finalSnapshot = this.lastSnapshot ?? this.buildSnapshot();
     this.persistCompletedSessionIfNeeded(
       this.lastSnapshot,
@@ -476,6 +512,13 @@ export class AgentMonitor implements vscode.Disposable {
     this.sourceWatchers.set(sourceId, watcher);
     this.disposables.push(watcher);
     watcher.start();
+  }
+
+  private startCursorTabSelectionPoll(): void {
+    this.syncCursorSelectedChatFromTabs('startup');
+    this.cursorTabSelectionPollHandle = setInterval(() => {
+      this.syncCursorSelectedChatFromTabs('poll');
+    }, CURSOR_TAB_SELECTION_POLL_MS);
   }
 
   private startCursorNetworkInterceptor(): void {
@@ -549,14 +592,20 @@ export class AgentMonitor implements vscode.Disposable {
       `[cursor-network] Prompt captured via ${captureSource} (${turnStart.prompt.length} chars${modelLabel})`
     );
 
-    const chatId = this.resolveCursorLiveChatId(turnStart.chatId);
+    const resolution = this.resolveCursorLiveChatTarget(turnStart.chatId);
+    const chatId = resolution.chatId;
+    const chatConfidence: CursorRequestBinding['chatConfidence'] = turnStart.chatId ? 'explicit' : 'selection';
     const chat = this.ensureCursorLiveChat(chatId, {
       provider: SOURCE_LABELS.cursor,
       model: turnStart.model,
       modelConfidence: turnStart.modelConfidence,
       startedAt: turnStart.startedAt,
-      title: summarizeForTitle(turnStart.prompt),
-      subtitle: summarizeForSubtitle(turnStart.prompt),
+      title: turnStart.prompt.trim()
+        ? summarizeForTitle(turnStart.prompt)
+        : undefined,
+      subtitle: turnStart.prompt.trim()
+        ? summarizeForSubtitle(turnStart.prompt)
+        : undefined,
     });
     const { turn, state } = this.bindLiveRequest(
       'cursor',
@@ -578,12 +627,14 @@ export class AgentMonitor implements vscode.Disposable {
 
     this.cursorRequestBindings.set(turnStart.requestId, {
       chatId,
+      chatConfidence,
+      selectionSource: turnStart.chatId ? 'explicit' : resolution.source,
       turnId: turn.id,
       requestType: turnStart.requestType,
       liveTurnKey: state.liveTurnKey,
       childTurnId: childTurn?.id,
     });
-    this.cursorSelectedChatId = chatId;
+    this.pinCursorSelectedChat(chatId);
 
     if (childTurn) {
       this.output.appendLine(
@@ -632,6 +683,10 @@ export class AgentMonitor implements vscode.Disposable {
     this.activeChatKey = `cursor:${chat.id}`;
     this.activeChatEngagedAt = turnStart.startedAt;
     this.refreshCursorCollection();
+
+    if (!turnStart.chatId && resolution.source !== 'tab') {
+      void this.refreshCursorSelectionForRequest(turnStart.requestId);
+    }
   }
 
   private handleCursorTurnChunk(turnChunk: CursorInterceptedTurnChunk): void {
@@ -678,12 +733,22 @@ export class AgentMonitor implements vscode.Disposable {
       return;
     }
 
+    if (turnComplete.chatId && turnComplete.chatId !== binding.chatId) {
+      binding.chatConfidence = 'explicit';
+      binding.selectionSource = 'explicit';
+      this.rebindCursorLiveChat(binding.chatId, turnComplete.chatId, 'request-metadata');
+    } else if (turnComplete.chatId) {
+      binding.chatConfidence = 'explicit';
+      binding.selectionSource = 'explicit';
+    }
+
     const chat = this.cursorLiveChats.get(binding.chatId);
     if (!chat) {
       return;
     }
 
     const { parentTurn, targetTurn } = this.resolveBoundTurn(chat, binding);
+    this.backfillCursorPrompt(chat, binding, parentTurn, targetTurn, turnComplete);
     if (turnComplete.model) {
       chat.model = turnComplete.model;
       chat.modelConfidence = turnComplete.modelConfidence;
@@ -742,10 +807,20 @@ export class AgentMonitor implements vscode.Disposable {
       this.touchTurn(chat, parentTurn, turnComplete.completedAt);
     }
 
+    const namedTitle = extractCursorNamedTitle(turnComplete.output);
+    if (namedTitle) {
+      this.applyCursorLiveChatMetadata(chat, {
+        title: namedTitle,
+        updatedAt: turnComplete.completedAt,
+      });
+    }
+
     this.settleLiveRequest('cursor', this.cursorLiveChats, turnComplete.requestId, binding, turnComplete.completedAt);
+    this.syncCursorSelectedChatFromTabs('completion');
     this.cursorRequestBindings.delete(turnComplete.requestId);
-    this.cursorSelectedChatId = binding.chatId;
-    this.activeChatKey = `cursor:${binding.chatId}`;
+    const selectedChatId = this.readCurrentCursorSelectedChatIdFromTabs() ?? binding.chatId;
+    this.pinCursorSelectedChat(selectedChatId);
+    this.activeChatKey = `cursor:${selectedChatId}`;
     this.activeChatEngagedAt = turnComplete.completedAt;
     this.refreshCursorCollection();
   }
@@ -1008,7 +1083,15 @@ export class AgentMonitor implements vscode.Disposable {
       }
     }
     if (sourceId === 'cursor') {
-      this.cursorSelectedChatId = decorated.selectedChatId ?? this.cursorSelectedChatId;
+      const tabSelection = this.readCurrentCursorTabSelectionFromTabs();
+      const preserveProvisionalSelection = tabSelection.isNewChat
+        && Boolean(this.cursorActiveNewChatChatId);
+      if (tabSelection.chatId) {
+        this.cursorSelectedChatId = tabSelection.chatId;
+      } else if (decorated.selectedChatId && !preserveProvisionalSelection) {
+        this.cursorSelectedChatId = decorated.selectedChatId;
+      }
+      this.reconcileCursorLiveChats(decorated);
     }
 
     const resolvedCollection = sourceId === 'antigravity'
@@ -1116,7 +1199,6 @@ export class AgentMonitor implements vscode.Disposable {
     persistedChat: ConversationChat,
     liveChat: ConversationChat
   ): ConversationChat {
-    const shouldPreferLiveTurns = hasOpenTurn(liveChat) || liveChat.updatedAt >= persistedChat.updatedAt;
     const preferredTitle = isGenericLiveTitle(persistedChat.title) && liveChat.title
       ? liveChat.title
       : persistedChat.title || liveChat.title;
@@ -1132,9 +1214,7 @@ export class AgentMonitor implements vscode.Disposable {
       subtitle: preferredSubtitle,
       createdAt: Math.min(persistedChat.createdAt, liveChat.createdAt),
       updatedAt: Math.max(persistedChat.updatedAt, liveChat.updatedAt),
-      turns: shouldPreferLiveTurns
-        ? liveChat.turns.map((turn) => cloneTurn(turn))
-        : persistedChat.turns.map((turn) => cloneTurn(turn)),
+      turns: mergeCursorTurns(persistedChat.turns, liveChat.turns),
       model: preferredModel,
       modelConfidence: preferredConfidence,
     };
@@ -1198,9 +1278,7 @@ export class AgentMonitor implements vscode.Disposable {
   }
 
   private buildSnapshot(): MonitorSnapshot {
-    const config = vscode.workspace.getConfiguration('aiAgentMonitor');
-    const groqKey = config.get<string>('groqApiKey', '');
-    const hasGroqKey = typeof groqKey === 'string' && groqKey.trim().length > 0;
+    const analysisProvider = getAnalysisProviderState();
 
     return buildDashboardSnapshot({
       app: this.hostApp,
@@ -1210,8 +1288,8 @@ export class AgentMonitor implements vscode.Disposable {
       promptLibrary: this.promptLibrary,
       persistedSessions: this.sessionSummaries,
       budgets: this.budgets,
-      hasGroqKey,
-      groqInsights: this.groqInsightChatKey === this.activeChatKey ? this.currentGroqInsights : [],
+      analysisProvider,
+      coachInsights: this.groqInsightChatKey === this.activeChatKey ? this.currentGroqInsights : [],
       sessionAnalysis: this.sessionAnalysisState,
       workspacePaths: this.getWorkspacePaths(),
     });
@@ -1463,16 +1541,63 @@ export class AgentMonitor implements vscode.Disposable {
     return `antigravity-live:${++this.chatCounter}`;
   }
 
-  private resolveCursorLiveChatId(preferredChatId?: string): string {
-    const selectedFromActiveChat = this.activeChatKey?.startsWith('cursor:')
-      ? extractChatId(this.activeChatKey)
-      : undefined;
+  private resolveCursorLiveChatTarget(preferredChatId?: string): { chatId: string; source: CursorSelectionSource } {
+    if (preferredChatId) {
+      return {
+        chatId: preferredChatId,
+        source: 'explicit',
+      };
+    }
 
-    return preferredChatId
-      ?? this.cursorSelectedChatId
-      ?? this.sourceCollections.get('cursor')?.selectedChatId
-      ?? selectedFromActiveChat
-      ?? this.createCursorLiveChatId();
+    const tabSelection = this.readCurrentCursorTabSelectionFromTabs();
+    if (tabSelection.chatId) {
+      return {
+        chatId: tabSelection.chatId,
+        source: 'tab',
+      };
+    }
+
+    if (tabSelection.isNewChat) {
+      return {
+        chatId: this.ensureCursorProvisionalSelectedChat(
+          tabSelection.label ?? 'New Agent',
+          !this.cursorTabIsNewChat
+        ),
+        source: 'provisional-tab',
+      };
+    }
+
+    if (this.cursorSelectedChatId) {
+      return {
+        chatId: this.cursorSelectedChatId,
+        source: 'pinned',
+      };
+    }
+
+    const storeSelectedChatId = this.sourceCollections.get('cursor')?.selectedChatId;
+    if (storeSelectedChatId) {
+      return {
+        chatId: storeSelectedChatId,
+        source: 'store',
+      };
+    }
+
+    const openChatId = this.findOpenCursorLiveChatId();
+    if (openChatId) {
+      return {
+        chatId: openChatId,
+        source: 'open-turn',
+      };
+    }
+
+    return {
+      chatId: this.createCursorLiveChatId(),
+      source: 'ephemeral',
+    };
+  }
+
+  private resolveCursorLiveChatId(preferredChatId?: string): string {
+    return this.resolveCursorLiveChatTarget(preferredChatId).chatId;
   }
 
   private resolveAntigravityLiveChatId(preferredChatId?: string): string {
@@ -1490,6 +1615,270 @@ export class AgentMonitor implements vscode.Disposable {
   private pinAntigravitySelectedChat(chatId: string, engagedAt = Date.now()): void {
     this.antigravitySelectedChatId = chatId;
     this.antigravitySelectedChatLockedUntil = engagedAt + ANTIGRAVITY_SELECTION_LOCK_MS;
+  }
+
+  private pinCursorSelectedChat(chatId: string): void {
+    this.cursorSelectedChatId = chatId;
+  }
+
+  private ensureCursorProvisionalSelectedChat(label: string, forceFresh = false): string {
+    const now = Date.now();
+    if (!forceFresh && this.cursorActiveNewChatChatId) {
+      const activeChat = this.cursorLiveChats.get(this.cursorActiveNewChatChatId);
+      if (activeChat) {
+        this.applyCursorLiveChatMetadata(activeChat, {
+          title: label,
+          updatedAt: now,
+        });
+      }
+      this.cursorSelectedChatId = this.cursorActiveNewChatChatId;
+      return this.cursorActiveNewChatChatId;
+    }
+
+    const selectedProvisional = this.cursorSelectedChatId?.startsWith('cursor-live:')
+      ? this.cursorLiveChats.get(this.cursorSelectedChatId)
+      : undefined;
+    if (!forceFresh && selectedProvisional?.isEphemeral && selectedProvisional.turns.length === 0) {
+      this.applyCursorLiveChatMetadata(selectedProvisional, {
+        title: label,
+        updatedAt: now,
+      });
+      this.cursorSelectedChatId = selectedProvisional.id;
+      this.cursorActiveNewChatChatId = selectedProvisional.id;
+      return selectedProvisional.id;
+    }
+
+    const chatId = this.createCursorLiveChatId();
+    this.ensureCursorLiveChat(chatId, {
+      provider: SOURCE_LABELS.cursor,
+      startedAt: now,
+      title: label,
+    });
+    this.cursorSelectedChatId = chatId;
+    this.cursorActiveNewChatChatId = chatId;
+    return chatId;
+  }
+
+  private syncCursorSelectedChatFromTabs(reason: string): void {
+    const tabSelection = this.readCurrentCursorTabSelectionFromTabs();
+    if (tabSelection.isNewChat) {
+      const previousSelectedChatId = this.cursorSelectedChatId;
+      const provisionalChatId = this.ensureCursorProvisionalSelectedChat(
+        tabSelection.label ?? 'New Agent',
+        !this.cursorTabIsNewChat
+      );
+      this.cursorTabIsNewChat = true;
+      if (provisionalChatId !== previousSelectedChatId) {
+        this.output.appendLine(
+          `[cursor-live] Active tab entered provisional chat ${provisionalChatId} (${reason}).`
+        );
+      }
+      this.refreshCursorCollection();
+      return;
+    }
+
+    this.cursorTabIsNewChat = false;
+    this.cursorActiveNewChatChatId = undefined;
+
+    const selectedChatId = tabSelection.chatId;
+    if (!selectedChatId) {
+      return;
+    }
+
+    const previousSelectedChatId = this.cursorSelectedChatId;
+    if (selectedChatId !== previousSelectedChatId) {
+      this.cursorSelectedChatId = selectedChatId;
+      this.output.appendLine(`[cursor-live] Active tab selected chat ${selectedChatId} (${reason}).`);
+    }
+
+    const liveTurn = this.findReassignableCursorLiveTurnState(selectedChatId);
+    if (liveTurn) {
+      this.reassignCursorLiveTurnToChat(
+        liveTurn.chatId,
+        selectedChatId,
+        liveTurn.turnId,
+        `tab-${reason}`
+      );
+      this.refreshCursorCollection();
+      return;
+    }
+
+    if (selectedChatId !== previousSelectedChatId) {
+      this.refreshCursorCollection();
+    }
+  }
+
+  private findReassignableCursorLiveTurnState(selectedChatId: string): LiveTurnState | undefined {
+    let bestState: LiveTurnState | undefined;
+    let bestUpdatedAt = 0;
+
+    for (const state of this.liveTurns.values()) {
+      if (state.sourceId !== 'cursor' || state.chatId === selectedChatId) {
+        continue;
+      }
+
+      if (!this.canCursorTurnFollowSelectedChat(state.turnId, state.chatId)) {
+        continue;
+      }
+
+      const chat = this.cursorLiveChats.get(state.chatId);
+      const turn = chat?.turns.find((candidate) => candidate.id === state.turnId);
+      if (!chat || !turn) {
+        continue;
+      }
+
+      if (state.pendingRequestIds.size === 0 && !state.settleHandle) {
+        continue;
+      }
+
+      if (turn.updatedAt < bestUpdatedAt) {
+        continue;
+      }
+
+      bestState = state;
+      bestUpdatedAt = turn.updatedAt;
+    }
+
+    return bestState;
+  }
+
+  private canCursorTurnFollowSelectedChat(turnId: string, chatId: string): boolean {
+    let sawBinding = false;
+
+    for (const binding of this.cursorRequestBindings.values()) {
+      if (binding.turnId !== turnId || binding.chatId !== chatId) {
+        continue;
+      }
+
+      sawBinding = true;
+      if (binding.chatConfidence === 'explicit') {
+        return false;
+      }
+    }
+
+    return sawBinding;
+  }
+
+  private readCurrentCursorTabSelectionFromTabs(): CursorTabSelection {
+    if (this.hostApp !== 'cursor') {
+      return {
+        isNewChat: false,
+      };
+    }
+
+    const activeTab = vscode.window.tabGroups.activeTabGroup?.activeTab;
+    if (!activeTab) {
+      return {
+        isNewChat: false,
+      };
+    }
+
+    const candidateIds = new Set<string>();
+    for (const chat of this.sourceCollections.get('cursor')?.chats ?? []) {
+      candidateIds.add(chat.id);
+    }
+    for (const chatId of this.cursorLiveChats.keys()) {
+      candidateIds.add(chatId);
+    }
+
+    const serializedTabStrings = collectCursorTabStrings(activeTab);
+    for (const candidateId of candidateIds) {
+      if (serializedTabStrings.some((value) => value.includes(candidateId))) {
+        return {
+          chatId: candidateId,
+          isNewChat: false,
+          label: activeTab.label,
+        };
+      }
+    }
+
+    const normalizedLabel = normalizeComparableText(activeTab.label);
+    if (normalizedLabel) {
+      const titleMatches = [
+        ...(this.sourceCollections.get('cursor')?.chats ?? []),
+        ...this.cursorLiveChats.values(),
+      ]
+        .filter((chat) => normalizeComparableText(chat.title) === normalizedLabel)
+        .sort((left, right) => right.updatedAt - left.updatedAt);
+      if (titleMatches[0]?.id) {
+        return {
+          chatId: titleMatches[0].id,
+          isNewChat: false,
+          label: activeTab.label,
+        };
+      }
+    }
+
+    const looksLikeNewChat = isCursorGenericNewChatLabel(activeTab.label)
+      || serializedTabStrings.some((value) => isCursorGenericNewChatLabel(value));
+    return {
+      isNewChat: looksLikeNewChat,
+      label: activeTab.label,
+    };
+  }
+
+  private readCurrentCursorSelectedChatIdFromTabs(): string | undefined {
+    return this.readCurrentCursorTabSelectionFromTabs().chatId;
+  }
+
+  private async readCurrentCursorSelectedChatId(): Promise<string | undefined> {
+    const workspaceStorageDir = await this.findCursorWorkspaceStorageDir();
+    if (!workspaceStorageDir) {
+      return undefined;
+    }
+
+    const dbPath = path.join(workspaceStorageDir, 'state.vscdb');
+    const values = await readMergedSqliteKeyMap(dbPath, [
+      'composer.composerData',
+      'memento/workbench.parts.embeddedAuxBarEditor.state',
+    ]);
+    const selectedCandidates = extractCursorActiveComposerIds(
+      values['composer.composerData'],
+      values['memento/workbench.parts.embeddedAuxBarEditor.state']
+    );
+
+    return selectedCandidates[0];
+  }
+
+  private async findCursorWorkspaceStorageDir(): Promise<string | undefined> {
+    const workspacePaths = this.getWorkspacePaths()
+      .map((workspacePath) => normalizeFsPath(workspacePath))
+      .filter((workspacePath): workspacePath is string => Boolean(workspacePath));
+    if (workspacePaths.length === 0) {
+      return undefined;
+    }
+
+    const roots = buildAppStoragePathCandidates('Cursor', 'User', 'workspaceStorage');
+    for (const root of roots) {
+      const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (!entry.isDirectory()) {
+          continue;
+        }
+
+        const workspaceJsonPath = path.join(root, entry.name, 'workspace.json');
+        const raw = await fs.readFile(workspaceJsonPath, 'utf8').catch(() => undefined);
+        if (!raw) {
+          continue;
+        }
+
+        try {
+          const parsed = JSON.parse(raw) as { folder?: string };
+          const workspacePath = normalizeFsPath(fileUriToFsPath(parsed.folder ?? ''));
+          if (!workspacePath) {
+            continue;
+          }
+
+          if (workspacePaths.some((candidate) => pathsEqual(candidate, workspacePath))) {
+            return path.join(root, entry.name);
+          }
+        } catch {
+          // Ignore malformed workspace descriptors.
+        }
+      }
+    }
+
+    return undefined;
   }
 
   private scheduleAntigravityBindingCleanup(executionId: string): void {
@@ -1598,6 +1987,7 @@ export class AgentMonitor implements vscode.Disposable {
       createdAt: persisted?.createdAt ?? timestamp,
       updatedAt: persisted?.updatedAt ?? timestamp,
       turns: persisted?.turns.map((turn) => cloneTurn(turn)) ?? [],
+      isEphemeral: chatId.startsWith('cursor-live:'),
       sourceId: 'cursor',
       sourceLabel: SOURCE_LABELS.cursor,
       model: options.model ?? persisted?.model,
@@ -1995,6 +2385,361 @@ export class AgentMonitor implements vscode.Disposable {
     if (options.updatedAt !== undefined) {
       chat.updatedAt = Math.max(chat.updatedAt, options.updatedAt);
     }
+  }
+
+  private findOpenCursorLiveChatId(): string | undefined {
+    const activeCursorChatId = this.activeChatKey?.startsWith('cursor:')
+      ? extractChatId(this.activeChatKey)
+      : undefined;
+    if (activeCursorChatId) {
+      const activeChat = this.cursorLiveChats.get(activeCursorChatId);
+      if (activeChat && hasOpenTurn(activeChat)) {
+        return activeCursorChatId;
+      }
+    }
+
+    return [...this.cursorLiveChats.values()]
+      .filter((chat) => hasOpenTurn(chat))
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0]
+      ?.id;
+  }
+
+  private backfillCursorPrompt(
+    chat: ConversationChat,
+    binding: CursorRequestBinding,
+    parentTurn: ConversationTurn,
+    targetTurn: ConversationTurn,
+    turnComplete: CursorInterceptedTurnComplete
+  ): void {
+    const prompt = turnComplete.prompt.trim();
+    if (!prompt) {
+      return;
+    }
+
+    if (!parentTurn.blocks['user-input'].content.trim()) {
+      this.setTurnBlockContent(
+        chat,
+        parentTurn,
+        'user-input',
+        prompt,
+        false,
+        turnComplete.completedAt
+      );
+    }
+
+    if (!binding.childTurnId || targetTurn.blocks['user-input'].content.trim()) {
+      return;
+    }
+
+    this.setTurnBlockContent(
+      chat,
+      targetTurn,
+      'user-input',
+      prompt,
+      false,
+      turnComplete.completedAt,
+      parentTurn
+    );
+
+    const inputTokens = estimateQuickTokens(prompt);
+    targetTurn.capturedTokenUsage = {
+      ...targetTurn.capturedTokenUsage,
+      ...(binding.requestType === 'editor'
+        ? { editorInputTokens: inputTokens }
+        : { inputTokens }),
+    };
+  }
+
+  private async refreshCursorSelectionForRequest(requestId: string): Promise<void> {
+    let lastObservedChatId: string | undefined;
+    let stableObservations = 0;
+
+    for (let attempt = 0; attempt < CURSOR_SELECTION_REFRESH_ATTEMPTS; attempt += 1) {
+      const binding = this.cursorRequestBindings.get(requestId);
+      if (!binding) {
+        return;
+      }
+
+      if (binding.chatConfidence === 'explicit' || binding.selectionSource === 'tab') {
+        return;
+      }
+
+      const tabSelection = this.readCurrentCursorTabSelectionFromTabs();
+      if (tabSelection.chatId) {
+        this.cursorTabIsNewChat = false;
+        this.cursorActiveNewChatChatId = undefined;
+        if (tabSelection.chatId === binding.chatId) {
+          this.cursorSelectedChatId = tabSelection.chatId;
+          binding.selectionSource = 'tab';
+          return;
+        }
+
+        this.cursorSelectedChatId = tabSelection.chatId;
+        this.reassignCursorLiveTurnToChat(
+          binding.chatId,
+          tabSelection.chatId,
+          binding.turnId,
+          'selection-refresh-tab'
+        );
+        binding.selectionSource = 'tab';
+        this.refreshCursorCollection();
+        return;
+      }
+
+      if (tabSelection.isNewChat) {
+        this.cursorTabIsNewChat = true;
+        const provisionalChatId = this.ensureCursorProvisionalSelectedChat(tabSelection.label ?? 'New Agent');
+        if (binding.chatId !== provisionalChatId) {
+          this.reassignCursorLiveTurnToChat(
+            binding.chatId,
+            provisionalChatId,
+            binding.turnId,
+            'selection-refresh-new-chat'
+          );
+          binding.selectionSource = 'provisional-tab';
+          this.refreshCursorCollection();
+        }
+      }
+
+      const selectedChatId = await this.readCurrentCursorSelectedChatId();
+      if (selectedChatId) {
+        if (selectedChatId === binding.chatId) {
+          this.cursorSelectedChatId = selectedChatId;
+          binding.selectionSource = 'store';
+          return;
+        }
+
+        if (selectedChatId === lastObservedChatId) {
+          stableObservations += 1;
+        } else {
+          lastObservedChatId = selectedChatId;
+          stableObservations = 1;
+        }
+
+        if (stableObservations >= 2) {
+          this.cursorSelectedChatId = selectedChatId;
+          this.reassignCursorLiveTurnToChat(
+            binding.chatId,
+            selectedChatId,
+            binding.turnId,
+            'selection-refresh'
+          );
+          binding.selectionSource = 'store';
+          this.refreshCursorCollection();
+          return;
+        }
+      }
+
+      if (attempt < CURSOR_SELECTION_REFRESH_ATTEMPTS - 1) {
+        await wait(CURSOR_SELECTION_REFRESH_DELAY_MS);
+      }
+    }
+  }
+
+  private reconcileCursorLiveChats(collection: ConversationCollection): void {
+    for (const liveChat of [...this.cursorLiveChats.values()]) {
+      if (!liveChat.id.startsWith('cursor-live:')) {
+        continue;
+      }
+
+      const matchId = this.findMatchingCursorChatId(liveChat, collection);
+      if (!matchId || matchId === liveChat.id) {
+        continue;
+      }
+
+      this.rebindCursorLiveChat(liveChat.id, matchId, 'store-reconciliation');
+    }
+  }
+
+  private findMatchingCursorChatId(
+    liveChat: ConversationChat,
+    collection: ConversationCollection
+  ): string | undefined {
+    const candidates = collection.chats.filter((candidate) => candidate.id !== liveChat.id);
+    if (candidates.length === 0) {
+      return undefined;
+    }
+
+    const latestPrompt = normalizeComparableText(getLatestPromptTextForChat(liveChat));
+    if (latestPrompt) {
+      const promptMatch = candidates
+        .filter((candidate) => normalizeComparableText(getLatestPromptTextForChat(candidate)) === latestPrompt)
+        .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+      if (promptMatch) {
+        return promptMatch.id;
+      }
+    }
+
+    const normalizedTitle = normalizeComparableText(liveChat.title);
+    if (normalizedTitle && !isGenericLiveTitle(liveChat.title)) {
+      const titleMatch = candidates
+        .filter((candidate) => normalizeComparableText(candidate.title) === normalizedTitle)
+        .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+      if (titleMatch) {
+        return titleMatch.id;
+      }
+    }
+
+    if (!latestPrompt) {
+      const selectedChat = collection.selectedChatId
+        ? candidates.find((candidate) => candidate.id === collection.selectedChatId)
+        : undefined;
+      if (
+        selectedChat
+        && Date.now() - liveChat.updatedAt < CURSOR_PROVISIONAL_CHAT_GRACE_MS
+        && selectedChat.updatedAt >= liveChat.createdAt - 5_000
+      ) {
+        return selectedChat.id;
+      }
+    }
+
+    return undefined;
+  }
+
+  private reassignCursorLiveTurnToChat(
+    fromChatId: string,
+    toChatId: string,
+    turnId: string,
+    reason: string
+  ): void {
+    if (!fromChatId || !toChatId || fromChatId === toChatId) {
+      return;
+    }
+
+    const sourceChat = this.cursorLiveChats.get(fromChatId);
+    if (!sourceChat) {
+      return;
+    }
+
+    const turnIndex = sourceChat.turns.findIndex((candidate) => candidate.id === turnId);
+    if (turnIndex < 0) {
+      return;
+    }
+
+    const [turn] = sourceChat.turns.splice(turnIndex, 1);
+    const targetChat = this.ensureCursorLiveChat(toChatId, {
+      provider: SOURCE_LABELS.cursor,
+      model: turn.model ?? sourceChat.model,
+      modelConfidence: turn.modelConfidence ?? sourceChat.modelConfidence,
+      startedAt: turn.createdAt,
+      title: sourceChat.title,
+      subtitle: sourceChat.subtitle,
+    });
+
+    if (!targetChat.turns.some((candidate) => candidate.id === turn.id)) {
+      targetChat.turns.push(turn);
+    }
+    targetChat.updatedAt = Math.max(targetChat.updatedAt, turn.updatedAt);
+
+    const fromChatKey = this.liveChatKey('cursor', fromChatId);
+    const toChatKey = this.liveChatKey('cursor', toChatId);
+    const liveTurnKey = this.buildLiveTurnKey('cursor', fromChatId, turnId);
+    const nextLiveTurnKey = this.buildLiveTurnKey('cursor', toChatId, turnId);
+    const liveState = this.liveTurns.get(liveTurnKey);
+    if (liveState) {
+      this.liveTurns.delete(liveTurnKey);
+      liveState.chatId = toChatId;
+      liveState.chatKey = toChatKey;
+      this.liveTurns.set(nextLiveTurnKey, liveState);
+      if (this.currentLiveTurnKeys.get(fromChatKey) === liveTurnKey) {
+        this.currentLiveTurnKeys.delete(fromChatKey);
+        this.currentLiveTurnKeys.set(toChatKey, nextLiveTurnKey);
+      }
+    }
+
+    for (const binding of this.cursorRequestBindings.values()) {
+      if (binding.turnId !== turnId || binding.chatId !== fromChatId) {
+        continue;
+      }
+      binding.chatId = toChatId;
+      binding.liveTurnKey = nextLiveTurnKey;
+    }
+
+    if (sourceChat.turns.length === 0 && sourceChat.isEphemeral) {
+      this.cursorLiveChats.delete(fromChatId);
+    }
+
+    if (this.cursorActiveNewChatChatId === fromChatId) {
+      this.cursorActiveNewChatChatId = toChatId;
+    }
+    if (this.activeChatKey === `cursor:${fromChatId}`) {
+      this.activeChatKey = `cursor:${toChatId}`;
+    }
+
+    this.output.appendLine(
+      `[cursor-live] Reassigned live turn ${turnId} ${fromChatId} -> ${toChatId} (${reason}).`
+    );
+  }
+
+  private rebindCursorLiveChat(
+    fromChatId: string,
+    toChatId: string,
+    reason: string
+  ): void {
+    if (!fromChatId || !toChatId || fromChatId === toChatId) {
+      return;
+    }
+
+    const liveChat = this.cursorLiveChats.get(fromChatId);
+    if (!liveChat) {
+      return;
+    }
+
+    const targetChat = this.cursorLiveChats.get(toChatId);
+    const mergedChat = targetChat
+      ? this.mergeCursorChat(targetChat, liveChat)
+      : cloneChat(liveChat);
+    mergedChat.id = toChatId;
+    mergedChat.isEphemeral = false;
+
+    this.cursorLiveChats.delete(fromChatId);
+    this.cursorLiveChats.set(toChatId, mergedChat);
+
+    const fromChatKey = this.liveChatKey('cursor', fromChatId);
+    const toChatKey = this.liveChatKey('cursor', toChatId);
+
+    for (const [liveTurnKey, state] of [...this.liveTurns.entries()]) {
+      if (state.sourceId !== 'cursor' || state.chatId !== fromChatId) {
+        continue;
+      }
+
+      const nextLiveTurnKey = this.buildLiveTurnKey('cursor', toChatId, state.turnId);
+      this.liveTurns.delete(liveTurnKey);
+      state.chatId = toChatId;
+      state.chatKey = toChatKey;
+      this.liveTurns.set(nextLiveTurnKey, state);
+
+      if (this.currentLiveTurnKeys.get(fromChatKey) === liveTurnKey) {
+        this.currentLiveTurnKeys.delete(fromChatKey);
+        this.currentLiveTurnKeys.set(toChatKey, nextLiveTurnKey);
+      }
+
+      for (const binding of this.cursorRequestBindings.values()) {
+        if (binding.liveTurnKey === liveTurnKey) {
+          binding.liveTurnKey = nextLiveTurnKey;
+        }
+      }
+    }
+
+    for (const binding of this.cursorRequestBindings.values()) {
+      if (binding.chatId === fromChatId) {
+        binding.chatId = toChatId;
+      }
+    }
+
+    if (this.cursorActiveNewChatChatId === fromChatId) {
+      this.cursorActiveNewChatChatId = toChatId;
+    }
+    if (this.cursorSelectedChatId === fromChatId) {
+      this.cursorSelectedChatId = toChatId;
+    }
+    if (this.activeChatKey === `cursor:${fromChatId}`) {
+      this.activeChatKey = `cursor:${toChatId}`;
+    }
+
+    this.output.appendLine(
+      `[cursor-live] Rebound provisional chat ${fromChatId} -> ${toChatId} (${reason}).`
+    );
   }
 
   private getLastOpenRuntimeTurn(chat: ConversationChat): ConversationTurn | undefined {
@@ -2665,6 +3410,203 @@ function latestPromptUpdatedAt(chat: ConversationChat): number {
   return updatedAt;
 }
 
+function getLatestPromptTextForChat(chat: ConversationChat): string {
+  let latestTurn: ConversationTurn | undefined;
+
+  for (const turn of chat.turns) {
+    if (!turn.blocks['user-input'].content.trim()) {
+      continue;
+    }
+
+    if (!latestTurn || turn.updatedAt >= latestTurn.updatedAt) {
+      latestTurn = turn;
+    }
+  }
+
+  return latestTurn?.blocks['user-input'].content ?? '';
+}
+
+function mergeCursorTurns(
+  persistedTurns: ConversationTurn[],
+  liveTurns: ConversationTurn[]
+): ConversationTurn[] {
+  if (persistedTurns.length === 0) {
+    return liveTurns.map((turn) => cloneTurn(turn));
+  }
+
+  if (liveTurns.length === 0) {
+    return persistedTurns.map((turn) => cloneTurn(turn));
+  }
+
+  const persisted = persistedTurns.map((turn) => cloneTurn(turn));
+  const live = liveTurns.map((turn) => cloneTurn(turn));
+  const matchedPersisted = new Set<number>();
+  const merged: ConversationTurn[] = [];
+
+  live.forEach((liveTurn, liveIndex) => {
+    const matchIndex = findMatchingCursorTurnIndex(persisted, liveTurn, liveIndex, matchedPersisted);
+    if (matchIndex === undefined) {
+      merged.push(liveTurn);
+      return;
+    }
+
+    matchedPersisted.add(matchIndex);
+    merged.push(mergeConversationTurn(persisted[matchIndex], liveTurn));
+  });
+
+  persisted.forEach((persistedTurn, index) => {
+    if (!matchedPersisted.has(index)) {
+      merged.push(persistedTurn);
+    }
+  });
+
+  return merged.sort((left, right) => {
+    if (left.createdAt !== right.createdAt) {
+      return left.createdAt - right.createdAt;
+    }
+    return left.id.localeCompare(right.id);
+  });
+}
+
+function findMatchingCursorTurnIndex(
+  persistedTurns: ConversationTurn[],
+  liveTurn: ConversationTurn,
+  liveIndex: number,
+  matchedPersisted: Set<number>
+): number | undefined {
+  const livePrompt = normalizeComparableText(liveTurn.blocks['user-input'].content);
+  if (livePrompt) {
+    const promptMatch = persistedTurns.findIndex((candidate, index) =>
+      !matchedPersisted.has(index)
+      && normalizeComparableText(candidate.blocks['user-input'].content) === livePrompt
+    );
+    if (promptMatch !== -1) {
+      return promptMatch;
+    }
+  }
+
+  if (liveIndex < persistedTurns.length && !matchedPersisted.has(liveIndex)) {
+    return liveIndex;
+  }
+
+  const liveSignature = buildTurnMatchSignature(liveTurn);
+  if (liveSignature) {
+    const signatureMatch = persistedTurns.findIndex((candidate, index) =>
+      !matchedPersisted.has(index)
+      && buildTurnMatchSignature(candidate) === liveSignature
+    );
+    if (signatureMatch !== -1) {
+      return signatureMatch;
+    }
+  }
+
+  return undefined;
+}
+
+function buildTurnMatchSignature(turn: ConversationTurn): string {
+  return [
+    turn.requestType ?? 'primary',
+    normalizeComparableText(turn.blocks['user-input'].content),
+    normalizeComparableText(turn.blocks['agent-editor'].content),
+    normalizeComparableText(turn.blocks['agent-subagent'].content),
+    normalizeComparableText(turn.blocks['agent-output'].content),
+  ]
+    .filter(Boolean)
+    .join('::');
+}
+
+function mergeConversationTurn(
+  persistedTurn: ConversationTurn,
+  liveTurn: ConversationTurn
+): ConversationTurn {
+  const merged = cloneTurn(liveTurn);
+  merged.parentTurnId = liveTurn.parentTurnId ?? persistedTurn.parentTurnId;
+  merged.requestId = liveTurn.requestId ?? persistedTurn.requestId;
+  merged.requestType = liveTurn.requestType ?? persistedTurn.requestType;
+  merged.createdAt = Math.min(persistedTurn.createdAt, liveTurn.createdAt);
+  merged.updatedAt = Math.max(persistedTurn.updatedAt, liveTurn.updatedAt);
+  merged.isComplete = liveTurn.isComplete || persistedTurn.isComplete;
+  merged.model = liveTurn.model ?? persistedTurn.model;
+  merged.modelConfidence = liveTurn.modelConfidence ?? persistedTurn.modelConfidence;
+
+  for (const blockType of BLOCK_TYPES) {
+    merged.blocks[blockType] = mergeConversationSegment(
+      persistedTurn.blocks[blockType],
+      liveTurn.blocks[blockType]
+    );
+  }
+
+  merged.capturedTokenUsage = mergeCapturedUsageObjects(
+    persistedTurn.capturedTokenUsage,
+    liveTurn.capturedTokenUsage
+  );
+
+  const persistedChildren = persistedTurn.childTurns ?? [];
+  const liveChildren = liveTurn.childTurns ?? [];
+  const mergedChildren = mergeCursorTurns(persistedChildren, liveChildren);
+  if (mergedChildren.length > 0) {
+    merged.childTurns = mergedChildren;
+  }
+
+  return merged;
+}
+
+function mergeConversationSegment(
+  persistedSegment: ConversationSegment | undefined,
+  liveSegment: ConversationSegment | undefined
+): ConversationSegment {
+  const persistedContent = persistedSegment?.content ?? '';
+  const liveContent = liveSegment?.content ?? '';
+  let content = liveContent;
+
+  if (!liveContent.trim()) {
+    content = persistedContent;
+  } else if (persistedContent.trim() && persistedContent.length > liveContent.length) {
+    content = persistedContent;
+  }
+
+  return {
+    content,
+    isStreaming: Boolean(liveSegment?.isStreaming || persistedSegment?.isStreaming),
+  };
+}
+
+function mergeCapturedUsageObjects(
+  persisted: CapturedTokenUsage | undefined,
+  live: CapturedTokenUsage | undefined
+): CapturedTokenUsage | undefined {
+  if (!persisted && !live) {
+    return undefined;
+  }
+
+  const merged: CapturedTokenUsage = {
+    ...persisted,
+    ...live,
+  };
+  for (const key of [
+    'inputTokens',
+    'editorInputTokens',
+    'editorOutputTokens',
+    'thinkingTokens',
+    'subagentTokens',
+    'editorTokens',
+    'outputTokens',
+  ] as const) {
+    const persistedValue = persisted?.[key];
+    const liveValue = live?.[key];
+    if (typeof persistedValue === 'number' && typeof liveValue === 'number') {
+      merged[key] = Math.max(persistedValue, liveValue);
+    }
+  }
+
+  return merged;
+}
+
+function extractCursorNamedTitle(value: string): string | undefined {
+  const match = value.match(/<name>([^<]+)<\/name>/i);
+  return match?.[1]?.trim() || undefined;
+}
+
 function snapshotContainsChat(sources: SourceSnapshot[], chatKey: string): boolean {
   return Boolean(findChatByKey(sources, chatKey));
 }
@@ -2691,4 +3633,130 @@ function extractChatId(chatKey: string): string {
 
 function normalizeComparableText(value: string): string {
   return value.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function isCursorGenericNewChatLabel(value: string | undefined): boolean {
+  const normalized = normalizeComparableText(value ?? '');
+  return normalized === 'new agent'
+    || normalized === 'new chat'
+    || normalized === 'untitled chat'
+    || normalized.startsWith('new agent ');
+}
+
+function wait(durationMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, durationMs);
+  });
+}
+
+function collectCursorTabStrings(tab: vscode.Tab): string[] {
+  const rawTab = tab as vscode.Tab & { tooltip?: string | { value?: string } };
+  const values = new Set<string>();
+  const tooltipValue = typeof rawTab.tooltip === 'string'
+    ? rawTab.tooltip
+    : rawTab.tooltip?.value;
+
+  pushCursorTabString(values, tab.label);
+  pushCursorTabString(values, tooltipValue);
+  collectCursorValueStrings(tab.input, values, 0, new WeakSet<object>());
+
+  return [...values];
+}
+
+function collectCursorValueStrings(
+  value: unknown,
+  values: Set<string>,
+  depth: number,
+  visited: WeakSet<object>
+): void {
+  if (depth > 3 || value === null || value === undefined) {
+    return;
+  }
+
+  if (typeof value === 'string') {
+    pushCursorTabString(values, value);
+    return;
+  }
+
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+    pushCursorTabString(values, String(value));
+    return;
+  }
+
+  if (typeof value !== 'object') {
+    return;
+  }
+
+  const record = value as Record<string, unknown>;
+  if (visited.has(record)) {
+    return;
+  }
+  visited.add(record);
+
+  const maybeUri = record as Partial<vscode.Uri>;
+  pushCursorTabString(values, maybeUri.fsPath);
+  pushCursorTabString(values, maybeUri.path);
+  pushCursorTabString(values, maybeUri.fragment);
+  pushCursorTabString(values, maybeUri.query);
+  if (typeof (maybeUri as { toString?: () => string }).toString === 'function') {
+    try {
+      pushCursorTabString(values, (maybeUri as { toString: () => string }).toString());
+    } catch {
+      // Ignore inaccessible toString implementations.
+    }
+  }
+
+  for (const key of Object.getOwnPropertyNames(record)) {
+    if (key.startsWith('_')) {
+      continue;
+    }
+
+    let nextValue: unknown;
+    try {
+      nextValue = record[key];
+    } catch {
+      continue;
+    }
+
+    collectCursorValueStrings(nextValue, values, depth + 1, visited);
+  }
+}
+
+function pushCursorTabString(target: Set<string>, value: string | undefined): void {
+  if (!value) {
+    return;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  target.add(trimmed);
+}
+
+function fileUriToFsPath(value: string): string {
+  if (!value) {
+    return value;
+  }
+
+  try {
+    return value.startsWith('file:')
+      ? path.normalize(new URL(value).pathname)
+      : value;
+  } catch {
+    return value;
+  }
+}
+
+function normalizeFsPath(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  return path.normalize(value);
+}
+
+function pathsEqual(left: string, right: string): boolean {
+  return normalizeFsPath(left) === normalizeFsPath(right);
 }

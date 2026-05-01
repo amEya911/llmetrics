@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import {
   buildAppStoragePathCandidates,
+  extractCursorActiveComposerIds,
   extractAntigravitySelectedModelName,
   firstExistingPath,
   formatError,
@@ -14,6 +15,7 @@ import {
 import {
   BLOCK_TYPES,
   BlockType,
+  cloneTurn,
   ConversationChat,
   ConversationCollection,
   ConversationSegment,
@@ -53,8 +55,37 @@ interface CursorComposerHeader {
 }
 
 interface CursorComposerState {
+  activeComposerIds: string[];
   selectedComposerIds: string[];
   lastFocusedComposerIds: string[];
+}
+
+interface CursorTranscriptToolUse {
+  name: string;
+  content: string;
+  prompt?: string;
+}
+
+interface CursorTranscriptEntry {
+  role: string;
+  text: string;
+  toolUses: CursorTranscriptToolUse[];
+  timestamp?: number;
+}
+
+interface CursorTranscriptTurnDraft {
+  userInput: string;
+  assistantEntries: CursorTranscriptEntry[];
+  editorToolUses: CursorTranscriptToolUse[];
+  fallbackSubagentToolUses: CursorTranscriptToolUse[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+interface CursorSubagentTranscript {
+  createdAt: number;
+  updatedAt: number;
+  turn: ConversationTurn;
 }
 
 interface AntigravitySummaryEntry {
@@ -410,6 +441,7 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     }
 
     const selectedCandidates = [
+      ...composerState.activeComposerIds,
       ...composerState.lastFocusedComposerIds,
       ...composerState.selectedComposerIds,
     ];
@@ -540,6 +572,7 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     const workspaceStorageDir = await findWorkspaceStorageDir('Cursor', workspacePaths);
     if (!workspaceStorageDir) {
       return {
+        activeComposerIds: [],
         selectedComposerIds: [],
         lastFocusedComposerIds: [],
       };
@@ -548,10 +581,15 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     const dbPath = path.join(workspaceStorageDir, 'state.vscdb');
     this.logDiscoveredRoot(dbPath, 'Cursor workspace state');
 
-    const values = await readMergedSqliteKeyMap(dbPath, ['composer.composerData']);
+    const values = await readMergedSqliteKeyMap(dbPath, [
+      'composer.composerData',
+      'memento/workbench.parts.embeddedAuxBarEditor.state',
+    ]);
     const raw = values['composer.composerData'];
+    const embeddedState = values['memento/workbench.parts.embeddedAuxBarEditor.state'];
     if (!raw) {
       return {
+        activeComposerIds: extractCursorActiveComposerIds(undefined, embeddedState),
         selectedComposerIds: [],
         lastFocusedComposerIds: [],
       };
@@ -560,12 +598,14 @@ export class ConversationStoreWatcher implements vscode.Disposable {
     try {
       const parsed = JSON.parse(raw) as Partial<CursorComposerState>;
       return {
+        activeComposerIds: extractCursorActiveComposerIds(raw, embeddedState),
         selectedComposerIds: Array.isArray(parsed.selectedComposerIds) ? parsed.selectedComposerIds : [],
         lastFocusedComposerIds: Array.isArray(parsed.lastFocusedComposerIds) ? parsed.lastFocusedComposerIds : [],
       };
     } catch (error) {
       this.output.appendLine(`[stores] Failed to parse Cursor composer state: ${formatError(error)}`);
       return {
+        activeComposerIds: extractCursorActiveComposerIds(undefined, embeddedState),
         selectedComposerIds: [],
         lastFocusedComposerIds: [],
       };
@@ -766,8 +806,7 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       stats?.mtimeMs ?? 0,
       createdAt
     );
-
-    const entries: Array<{ role: string; text: string }> = [];
+    const entries: CursorTranscriptEntry[] = [];
     for (const line of (raw ?? '').split(/\r?\n/)) {
       const trimmed = line.trim();
       if (!trimmed) {
@@ -777,58 +816,65 @@ export class ConversationStoreWatcher implements vscode.Disposable {
       try {
         const parsed = JSON.parse(trimmed);
         const role = typeof parsed?.role === 'string' ? parsed.role : '';
-        const text = extractStructuredMessageText(parsed?.message);
-        if (role && text) {
-          entries.push({ role, text });
+        const message = extractCursorStructuredMessage(parsed?.message);
+        if (role && (message.text || message.toolUses.length > 0)) {
+          entries.push({
+            role,
+            text: message.text,
+            toolUses: message.toolUses,
+            timestamp: parseEmbeddedTimestamp(message.text),
+          });
         }
       } catch {
         // Ignore incomplete trailing lines while the host is still writing.
       }
     }
 
-    const turns: ConversationTurn[] = [];
-    let currentTurn: { userInput: string; assistantMessages: string[] } | undefined;
+    const drafts: CursorTranscriptTurnDraft[] = [];
+    let currentTurn: CursorTranscriptTurnDraft | undefined;
 
     for (const entry of entries) {
       if (entry.role === 'user') {
+        const normalizedUserInput = normalizeUserMessage(entry.text);
+        const turnTimestamp = entry.timestamp ?? updatedAt + drafts.length;
         currentTurn = {
-          userInput: normalizeUserMessage(entry.text),
-          assistantMessages: [],
+          userInput: normalizedUserInput,
+          assistantEntries: [],
+          editorToolUses: [],
+          fallbackSubagentToolUses: [],
+          createdAt: turnTimestamp,
+          updatedAt: turnTimestamp,
         };
-        turns.push(
-          this.createTurnFromMessages(
-            `${composerId}:turn:${turns.length + 1}`,
-            currentTurn.userInput,
-            [],
-            createdAt + turns.length,
-            updatedAt + turns.length,
-            false
-          )
-        );
+        drafts.push(currentTurn);
         continue;
       }
 
-      if (entry.role !== 'assistant' || !currentTurn || turns.length === 0) {
+      if (entry.role !== 'assistant' || !currentTurn) {
         continue;
       }
 
-      const assistantText = normalizeAssistantMessage(entry.text);
-      if (!assistantText) {
-        continue;
+      currentTurn.updatedAt = Math.max(currentTurn.updatedAt, entry.timestamp ?? currentTurn.updatedAt);
+      currentTurn.assistantEntries.push(entry);
+      for (const toolUse of entry.toolUses) {
+        if (isCursorEditorToolName(toolUse.name)) {
+          currentTurn.editorToolUses.push(toolUse);
+        } else if (isCursorSubagentToolName(toolUse.name)) {
+          currentTurn.fallbackSubagentToolUses.push(toolUse);
+        }
       }
-
-      currentTurn.assistantMessages.push(assistantText);
-      const latestTurn = turns[turns.length - 1];
-      const reconstructed = this.createTurnFromMessages(
-        latestTurn.id,
-        currentTurn.userInput,
-        currentTurn.assistantMessages,
-        latestTurn.createdAt,
-        updatedAt + turns.length,
-        Date.now() - updatedAt < STREAMING_GRACE_MS
-      );
-      turns[turns.length - 1] = reconstructed;
     }
+
+    const subagentTranscripts = await this.readCursorSubagentTranscripts(path.dirname(filePath));
+    const turns = drafts.map((draft, index) =>
+      this.buildCursorTranscriptTurn(
+        composerId,
+        index,
+        draft,
+        drafts,
+        subagentTranscripts,
+        updatedAt
+      )
+    );
 
     const latestTurn = turns[turns.length - 1];
     const title = normalizeTitle(header?.name)
@@ -853,6 +899,215 @@ export class ConversationStoreWatcher implements vscode.Disposable {
         ? header.contextUsagePercent
         : undefined,
     };
+  }
+
+  private buildCursorTranscriptTurn(
+    composerId: string,
+    index: number,
+    draft: CursorTranscriptTurnDraft,
+    drafts: CursorTranscriptTurnDraft[],
+    subagentTranscripts: CursorSubagentTranscript[],
+    fileUpdatedAt: number
+  ): ConversationTurn {
+    const assistantMessages = draft.assistantEntries
+      .map((entry) => normalizeAssistantMessage(entry.text))
+      .filter((value): value is string => Boolean(value));
+    const turn = this.createTurnFromMessages(
+      `${composerId}:turn:${index + 1}`,
+      draft.userInput,
+      assistantMessages,
+      draft.createdAt || fileUpdatedAt + index,
+      Math.max(draft.updatedAt, fileUpdatedAt + index),
+      Date.now() - Math.max(draft.updatedAt, fileUpdatedAt) < STREAMING_GRACE_MS
+    );
+
+    const childTurns: ConversationTurn[] = [];
+    const nextDraft = drafts[index + 1];
+    const matchingSubagents = subagentTranscripts.filter((candidate) =>
+      candidate.createdAt >= draft.createdAt
+      && (!nextDraft || candidate.createdAt < nextDraft.createdAt)
+    );
+
+    if (matchingSubagents.length > 0) {
+      childTurns.push(...matchingSubagents.map((candidate) => cloneTurn(candidate.turn)));
+    } else if (draft.fallbackSubagentToolUses.length > 0) {
+      childTurns.push(
+        ...draft.fallbackSubagentToolUses.map((toolUse, toolIndex) =>
+          this.createCursorToolChildTurn(
+            `${turn.id}:child:subagent:${toolIndex + 1}`,
+            'subagent',
+            toolUse.prompt ?? toolUse.content,
+            toolUse.content,
+            draft.createdAt + toolIndex,
+            draft.updatedAt + toolIndex
+          )
+        )
+      );
+    }
+
+    if (draft.editorToolUses.length > 0) {
+      childTurns.push(
+        ...draft.editorToolUses.map((toolUse, toolIndex) =>
+          this.createCursorToolChildTurn(
+            `${turn.id}:child:editor:${toolIndex + 1}`,
+            'editor',
+            '',
+            toolUse.content,
+            draft.createdAt + matchingSubagents.length + toolIndex,
+            draft.updatedAt + matchingSubagents.length + toolIndex
+          )
+        )
+      );
+    }
+
+    if (childTurns.length > 0) {
+      turn.childTurns = childTurns
+        .sort((left, right) => {
+          if (left.createdAt !== right.createdAt) {
+            return left.createdAt - right.createdAt;
+          }
+          return left.id.localeCompare(right.id);
+        });
+      turn.updatedAt = Math.max(
+        turn.updatedAt,
+        ...turn.childTurns.map((childTurn) => childTurn.updatedAt)
+      );
+      turn.isComplete = true;
+    }
+
+    return turn;
+  }
+
+  private async readCursorSubagentTranscripts(composerDir: string): Promise<CursorSubagentTranscript[]> {
+    const subagentsDir = path.join(composerDir, 'subagents');
+    if (!(await pathExists(subagentsDir))) {
+      return [];
+    }
+
+    const entries = await readDirSafe(subagentsDir);
+    const transcripts = await Promise.all(
+      entries
+        .filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl'))
+        .map(async (entry) => this.parseCursorSubagentTranscript(path.join(subagentsDir, entry.name)))
+    );
+
+    return transcripts
+      .filter((candidate): candidate is CursorSubagentTranscript => Boolean(candidate))
+      .sort((left, right) => {
+        if (left.createdAt !== right.createdAt) {
+          return left.createdAt - right.createdAt;
+        }
+        return left.turn.id.localeCompare(right.turn.id);
+      });
+  }
+
+  private async parseCursorSubagentTranscript(
+    filePath: string
+  ): Promise<CursorSubagentTranscript | undefined> {
+    const stats = await safeStat(filePath);
+    const raw = await safeReadFile(filePath);
+    if (!raw) {
+      return undefined;
+    }
+
+    let userInput = '';
+    let createdAt = stats?.birthtimeMs ?? stats?.mtimeMs ?? Date.now();
+    let updatedAt = stats?.mtimeMs ?? createdAt;
+    const assistantMessages: string[] = [];
+    const toolSummaries: string[] = [];
+
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(trimmed);
+        const role = typeof parsed?.role === 'string' ? parsed.role : '';
+        const message = extractCursorStructuredMessage(parsed?.message);
+        const timestamp = parseEmbeddedTimestamp(message.text);
+        if (role === 'user' && message.text) {
+          userInput = normalizeUserMessage(message.text);
+          if (timestamp) {
+            createdAt = timestamp;
+          }
+          continue;
+        }
+
+        if (role !== 'assistant') {
+          continue;
+        }
+
+        const assistantText = normalizeAssistantMessage(message.text);
+        if (assistantText) {
+          assistantMessages.push(assistantText);
+        }
+        for (const toolUse of message.toolUses) {
+          if (normalizeComparableText(toolUse.name) === 'updatecurrentstep') {
+            continue;
+          }
+          toolSummaries.push(formatCursorToolUseSummary(toolUse));
+        }
+      } catch {
+        // Ignore malformed trailing lines while the subagent transcript is still being written.
+      }
+    }
+
+    if (!userInput && assistantMessages.length === 0 && toolSummaries.length === 0) {
+      return undefined;
+    }
+
+    const turn = this.createTurnFromMessages(
+      path.basename(filePath, '.jsonl'),
+      userInput,
+      assistantMessages,
+      createdAt,
+      updatedAt,
+      Date.now() - updatedAt < STREAMING_GRACE_MS
+    );
+    turn.requestType = 'subagent';
+    if (toolSummaries.length > 0) {
+      turn.blocks['agent-subagent'] = {
+        content: toolSummaries.join('\n\n'),
+        isStreaming: Date.now() - updatedAt < STREAMING_GRACE_MS,
+      };
+      turn.isComplete = true;
+    }
+
+    return {
+      createdAt,
+      updatedAt,
+      turn,
+    };
+  }
+
+  private createCursorToolChildTurn(
+    turnId: string,
+    requestType: 'subagent' | 'editor',
+    userInput: string,
+    content: string,
+    createdAt: number,
+    updatedAt: number
+  ): ConversationTurn {
+    const blocks = this.createTurnFromMessages(
+      turnId,
+      userInput,
+      [],
+      createdAt,
+      updatedAt,
+      false
+    ).blocks;
+
+    blocks[requestType === 'editor' ? 'agent-editor' : 'agent-subagent'] = {
+      content,
+      isStreaming: false,
+    };
+
+    const turn = this.createTurn(turnId, blocks, createdAt, updatedAt);
+    turn.requestType = requestType;
+    turn.isComplete = true;
+    return turn;
   }
 
   private async parseAntigravitySummaryChat(
@@ -1368,47 +1623,134 @@ function parseAntigravitySelectedChatIdFromJetskiState(
   }
 }
 
-function extractStructuredMessageText(message: unknown): string {
+function extractCursorStructuredMessage(message: unknown): {
+  text: string;
+  toolUses: CursorTranscriptToolUse[];
+} {
   if (!message || typeof message !== 'object') {
-    return '';
+    return {
+      text: '',
+      toolUses: [],
+    };
   }
 
   const content = (message as any).content;
   if (typeof content === 'string') {
-    return content;
+    return {
+      text: content,
+      toolUses: [],
+    };
   }
 
   if (!Array.isArray(content)) {
+    return {
+      text: '',
+      toolUses: [],
+    };
+  }
+
+  const textParts: string[] = [];
+  const toolUses: CursorTranscriptToolUse[] = [];
+
+  for (const part of content) {
+    if (!part || typeof part !== 'object') {
+      continue;
+    }
+
+    if ((part as any).type === 'text' && typeof (part as any).text === 'string') {
+      textParts.push((part as any).text);
+      continue;
+    }
+
+    if ((part as any).type === 'tool_use') {
+      const name = typeof (part as any).name === 'string'
+        ? (part as any).name
+        : 'Tool';
+      const input = (part as any).input;
+      const prompt = typeof input?.prompt === 'string' ? input.prompt.trim() : undefined;
+      toolUses.push({
+        name,
+        content: normalizeCursorToolInput(input),
+        prompt,
+      });
+    }
+  }
+
+  return {
+    text: textParts.filter(Boolean).join('\n'),
+    toolUses,
+  };
+}
+
+function normalizeCursorToolInput(value: unknown): string {
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+
+  if (value === undefined) {
     return '';
   }
 
-  return content
-    .map((part) => {
-      if (!part || typeof part !== 'object') {
-        return '';
-      }
+  try {
+    return JSON.stringify(value, null, 2).trim();
+  } catch {
+    return String(value);
+  }
+}
 
-      if ((part as any).type === 'text' && typeof (part as any).text === 'string') {
-        return (part as any).text;
-      }
+function parseEmbeddedTimestamp(value: string): number | undefined {
+  const match = value.match(/<timestamp>([\s\S]*?)<\/timestamp>/i);
+  if (!match?.[1]) {
+    return undefined;
+  }
 
-      return '';
-    })
-    .filter(Boolean)
-    .join('\n');
+  const normalized = match[1].replace(/\s*\(UTC[^)]*\)\s*/gi, ' ').trim();
+  const parsed = Date.parse(normalized);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function stripEmbeddedTimestamps(value: string): string {
+  return value.replace(/<timestamp>[\s\S]*?<\/timestamp>\s*/gi, '');
+}
+
+function normalizeComparableText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function isCursorSubagentToolName(name: string): boolean {
+  return normalizeComparableText(name) === 'subagent';
+}
+
+function isCursorEditorToolName(name: string): boolean {
+  const normalized = normalizeComparableText(name).replace(/\s+/g, '');
+  return normalized === 'applypatch'
+    || normalized === 'edit'
+    || normalized === 'multiedit'
+    || normalized === 'writefile'
+    || normalized === 'notebookedit'
+    || normalized === 'rewrite';
+}
+
+function formatCursorToolUseSummary(toolUse: CursorTranscriptToolUse): string {
+  if (!toolUse.content) {
+    return toolUse.name;
+  }
+
+  return `${toolUse.name}\n${toolUse.content}`;
 }
 
 function normalizeUserMessage(value: string): string {
-  return value
+  const withoutTimestamp = stripEmbeddedTimestamps(value);
+  return withoutTimestamp
     .replace(/^\s*<user_query>\s*/i, '')
     .replace(/\s*<\/user_query>\s*$/i, '')
     .trim();
 }
 
 function normalizeAssistantMessage(value: string): string {
-  const normalized = value
-    .replace(/\n?\[REDACTED\]\s*$/g, '')
-    .trim();
+  const normalized = stripEmbeddedTimestamps(
+    value.replace(/\n?\[REDACTED\]\s*$/g, '')
+  ).trim();
 
   return normalized === '[REDACTED]' ? '' : normalized;
 }
@@ -1571,12 +1913,29 @@ function fingerprintCollection(collection: ConversationCollection): string {
       contextUsagePercent: chat.contextUsagePercent,
       turns: chat.turns.map((turn) => ({
         id: turn.id,
+        requestType: turn.requestType,
         createdAt: turn.createdAt,
         updatedAt: turn.updatedAt,
         isComplete: turn.isComplete,
         userInput: turn.blocks['user-input'],
         thinking: turn.blocks['agent-thinking'],
+        subagent: turn.blocks['agent-subagent'],
+        editor: turn.blocks['agent-editor'],
         output: turn.blocks['agent-output'],
+        capturedTokenUsage: turn.capturedTokenUsage,
+        childTurns: turn.childTurns?.map((childTurn) => ({
+          id: childTurn.id,
+          requestType: childTurn.requestType,
+          createdAt: childTurn.createdAt,
+          updatedAt: childTurn.updatedAt,
+          isComplete: childTurn.isComplete,
+          userInput: childTurn.blocks['user-input'],
+          thinking: childTurn.blocks['agent-thinking'],
+          subagent: childTurn.blocks['agent-subagent'],
+          editor: childTurn.blocks['agent-editor'],
+          output: childTurn.blocks['agent-output'],
+          capturedTokenUsage: childTurn.capturedTokenUsage,
+        })),
       })),
     })),
   });

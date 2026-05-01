@@ -20,8 +20,10 @@ const STREAM_STARTUP_STALL_MS = 4_000;
 const BRAIN_COMPLETION_GRACE_MS = 30_000;
 const BRAIN_IDLE_AUTOCOMPLETE_MS = 15_000;
 const BRAIN_LIVE_DISCOVERY_MAX_AGE_MS = 10 * 60 * 1000;
+const BRAIN_DIRECTORY_SCAN_INTERVAL_MS = 2_000;
 const MAX_ACTIVE_STREAM_TARGETS = 12;
 const MAX_BRAIN_DISCOVERY_CONVERSATIONS = 12;
+const MAX_RECENT_BRAIN_CONVERSATIONS = 12;
 const CONNECT_END_STREAM_FLAG = 0x02;
 const PS_OUTPUT_MAX_BUFFER = 4 * 1024 * 1024;
 
@@ -110,6 +112,13 @@ interface OverviewLogEntry {
   createdAt?: number;
   content?: string;
   toolCalls: Array<{ name?: string; args?: Record<string, unknown> }>;
+}
+
+interface BrainArtifactEntry {
+  baseName: string;
+  filePath: string;
+  content: string;
+  updatedAt: number;
 }
 
 interface StreamState {
@@ -201,8 +210,11 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
   private tickHandle?: NodeJS.Timeout;
   private lastDiscoveryAt = 0;
   private lastSearchAt = 0;
+  private lastBrainDirectoryScanAt = 0;
   private discoveryInFlight = false;
   private searchInFlight = false;
+  private brainDirectoryScanInFlight = false;
+  private recentBrainConversationIds: string[] = [];
 
   constructor(options: CollectorOptions) {
     this.output = options.output;
@@ -274,12 +286,15 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
     }
 
     if (!this.clientInfo || this.searchInFlight || now - this.lastSearchAt < SEARCH_INTERVAL_MS) {
+      await this.refreshRecentBrainConversationIds(now);
+      this.ensureRecentBrainStreamsOpen(now);
       await this.syncBrainFallbacks();
       return;
     }
 
     this.searchInFlight = true;
     try {
+      await this.refreshRecentBrainConversationIds(now);
       await this.refreshConversationSearch();
     } finally {
       this.searchInFlight = false;
@@ -674,6 +689,9 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
     if (preferredConversationId) {
       targetIds.add(preferredConversationId);
     }
+    for (const conversationId of this.recentBrainConversationIds.slice(0, MAX_ACTIVE_STREAM_TARGETS)) {
+      targetIds.add(conversationId);
+    }
     for (const result of streamResults.slice(0, MAX_ACTIVE_STREAM_TARGETS)) {
       if (result.cascadeId) {
         targetIds.add(result.cascadeId);
@@ -681,6 +699,61 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
     }
 
     const now = Date.now();
+    for (const conversationId of targetIds) {
+      if (this.activeStreams.has(conversationId)) {
+        continue;
+      }
+
+      const nextAttemptAt = this.nextStreamAttemptAt.get(conversationId) ?? 0;
+      if (nextAttemptAt > now) {
+        continue;
+      }
+
+      this.openConversationStream(conversationId);
+    }
+  }
+
+  private async refreshRecentBrainConversationIds(now = Date.now()): Promise<void> {
+    if (
+      this.brainDirectoryScanInFlight
+      || now - this.lastBrainDirectoryScanAt < BRAIN_DIRECTORY_SCAN_INTERVAL_MS
+    ) {
+      return;
+    }
+
+    this.brainDirectoryScanInFlight = true;
+    try {
+      const recentConversationIds = await listRecentBrainConversationIds(MAX_RECENT_BRAIN_CONVERSATIONS);
+      const previousIds = new Set(this.recentBrainConversationIds);
+      const newlyDiscovered = recentConversationIds.filter((conversationId) => !previousIds.has(conversationId));
+
+      this.recentBrainConversationIds = recentConversationIds;
+      this.lastBrainDirectoryScanAt = now;
+
+      for (const conversationId of newlyDiscovered) {
+        this.output.appendLine(
+          `[antigravity-ls] Discovered recent brain conversation ${conversationId}.`
+        );
+      }
+    } finally {
+      this.brainDirectoryScanInFlight = false;
+    }
+  }
+
+  private ensureRecentBrainStreamsOpen(now = Date.now()): void {
+    if (!this.clientInfo) {
+      return;
+    }
+
+    const targetIds = new Set<string>();
+    const preferredConversationId = this.getPreferredConversationId?.();
+    if (preferredConversationId) {
+      targetIds.add(preferredConversationId);
+    }
+    for (const conversationId of this.recentBrainConversationIds.slice(0, MAX_ACTIVE_STREAM_TARGETS)) {
+      targetIds.add(conversationId);
+    }
+
     for (const conversationId of targetIds) {
       if (this.activeStreams.has(conversationId)) {
         continue;
@@ -1218,6 +1291,10 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       conversationIds.add(summary.conversationId);
     }
 
+    for (const conversationId of this.recentBrainConversationIds) {
+      conversationIds.add(conversationId);
+    }
+
     for (const run of this.runStates.values()) {
       conversationIds.add(run.conversationId);
     }
@@ -1271,9 +1348,13 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
         return !run.prompt || normalizeBrainFallbackText(run.prompt).toLowerCase() === normalizedPrompt;
       }
 
-      return !run.completed
-        && Boolean(run.prompt)
-        && normalizeBrainFallbackText(run.prompt).toLowerCase() === normalizedPrompt;
+      const latestActivityAt = run.lastUpdatedAt ?? run.promptStartedAt ?? 0;
+      return Boolean(run.prompt)
+        && normalizeBrainFallbackText(run.prompt).toLowerCase() === normalizedPrompt
+        && (
+          !run.completed
+          || (latestActivityAt > 0 && Date.now() - latestActivityAt < BRAIN_LIVE_DISCOVERY_MAX_AGE_MS)
+        );
     });
     if (matchingRun) {
       if (snapshot.promptStepIndex !== undefined) {
@@ -1347,7 +1428,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
   }
 
   private async syncBrainFallbackForRun(run: ActiveRunState): Promise<void> {
-    const snapshot = await loadBrainFallbackSnapshot(run.conversationId);
+    const snapshot = await loadBrainFallbackSnapshotForRun(run.conversationId, run);
     if (!snapshot) {
       return;
     }
@@ -1356,7 +1437,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
   }
 
   private syncBrainFallbackForRunSync(run: ActiveRunState): void {
-    const snapshot = loadBrainFallbackSnapshotSync(run.conversationId);
+    const snapshot = loadBrainFallbackSnapshotForRunSync(run.conversationId, run);
     if (!snapshot) {
       return;
     }
@@ -1440,7 +1521,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
       );
     }
 
-    if (!run.completed && run.startedEmitted) {
+    if (run.startedEmitted) {
       this._onTurnUpdate.fire({
         conversationId: run.conversationId,
         executionId: run.executionId,
@@ -1456,7 +1537,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
         editor: run.editor,
         output: run.output,
         capturedTokenUsage: { ...run.capturedTokenUsage },
-        isComplete: false,
+        isComplete: run.completed,
       });
     }
   }
@@ -2023,6 +2104,30 @@ function stepTimestamp(metadata: any): number | undefined {
 async function loadBrainFallbackSnapshot(
   conversationId: string
 ): Promise<BrainFallbackSnapshot | undefined> {
+  const inputs = await loadBrainSnapshotInputs(conversationId);
+  if (!inputs) {
+    return undefined;
+  }
+
+  return buildBrainFallbackSnapshot(inputs.overviewRaw, inputs.artifactEntries);
+}
+
+async function loadBrainFallbackSnapshotForRun(
+  conversationId: string,
+  run: Pick<ActiveRunState, 'prompt' | 'promptStartedAt' | 'promptStepIndex'>
+): Promise<BrainFallbackSnapshot | undefined> {
+  const inputs = await loadBrainSnapshotInputs(conversationId);
+  if (!inputs) {
+    return undefined;
+  }
+
+  return buildBrainFallbackSnapshotForRun(inputs.overviewRaw, inputs.artifactEntries, run)
+    ?? buildBrainFallbackSnapshot(inputs.overviewRaw, inputs.artifactEntries);
+}
+
+async function loadBrainSnapshotInputs(
+  conversationId: string
+): Promise<{ overviewRaw: string; artifactEntries: BrainArtifactEntry[] } | undefined> {
   const brainDir = path.join(os.homedir(), '.gemini', 'antigravity', 'brain', conversationId);
   const overviewPath = path.join(brainDir, '.system_generated', 'logs', 'overview.txt');
 
@@ -2034,35 +2139,60 @@ async function loadBrainFallbackSnapshot(
     return undefined;
   }
 
-  const artifactEntries = await Promise.all(
-    brainEntries
-      .filter((entry) =>
-        entry.isFile()
-        && !entry.name.startsWith('.')
-        && !entry.name.endsWith('.metadata.json')
-        && !entry.name.includes('.resolved')
-      )
+  const artifactEntries = await loadBrainArtifactEntries(brainDir, brainEntries);
+
+  return { overviewRaw, artifactEntries };
+}
+
+async function listRecentBrainConversationIds(limit: number): Promise<string[]> {
+  const brainRoot = path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
+  const entries = await safeReadDirEntries(brainRoot);
+  const candidates = await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory() && isUuidLike(entry.name))
       .map(async (entry) => {
-        const filePath = path.join(brainDir, entry.name);
-        const [content, stats] = await Promise.all([
-          safeReadUtf8(filePath),
-          safeStat(filePath),
-        ]);
+        const dirPath = path.join(brainRoot, entry.name);
+        const stats = await safeStat(dirPath);
         return {
-          baseName: entry.name,
-          filePath,
-          content: normalizeBrainFallbackText(content),
+          conversationId: entry.name,
           updatedAt: stats?.mtimeMs ?? 0,
         };
       })
   );
 
-  return buildBrainFallbackSnapshot(overviewRaw, artifactEntries);
+  return candidates
+    .sort((left, right) => right.updatedAt - left.updatedAt)
+    .slice(0, Math.max(0, limit))
+    .map((candidate) => candidate.conversationId);
 }
 
 function loadBrainFallbackSnapshotSync(
   conversationId: string
 ): BrainFallbackSnapshot | undefined {
+  const inputs = loadBrainSnapshotInputsSync(conversationId);
+  if (!inputs) {
+    return undefined;
+  }
+
+  return buildBrainFallbackSnapshot(inputs.overviewRaw, inputs.artifactEntries);
+}
+
+function loadBrainFallbackSnapshotForRunSync(
+  conversationId: string,
+  run: Pick<ActiveRunState, 'prompt' | 'promptStartedAt' | 'promptStepIndex'>
+): BrainFallbackSnapshot | undefined {
+  const inputs = loadBrainSnapshotInputsSync(conversationId);
+  if (!inputs) {
+    return undefined;
+  }
+
+  return buildBrainFallbackSnapshotForRun(inputs.overviewRaw, inputs.artifactEntries, run)
+    ?? buildBrainFallbackSnapshot(inputs.overviewRaw, inputs.artifactEntries);
+}
+
+function loadBrainSnapshotInputsSync(
+  conversationId: string
+): { overviewRaw: string; artifactEntries: BrainArtifactEntry[] } | undefined {
   const brainDir = path.join(os.homedir(), '.gemini', 'antigravity', 'brain', conversationId);
   const overviewPath = path.join(brainDir, '.system_generated', 'logs', 'overview.txt');
   if (!fsSync.existsSync(overviewPath)) {
@@ -2083,44 +2213,16 @@ function loadBrainFallbackSnapshotSync(
     brainEntries = [];
   }
 
-  const artifactEntries = brainEntries
-    .filter((entry) =>
-      entry.isFile()
-      && !entry.name.startsWith('.')
-      && !entry.name.endsWith('.metadata.json')
-      && !entry.name.includes('.resolved')
-    )
-    .map((entry) => {
-      const filePath = path.join(brainDir, entry.name);
-      let content = '';
-      let updatedAt = 0;
-      try {
-        content = fsSync.readFileSync(filePath, 'utf8');
-      } catch {
-        content = '';
-      }
-      try {
-        updatedAt = fsSync.statSync(filePath).mtimeMs;
-      } catch {
-        updatedAt = 0;
-      }
+  const artifactEntries = loadBrainArtifactEntriesSync(brainDir, brainEntries);
 
-      return {
-        baseName: entry.name,
-        filePath,
-        content: normalizeBrainFallbackText(content),
-        updatedAt,
-      };
-    });
-
-  return buildBrainFallbackSnapshot(overviewRaw, artifactEntries);
+  return { overviewRaw, artifactEntries };
 }
 
 function buildBrainFallbackSnapshot(
   overviewRaw: string,
-  artifactEntries: Array<{ baseName: string; filePath: string; content: string; updatedAt: number }>
+  artifactEntries: BrainArtifactEntry[]
 ): BrainFallbackSnapshot | undefined {
-  const steps = parseOverviewLogEntries(overviewRaw);
+  const steps = coalesceOverviewLogEntries(parseOverviewLogEntries(overviewRaw));
   if (steps.length === 0) {
     return undefined;
   }
@@ -2204,6 +2306,216 @@ function buildBrainFallbackSnapshot(
   };
 }
 
+async function loadBrainArtifactEntries(
+  brainDir: string,
+  brainEntries: fsSync.Dirent[]
+): Promise<BrainArtifactEntry[]> {
+  const groups = new Map<string, string[]>();
+  for (const entry of brainEntries) {
+    if (
+      !entry.isFile()
+      || entry.name.startsWith('.')
+      || entry.name.endsWith('.metadata.json')
+      || !isBrainSnapshotContentArtifactFile(entry.name)
+    ) {
+      continue;
+    }
+
+    const baseName = toBrainSnapshotBaseName(entry.name);
+    const existing = groups.get(baseName) ?? [];
+    existing.push(path.join(brainDir, entry.name));
+    groups.set(baseName, existing);
+  }
+
+  return Promise.all(
+    [...groups.entries()].map(async ([baseName, contentPaths]) => {
+      const candidates = await Promise.all(
+        contentPaths.map(async (filePath) => ({
+          filePath,
+          fileName: path.basename(filePath),
+          stats: await safeStat(filePath),
+        }))
+      );
+      const currentCandidate = candidates
+        .sort((left, right) => {
+          const mtimeDiff = (right.stats?.mtimeMs ?? 0) - (left.stats?.mtimeMs ?? 0);
+          if (mtimeDiff !== 0) {
+            return mtimeDiff;
+          }
+
+          return brainResolvedVariantPriority(right.fileName) - brainResolvedVariantPriority(left.fileName);
+        })[0];
+      const content = await safeReadUtf8(currentCandidate?.filePath ?? '');
+      return {
+        baseName,
+        filePath: currentCandidate?.filePath ?? path.join(brainDir, baseName),
+        content: normalizeBrainFallbackText(content),
+        updatedAt: currentCandidate?.stats?.mtimeMs ?? 0,
+      };
+    })
+  );
+}
+
+function loadBrainArtifactEntriesSync(
+  brainDir: string,
+  brainEntries: fsSync.Dirent[]
+): BrainArtifactEntry[] {
+  const groups = new Map<string, string[]>();
+  for (const entry of brainEntries) {
+    if (
+      !entry.isFile()
+      || entry.name.startsWith('.')
+      || entry.name.endsWith('.metadata.json')
+      || !isBrainSnapshotContentArtifactFile(entry.name)
+    ) {
+      continue;
+    }
+
+    const baseName = toBrainSnapshotBaseName(entry.name);
+    const existing = groups.get(baseName) ?? [];
+    existing.push(path.join(brainDir, entry.name));
+    groups.set(baseName, existing);
+  }
+
+  return [...groups.entries()].map(([baseName, contentPaths]) => {
+    const currentCandidate = contentPaths
+      .map((filePath) => {
+        let stats: fsSync.Stats | undefined;
+        try {
+          stats = fsSync.statSync(filePath);
+        } catch {
+          stats = undefined;
+        }
+
+        return {
+          filePath,
+          fileName: path.basename(filePath),
+          stats,
+        };
+      })
+      .sort((left, right) => {
+        const mtimeDiff = (right.stats?.mtimeMs ?? 0) - (left.stats?.mtimeMs ?? 0);
+        if (mtimeDiff !== 0) {
+          return mtimeDiff;
+        }
+
+        return brainResolvedVariantPriority(right.fileName) - brainResolvedVariantPriority(left.fileName);
+      })[0];
+
+    let content = '';
+    try {
+      content = fsSync.readFileSync(currentCandidate?.filePath ?? '', 'utf8');
+    } catch {
+      content = '';
+    }
+
+    return {
+      baseName,
+      filePath: currentCandidate?.filePath ?? path.join(brainDir, baseName),
+      content: normalizeBrainFallbackText(content),
+      updatedAt: currentCandidate?.stats?.mtimeMs ?? 0,
+    };
+  });
+}
+
+function buildBrainFallbackSnapshotForRun(
+  overviewRaw: string,
+  artifactEntries: BrainArtifactEntry[],
+  run: Pick<ActiveRunState, 'prompt' | 'promptStartedAt' | 'promptStepIndex'>
+): BrainFallbackSnapshot | undefined {
+  const normalizedPrompt = normalizeBrainFallbackText(run.prompt);
+  const promptStartedAt = run.promptStartedAt ?? 0;
+  if (!normalizedPrompt || !promptStartedAt) {
+    return undefined;
+  }
+
+  const steps = coalesceOverviewLogEntries(parseOverviewLogEntries(overviewRaw));
+  if (steps.length === 0 && artifactEntries.length === 0) {
+    return undefined;
+  }
+
+  const timeFloor = Math.max(0, promptStartedAt - 2_000);
+  const relevantSteps = steps.filter((step) => (step.createdAt ?? 0) >= timeFloor);
+  const relevantArtifacts = artifactEntries
+    .filter((artifact) => artifact.updatedAt >= timeFloor)
+    .sort((left, right) => left.baseName.localeCompare(right.baseName));
+
+  let promptStepIndex = run.promptStepIndex;
+  let thinking = '';
+  let editor = '';
+  let output = '';
+  let updatedAt = 0;
+  const referencedArtifactPaths = new Set<string>();
+
+  for (const step of relevantSteps) {
+    updatedAt = Math.max(updatedAt, step.createdAt ?? 0);
+
+    if (step.type === 'USER_INPUT') {
+      const stepPrompt = extractOverviewPrompt(step.content);
+      if (stepPrompt && promptsMatch(normalizedPrompt, stepPrompt)) {
+        promptStepIndex = step.stepIndex ?? promptStepIndex;
+      }
+      continue;
+    }
+
+    if (step.type !== 'PLANNER_RESPONSE') {
+      continue;
+    }
+
+    const stepContent = normalizeBrainFallbackText(step.content);
+    if (stepContent) {
+      output = mergeStepText(output, stepContent);
+    }
+
+    for (const toolCall of step.toolCalls) {
+      for (const target of resolveOverviewToolCallTarget(toolCall)) {
+        referencedArtifactPaths.add(target.filePath);
+      }
+
+      if (classifyOverviewToolCall(toolCall) !== 'editor') {
+        continue;
+      }
+
+      const toolText = buildOverviewToolCallText(toolCall);
+      if (toolText) {
+        editor = mergeStepText(editor, toolText);
+      }
+    }
+  }
+
+  const targetedArtifacts = relevantArtifacts.filter((artifact) => referencedArtifactPaths.has(artifact.filePath));
+  const artifactsToMerge = targetedArtifacts.length > 0 ? targetedArtifacts : relevantArtifacts;
+  for (const artifact of artifactsToMerge) {
+    updatedAt = Math.max(updatedAt, artifact.updatedAt);
+    if (!artifact.content) {
+      continue;
+    }
+
+    if (classifyBrainFallbackArtifact(artifact.baseName, artifact.filePath) === 'thinking') {
+      thinking = mergeStepText(thinking, artifact.content);
+    } else {
+      output = mergeStepText(output, artifact.content);
+    }
+  }
+
+  const normalizedThinking = normalizeBrainFallbackText(thinking);
+  const normalizedEditor = normalizeBrainFallbackText(editor);
+  const normalizedOutput = normalizeBrainFallbackText(output);
+  if (!normalizedThinking && !normalizedEditor && !normalizedOutput) {
+    return undefined;
+  }
+
+  return {
+    prompt: normalizedPrompt,
+    promptStartedAt,
+    promptStepIndex,
+    thinking: normalizedThinking || undefined,
+    editor: normalizedEditor || undefined,
+    output: normalizedOutput || undefined,
+    updatedAt: updatedAt || promptStartedAt || undefined,
+  };
+}
+
 function parseOverviewLogEntries(overviewRaw: string): OverviewLogEntry[] {
   return overviewRaw
     .split(/\r?\n/)
@@ -2234,6 +2546,55 @@ function parseOverviewLogEntries(overviewRaw: string): OverviewLogEntry[] {
     });
 }
 
+function coalesceOverviewLogEntries(entries: OverviewLogEntry[]): OverviewLogEntry[] {
+  const order: string[] = [];
+  const coalesced = new Map<string, OverviewLogEntry>();
+
+  entries.forEach((entry, index) => {
+    const key = Number.isFinite(entry.stepIndex)
+      ? `step:${entry.stepIndex}`
+      : `entry:${index}`;
+    const previous = coalesced.get(key);
+    if (!previous) {
+      order.push(key);
+    }
+
+    coalesced.set(key, {
+      stepIndex: entry.stepIndex ?? previous?.stepIndex,
+      source: entry.source ?? previous?.source,
+      type: entry.type ?? previous?.type,
+      status: entry.status ?? previous?.status,
+      createdAt: Math.max(entry.createdAt ?? 0, previous?.createdAt ?? 0) || entry.createdAt || previous?.createdAt,
+      content: entry.content ?? previous?.content,
+      toolCalls: entry.toolCalls.length > 0
+        ? entry.toolCalls
+        : previous?.toolCalls ?? [],
+    });
+  });
+
+  return order
+    .map((key) => coalesced.get(key))
+    .filter((entry): entry is OverviewLogEntry => Boolean(entry));
+}
+
+function isBrainSnapshotContentArtifactFile(fileName: string): boolean {
+  return /\.(md|txt)(?:\.resolved(?:\.\d+)?)?$/i.test(fileName);
+}
+
+function toBrainSnapshotBaseName(fileName: string): string {
+  return fileName.replace(/\.resolved(?:\.\d+)?$/i, '');
+}
+
+function brainResolvedVariantPriority(fileName: string): number {
+  if (/\.resolved\.\d+$/i.test(fileName)) {
+    return 2;
+  }
+  if (/\.resolved$/i.test(fileName)) {
+    return 1;
+  }
+  return 0;
+}
+
 function extractOverviewPrompt(content: string | undefined): string | undefined {
   if (!content) {
     return undefined;
@@ -2245,6 +2606,18 @@ function extractOverviewPrompt(content: string | undefined): string | undefined 
   }
 
   return normalizeBrainFallbackText(content);
+}
+
+function promptsMatch(left: string, right: string): boolean {
+  const normalizedLeft = normalizeBrainFallbackText(left).toLowerCase();
+  const normalizedRight = normalizeBrainFallbackText(right).toLowerCase();
+  return Boolean(normalizedLeft)
+    && Boolean(normalizedRight)
+    && (
+      normalizedLeft === normalizedRight
+      || normalizedLeft.includes(normalizedRight)
+      || normalizedRight.includes(normalizedLeft)
+    );
 }
 
 function resolveOverviewToolCallTarget(
@@ -2390,6 +2763,10 @@ function classifyBrainFallbackArtifact(
 
 function normalizeBrainFallbackText(value: string | undefined): string {
   return (value ?? '').replace(/\r\n/g, '\n').trim();
+}
+
+function isUuidLike(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
 async function safeReadUtf8(filePath: string): Promise<string | undefined> {

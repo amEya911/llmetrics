@@ -7,6 +7,7 @@
 [![VS Code](https://img.shields.io/badge/VS%20Code-%5E1.85.0-007ACC?style=for-the-badge&logo=visual-studio-code)](https://code.visualstudio.com/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.3+-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![License](https://img.shields.io/badge/License-MIT-22c55e?style=for-the-badge)](./ai-agent-monitor/LICENSE)
+[![Gemini](https://img.shields.io/badge/Gemini-2.5%20Flash%20%26%20Flash--Lite-4285F4?style=for-the-badge)](https://ai.google.dev/gemini-api/docs/models/gemini-v2)
 [![Groq](https://img.shields.io/badge/Groq-LLaMA%203.3-F55036?style=for-the-badge)](https://groq.com/)
 
 **Stop flying blind with AI agents.** Know exactly how many tokens you're burning, how much it costs, and what you can do better — all in real time, right inside VS Code.
@@ -14,6 +15,9 @@
 [Features](#-features) · [Architecture](#-architecture) · [How It Works](#-how-it-works) · [Installation](#-installation) · [Configuration](#%EF%B8%8F-configuration)
 
 </div>
+happy coding
+
+happy coding
 
 ---
 
@@ -22,7 +26,7 @@
 **AI Agent Monitor** is a VS Code extension that acts as a **flight recorder for your AI coding sessions**. Whether you're using **Cursor** or **Antigravity (Gemini Code Assist)**, this extension passively observes every interaction between you and the AI agent, then gives you:
 
 - 📊 **Real-time token & cost tracking** — see exactly what each prompt costs
-- 🧠 **AI Coaching** — LLM-powered analysis of your prompting patterns (via Groq)
+- 🧠 **AI Coaching** — Gemini-first coaching with Groq fallback for prompting-pattern analysis
 - 🔍 **Session Diagnostics** — detects anti-patterns like "The Re-explainer" or "The Error Paster"
 - 📈 **Trend Analytics** — daily/weekly/monthly spend breakdowns
 - 💡 **Model Recommendations** — tells you when you're overpaying for a simple task
@@ -35,19 +39,52 @@
 
 | Feature | Description |
 |---|---|
-| **Live Dashboard** | Real-time WebView panel showing active session metrics, cost, and context usage |
+| **Live Dashboard** | Real-time WebView panel showing active session metrics, cost, context usage, and turn-by-turn token flow |
+| **Token Categories** | Tracks `input`, `thinking`, `sub-agent`, `editor`, and `output` tokens independently |
+| **Cursor Multi-Chat Tracking** | Keeps per-chat state isolated across new chats, chat switching, sub-agents, and editor actions |
+| **Restart Persistence** | Restores live and persisted chat state after Cursor or Antigravity restarts, including child turns and editor work |
 | **Network Interception** | Passively captures all LLM API traffic by patching Node.js internals — zero config required |
 | **Cursor Deep Integration** | Injects probes into Cursor's sibling processes via V8 Inspector Protocol |
-| **Antigravity Support** | Polls the Antigravity Language Server via gRPC/Connect for state updates |
-| **AI Coach (Groq)** | Sends session data to Groq (LLaMA 3.3 70B) for actionable coaching insights |
+| **Antigravity Support** | Polls the Antigravity Language Server plus persisted brain artifacts for live chat, thinking, and editor recovery |
+| **AI Coach** | Uses Gemini 2.5 Flash-Lite for continuous coaching when available, with Groq fallback |
 | **Session Diagnostics** | Detects 6 failure patterns: Re-explainer, Error Paster, Scope Creeper, Cheap Task Tax, Dead Attachment, Frustration Spiral |
-| **Full Session Analysis** | One-click deep report with prompt-by-prompt breakdown, rewritten prompts, and a "session personality" |
+| **Full Session Analysis** | One-click deep report with prompt-by-prompt breakdown, rewritten prompts, and a "session personality" using Gemini 2.5 Flash or Groq fallback |
 | **Context Health Score** | Tracks `@file` references, identifies dead attachments wasting tokens every turn |
 | **Model Recommendation Engine** | Classifies prompt complexity and suggests cheaper models when appropriate |
 | **Budget Alerts** | Configurable daily/monthly cost and token thresholds with real-time warnings |
 | **Prompt Library** | Saves high-performing prompts for reuse across sessions |
 | **Cross-Session Patterns** | Aggregates behavior trends across your last 30 days of sessions |
 | **SQLite State Extraction** | Reads Cursor/Antigravity's internal `state.vscdb` databases with WAL merge support |
+
+---
+
+## 🎯 What Gets Tracked
+
+### Token Categories
+
+Every turn is broken into the same five buckets in the dashboard and persisted state:
+
+| Category | What it means |
+|---|---|
+| `input` | The user prompt or request payload sent to the model |
+| `thinking` | Model reasoning, planner output, or hidden/thinking-style intermediate content when the provider exposes or implies it |
+| `sub-agent` | Child agent work, background tool-agent runs, and delegated analysis turns |
+| `editor` | Inline edits, patches, diffs, rewrite-selection operations, and generated file changes |
+| `output` | The visible assistant reply or completion text |
+
+### Source Coverage
+
+| Source | Coverage |
+|---|---|
+| **Cursor** | New chats, existing chats, chat switching, sub-agents, editor actions, thinking, and restart recovery |
+| **Antigravity** | Chat turns, thinking, tool/editor work, active-chat switching, and recovery from persisted brain/state artifacts |
+
+### Multi-Chat Behavior
+
+- The live dashboard is pinned to the chat that is actually consuming tokens right now.
+- Cursor provisional new chats are created with isolated state and then rebound to the real chat ID once Cursor persists it.
+- Switching between old and new chats preserves each chat's own turn history, editor tokens, and child-turn totals.
+- Persisted state is merged back into live runtime state after app restarts so editor and sub-agent tokens do not disappear when the host process restarts.
 
 ---
 
@@ -73,7 +110,7 @@ flowchart TB
         subgraph Dash["Dashboard Pipeline"]
             RAW["Raw Turns"] --> AE["Analytics Engine\n(dashboard.ts)"]
             AE --> WV["WebView UI"]
-            AE --> GC["Groq AI Coach\n(LLaMA 3.3 70B)"]
+            AE --> GC["AI Coach Providers\nGemini 2.5 Flash-Lite\nor Groq LLaMA 3.3"]
             AE --> SD["Session Diagnostics\n+ Coaching Insights"]
         end
 
@@ -100,7 +137,7 @@ ai-agent-monitor/
 │   ├── AntigravityLanguageServerCollector.ts # 🔗 gRPC/Connect polling for Antigravity state
 │   ├── dashboard.ts                        # 📊 Analytics computation, cost estimation, model profiles
 │   ├── sessionDiagnostics.ts               # 🩺 6 anti-pattern detectors (861 lines)
-│   ├── groqClient.ts                       # 🤖 Groq API integration for AI coaching (1,288 lines)
+│   ├── groqClient.ts                       # 🤖 Gemini/Groq analysis provider client for coaching + session reports
 │   ├── stateSqlite.ts                      # 💾 SQLite + WAL reader with Protobuf decoder
 │   ├── webviewContent.ts                   # 🎨 Dashboard HTML/CSS/JS generation
 │   ├── sidebarProvider.ts                  # 📋 VS Code sidebar tree view
@@ -276,6 +313,15 @@ flowchart TB
 
 **Why not just use `better-sqlite3`?** Because VS Code extensions run in a sandboxed environment where native Node modules are problematic. Instead, this project implements a **pure-TypeScript SQLite page reader** that understands the SQLite B-tree page format and WAL frame structure, plus a **custom Protobuf decoder** for Cursor's binary conversation storage.
 
+### 6. Live/Persisted Cursor Merge
+
+Cursor runtime traffic is intentionally merged with persisted transcript/state data instead of choosing one source over the other:
+
+- runtime interception keeps the dashboard live while a chat is active
+- transcript parsing restores sub-agent and editor child turns after restart
+- prompt matching plus provisional chat IDs prevent new-chat traffic from being charged to the previous chat
+- turn merging allows persisted editor/sub-agent detail to backfill a live turn without wiping live token counts
+
 ---
 
 ## 📦 Installation
@@ -284,7 +330,7 @@ flowchart TB
 
 - [VS Code](https://code.visualstudio.com/) ≥ 1.85.0 (or Cursor / Antigravity)
 - [Node.js](https://nodejs.org/) ≥ 18.x
-- (Optional) [Groq API Key](https://console.groq.com/) for AI coaching features
+- (Optional) [Gemini API Key](https://aistudio.google.com/app/apikey) or [Groq API Key](https://console.groq.com/) for coaching/report features
 
 ### Build & Install
 
@@ -310,10 +356,10 @@ This will:
 After installation, open the Command Palette (`Cmd+Shift+P`) and run:
 
 ```
-AI Agent Monitor: Open Dashboard
+AI Agent Monitor: Focus Sidebar
 ```
 
-You should see the analytics dashboard open in a new editor tab.
+You should see the live analytics dashboard appear in the sidebar. `AI Agent Monitor: Open Panel` opens the same data in a separate floating panel.
 
 ---
 
@@ -323,22 +369,31 @@ All settings are under `aiAgentMonitor.*` in VS Code settings:
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `aiAgentMonitor.groqApiKey` | `string` | `""` | Your Groq API key for AI coaching |
-| `aiAgentMonitor.dailyCostBudgetUsd` | `number` | `null` | Daily cost budget in USD |
-| `aiAgentMonitor.monthlyCostBudgetUsd` | `number` | `null` | Monthly cost budget in USD |
-| `aiAgentMonitor.dailyTokenBudget` | `number` | `null` | Daily token budget |
-| `aiAgentMonitor.monthlyTokenBudget` | `number` | `null` | Monthly token budget |
+| `aiAgentMonitor.geminiApiKey` | `string` | `""` | Preferred API key for AI coaching and full-session analysis |
+| `aiAgentMonitor.groqApiKey` | `string` | `""` | Fallback API key for AI coaching and full-session analysis |
 
-### Setting Up Groq (Optional but Recommended)
+### Analysis Provider Priority
 
-1. Get a free API key at [console.groq.com](https://console.groq.com/)
-2. Open VS Code Settings → search for `aiAgentMonitor.groqApiKey`
-3. Paste your key
+1. If `aiAgentMonitor.geminiApiKey` is set, the extension uses Gemini for coaching/report generation.
+2. If Gemini is not configured but `aiAgentMonitor.groqApiKey` is set, it falls back to Groq.
+3. If both are empty, all core monitoring still works, but AI coaching and full-session analysis stay disabled.
+
+### Recommended Setup
+
+1. Get a Gemini key at [Google AI Studio](https://aistudio.google.com/app/apikey)
+2. Open VS Code Settings and search for `aiAgentMonitor.geminiApiKey`
+3. Optionally add `aiAgentMonitor.groqApiKey` as a fallback
 
 This unlocks:
 - Real-time AI coaching insights
 - Full session analysis reports
 - Pattern-aware prompt recommendations
+
+### Provider Defaults
+
+- **Continuous coaching** prefers `gemini-2.5-flash-lite` for high-frequency, low-cost calls.
+- **Full session analysis** prefers `gemini-2.5-flash` for better long-form synthesis.
+- **Fallback provider** uses Groq `llama-3.3-70b-versatile`.
 
 ---
 
@@ -346,9 +401,9 @@ This unlocks:
 
 | Command | Shortcut | Description |
 |---|---|---|
-| `AI Agent Monitor: Open Dashboard` | `Cmd+Shift+M` | Opens the main analytics WebView |
-| `AI Agent Monitor: Run Full Session Analysis` | — | Generates a deep LLM-powered report for the active session |
-| `AI Agent Monitor: Save Prompt to Library` | — | Saves the current prompt to your reusable prompt library |
+| `AI Agent Monitor: Open Panel` | — | Opens the floating analytics panel |
+| `AI Agent Monitor: Focus Sidebar` | `Cmd+Shift+M` | Focuses the live token dashboard in the sidebar |
+| `AI Token Analytics: Full Session Analysis` | `Cmd+Shift+A` | Generates a deep LLM-powered report for the active session |
 | `AI Agent Monitor: Clear History` | — | Resets all tracked session data |
 
 ---
@@ -442,7 +497,7 @@ Estimated Overspend: $0.004 per turn
 The WebView dashboard is a premium dark-themed analytics interface with these sections:
 
 1. **Live Session** — Current active chat with token count, cost, model, and context usage bar
-2. **Groq AI Coach** — Most urgent insight from the coaching engine, with severity badge
+2. **AI Coach** — Most urgent insight from the coaching engine, with severity badge
 3. **Per-Message Timeline** — Prompt-by-prompt cost flow for the active session
 4. **Spend Summary** — Today / This Week / This Month aggregated metrics
 5. **Daily Spend Trend** — Bar chart showing cost trajectory over time
@@ -462,7 +517,7 @@ The WebView dashboard is a premium dark-themed analytics interface with these se
 | **Crash isolation** | Every interception point is wrapped in `try/catch` with safe fallbacks |
 | **No native dependencies** | Custom SQLite/WAL/Protobuf parsers — pure TypeScript, no `node-gyp` |
 | **Performance** | Debounced emitters, LRU caches, lazy evaluation of analytics |
-| **Privacy** | All data stays local; Groq calls are opt-in and use only session metadata |
+| **Privacy** | All monitoring data stays local; Gemini/Groq calls are opt-in and only used for coaching/report generation |
 
 ---
 
@@ -501,4 +556,3 @@ This project is licensed under the **MIT License** — see [LICENSE](./ai-agent-
 *Because if you're going to spend tokens, you should at least know where they're going.*
 
 </div>
-

@@ -384,6 +384,12 @@ export function getConversationWebviewHtml(
       font-weight: 800;
     }
 
+    .button.secondary {
+      background: transparent;
+      color: var(--muted-strong);
+      border-color: rgba(255, 255, 255, 0.1);
+    }
+
     .button[disabled] {
       cursor: default;
       opacity: 0.5;
@@ -711,7 +717,7 @@ export function getConversationWebviewHtml(
 
         <article class="card">
           <div class="card-head">
-            <div class="eyebrow">Groq AI Coach</div>
+            <div class="eyebrow">AI Coach</div>
             <div class="card-title">Most urgent active insight</div>
             <div class="card-subtitle">One recommendation at a time, prioritized by wasted spend and context risk.</div>
           </div>
@@ -809,7 +815,11 @@ export function getConversationWebviewHtml(
         monthlyTokens: null,
       },
       alerts: [],
-      hasGroqKey: false,
+      analysisProvider: {
+        hasAnyKey: false,
+        hasGeminiKey: false,
+        hasGroqKey: false,
+      },
       sessionAnalysis: {
         isGenerating: false,
       },
@@ -993,14 +1003,24 @@ export function getConversationWebviewHtml(
       };
       const healthScore = metrics.healthScore ?? 100;
       const isGenerating = Boolean(snapshot.sessionAnalysis && snapshot.sessionAnalysis.isGenerating && snapshot.sessionAnalysis.activeChatId === chat.id);
-      const disabled = !snapshot.hasGroqKey || isGenerating;
+      const provider = snapshot.analysisProvider || {
+        hasAnyKey: false,
+        hasGeminiKey: false,
+        hasGroqKey: false,
+      };
+      const disabled = !provider.hasAnyKey || isGenerating;
       const startFresh = healthScore <= 40;
       const analysisButtonLabel = isGenerating ? 'Generating Analysis...' : 'Full Session Analysis';
-      const analysisNote = !snapshot.hasGroqKey
-        ? 'Set aiAgentMonitor.groqApiKey in Settings to unlock the browser report.'
+      const providerSummary = provider.preferredProviderLabel && provider.reportModel
+        ? provider.preferredProviderLabel + ' · ' + provider.reportModel
+        : provider.preferredProviderLabel
+          ? provider.preferredProviderLabel
+          : 'No analysis provider configured';
+      const analysisNote = !provider.hasAnyKey
+        ? 'Set aiAgentMonitor.geminiApiKey or aiAgentMonitor.groqApiKey in Settings to unlock browser reports. Gemini is preferred when both are set.'
         : snapshot.sessionAnalysis && snapshot.sessionAnalysis.lastError
           ? snapshot.sessionAnalysis.lastError
-          : 'Streams a premium HTML report to your browser.';
+          : 'Uses ' + providerSummary + ' for full-session analysis.';
 
       liveSession.innerHTML = ''
         + (startFresh
@@ -1024,6 +1044,7 @@ export function getConversationWebviewHtml(
              ])) + '</div>'
         + '    <div class="button-row">'
         + '      <button class="button" data-action="generate-session-analysis" ' + (disabled ? 'disabled' : '') + '>' + escapeHtml(analysisButtonLabel) + '</button>'
+        + '      <button class="button secondary" data-action="open-api-key-settings">API Keys</button>'
         + '    </div>'
         + '    <div class="support-copy">' + escapeHtml(analysisNote) + '</div>'
         + '  </div>'
@@ -1064,8 +1085,8 @@ export function getConversationWebviewHtml(
           + '    <div class="badge blue">Info</div>'
           + '    <div class="insight-title">Session looks healthy</div>'
           + '    <div class="detail-copy">No urgent context, spend, or model-fit problems are active right now.</div>'
-          + (!snapshot.hasGroqKey
-            ? '<div class="support-copy">Add a Groq API key to unlock deeper narrative coaching and the full browser analysis report.</div>'
+          + (!snapshot.analysisProvider || !snapshot.analysisProvider.hasAnyKey
+            ? '<div class="support-copy">Add a Gemini or Groq API key to unlock deeper narrative coaching and the full browser analysis report.</div>'
             : '')
           + '  </div>'
           + '</div>';
@@ -1404,6 +1425,11 @@ export function getConversationWebviewHtml(
         return;
       }
 
+      if (action === 'open-api-key-settings') {
+        vscode.postMessage({ command: 'openApiKeySettings' });
+        return;
+      }
+
       if (action === 'save-prompt') {
         vscode.postMessage({
           command: 'savePrompt',
@@ -1480,7 +1506,7 @@ export function getConversationWebviewHtml(
             promptLibrary: snapshot.promptLibrary,
             budgets: snapshot.budgets,
             alerts: [],
-            hasGroqKey: snapshot.hasGroqKey,
+            analysisProvider: snapshot.analysisProvider,
             sessionAnalysis: snapshot.sessionAnalysis,
             generatedAt: Date.now(),
           });

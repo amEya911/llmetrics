@@ -1,5 +1,6 @@
 import {
   AgentSourceId,
+  AnalysisProviderStatus,
   BreakdownRow,
   BudgetAlert,
   BudgetSettings,
@@ -33,8 +34,8 @@ interface DashboardBuildOptions {
   activeChatKey?: string;
   promptLibrary: SavedPrompt[];
   budgets: BudgetSettings;
-  hasGroqKey: boolean;
-  groqInsights?: CoachInsight[];
+  analysisProvider: AnalysisProviderStatus;
+  coachInsights?: CoachInsight[];
   persistedSessions?: PersistedSessionSummary[];
   sessionAnalysis?: SessionAnalysisState;
   workspacePaths?: string[];
@@ -131,7 +132,7 @@ export function buildDashboardSnapshot(options: DashboardBuildOptions): MonitorS
     activeChat,
     activeSuggestion,
     repeatedCounts,
-    options.groqInsights,
+    options.coachInsights,
     options.persistedSessions ?? []
   );
   const alerts = computeBudgetAlerts(options.budgets, analytics, now);
@@ -146,7 +147,7 @@ export function buildDashboardSnapshot(options: DashboardBuildOptions): MonitorS
     promptLibrary,
     budgets: options.budgets,
     alerts,
-    hasGroqKey: options.hasGroqKey,
+    analysisProvider: options.analysisProvider,
     sessionAnalysis: options.sessionAnalysis ?? { isGenerating: false },
     generatedAt: now,
   };

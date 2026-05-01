@@ -77,10 +77,15 @@
     "configuration": {
       "title": "AI Token Analytics",
       "properties": {
+        "aiAgentMonitor.geminiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Optional: Supply a Gemini API key to unlock AI coaching and full-session analysis. Gemini is preferred when both Gemini and Groq keys are configured."
+        },
         "aiAgentMonitor.groqApiKey": {
           "type": "string",
           "default": "",
-          "description": "Optional: Supply a free Groq API key to unlock the continuous LLaMA 3 AI Coach for prompt analysis."
+          "description": "Optional fallback: Supply a Groq API key to unlock AI coaching and full-session analysis when a Gemini key is not configured."
         }
       }
     }

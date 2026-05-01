@@ -103,6 +103,7 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
 
   private readonly attachedPids = new Map<number, InspectorEndpoint>();
   private readonly decoder = new StringDecoder('utf8');
+  private readonly unavailableInspectorLogAt = new Map<number, number>();
   private eventOffset = 0;
   private eventRemainder = '';
   private polling = false;
@@ -177,6 +178,7 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
       for (const attachedPid of [...this.attachedPids.keys()]) {
         if (!livePids.has(attachedPid)) {
           this.attachedPids.delete(attachedPid);
+          this.unavailableInspectorLogAt.delete(attachedPid);
         }
       }
 
@@ -186,9 +188,16 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
           continue;
         }
 
-        const endpoint = await this.attachProbe(sibling);
-        if (endpoint) {
-          this.attachedPids.set(sibling.pid, endpoint);
+        try {
+          const endpoint = await this.attachProbe(sibling);
+          if (endpoint) {
+            this.attachedPids.set(sibling.pid, endpoint);
+            this.unavailableInspectorLogAt.delete(sibling.pid);
+          }
+        } catch (error) {
+          this.debug(
+            `[cursor-network] Failed to attach remote probe to ${sibling.role} pid ${sibling.pid}: ${formatError(error)}`
+          );
         }
       }
     } catch (error) {
@@ -214,9 +223,7 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
 
     const endpoint = await this.resolveInspectorEndpoint(sibling);
     if (!endpoint) {
-      this.debug(
-        `[cursor-network] No inspector endpoint found for ${sibling.role} pid ${sibling.pid}.`
-      );
+      this.logMissingInspectorEndpoint(sibling);
       return undefined;
     }
 
@@ -290,14 +297,22 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
   private async resolveInspectorEndpoint(
     sibling: SiblingProcessInfo
   ): Promise<InspectorEndpoint | undefined> {
-    const { stdout } = await execFileAsync('lsof', [
-      '-nP',
-      '-a',
-      '-p',
-      String(sibling.pid),
-      '-iTCP',
-      '-sTCP:LISTEN',
-    ]);
+    let stdout = '';
+    try {
+      ({ stdout } = await execFileAsync('lsof', [
+        '-nP',
+        '-a',
+        '-p',
+        String(sibling.pid),
+        '-iTCP',
+        '-sTCP:LISTEN',
+      ]));
+    } catch (error) {
+      if (isExpectedLsofMiss(error)) {
+        return undefined;
+      }
+      throw error;
+    }
 
     const ports = String(stdout || '')
       .split(/\r?\n/)
@@ -334,6 +349,19 @@ export class CursorSiblingNetworkBridge implements vscode.Disposable {
     }
 
     return undefined;
+  }
+
+  private logMissingInspectorEndpoint(sibling: SiblingProcessInfo): void {
+    const now = Date.now();
+    const lastLoggedAt = this.unavailableInspectorLogAt.get(sibling.pid) ?? 0;
+    if (now - lastLoggedAt < 30_000) {
+      return;
+    }
+
+    this.unavailableInspectorLogAt.set(sibling.pid, now);
+    this.debug(
+      `[cursor-network] No inspector endpoint found for ${sibling.role} pid ${sibling.pid}.`
+    );
   }
 
   private async installAlwaysLocalInternalTransportHook(
@@ -1022,6 +1050,20 @@ function formatError(error: unknown): string {
   }
 
   return String(error);
+}
+
+function isExpectedLsofMiss(error: unknown): boolean {
+  const code = typeof error === 'object' && error && 'code' in error
+    ? (error as { code?: unknown }).code
+    : undefined;
+  const stdout = typeof error === 'object' && error && 'stdout' in error
+    ? String((error as { stdout?: unknown }).stdout ?? '')
+    : '';
+  const stderr = typeof error === 'object' && error && 'stderr' in error
+    ? String((error as { stderr?: unknown }).stderr ?? '')
+    : '';
+
+  return code === 1 && !stdout.trim() && !stderr.trim();
 }
 
 function safeStringify(value: unknown): string {

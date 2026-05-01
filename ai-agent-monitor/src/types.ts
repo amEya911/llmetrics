@@ -1,6 +1,7 @@
 export type HostApp = 'cursor' | 'antigravity' | 'unknown';
 
 export type AgentSourceId = 'cursor' | 'antigravity' | 'manual';
+export type AnalysisProviderId = 'gemini' | 'groq';
 
 export type BlockType =
   | 'user-input'
@@ -390,6 +391,16 @@ export interface SessionAnalysisState {
   lastError?: string;
 }
 
+export interface AnalysisProviderStatus {
+  hasAnyKey: boolean;
+  hasGeminiKey: boolean;
+  hasGroqKey: boolean;
+  preferredProvider?: AnalysisProviderId;
+  preferredProviderLabel?: string;
+  coachModel?: string;
+  reportModel?: string;
+}
+
 export interface MonitorSnapshot {
   app: HostApp;
   appLabel: string;
@@ -400,7 +411,7 @@ export interface MonitorSnapshot {
   promptLibrary: SavedPrompt[];
   budgets: BudgetSettings;
   alerts: BudgetAlert[];
-  hasGroqKey: boolean;
+  analysisProvider: AnalysisProviderStatus;
   sessionAnalysis: SessionAnalysisState;
   generatedAt: number;
 }
@@ -425,6 +436,7 @@ export interface WebviewIncoming {
     | 'deletePrompt'
     | 'markPromptUsed'
     | 'updateBudgets'
+    | 'openApiKeySettings'
     | 'generateSessionAnalysis';
   promptId?: string;
   sourceId?: AgentSourceId;

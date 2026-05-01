@@ -32,7 +32,11 @@ function createEmptySnapshot(): MonitorSnapshot {
       monthlyTokens: null,
     },
     alerts: [],
-    hasGroqKey: false,
+    analysisProvider: {
+      hasAnyKey: false,
+      hasGeminiKey: false,
+      hasGroqKey: false,
+    },
     sessionAnalysis: {
       isGenerating: false,
     },

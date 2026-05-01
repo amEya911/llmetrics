@@ -6,6 +6,7 @@ import {
   NETWORK_INTERCEPTOR_IGNORE_VALUE,
 } from './NetworkInterceptor';
 import {
+  AnalysisProviderId,
   CoachInsight,
   ConversationChat,
   CrossSessionPatterns,
@@ -15,6 +16,8 @@ import {
 import { analyzeSessionDiagnostics } from './sessionDiagnostics';
 
 const GROQ_MODEL = 'llama-3.3-70b-versatile';
+const GEMINI_COACH_MODEL = 'gemini-2.5-flash-lite';
+const GEMINI_REPORT_MODEL = 'gemini-2.5-flash';
 const FULL_REPORT_MAX_PAYLOAD_CHARS = 90_000;
 const FULL_REPORT_CHUNK_TARGET_CHARS = 42_000;
 
@@ -27,6 +30,37 @@ interface GroqResponse {
       content?: string;
     };
   }>;
+}
+
+interface GeminiGenerateContentResponse {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{
+        text?: string;
+      }>;
+    };
+  }>;
+  error?: {
+    message?: string;
+  };
+}
+
+export interface AnalysisProviderState {
+  hasAnyKey: boolean;
+  hasGeminiKey: boolean;
+  hasGroqKey: boolean;
+  preferredProvider?: AnalysisProviderId;
+  preferredProviderLabel?: string;
+  coachModel?: string;
+  reportModel?: string;
+}
+
+interface AnalysisProviderConfig {
+  id: AnalysisProviderId;
+  label: string;
+  apiKey: string;
+  coachModel: string;
+  reportModel: string;
 }
 
 export interface FullSessionPromptBreakdown {
@@ -106,7 +140,7 @@ interface ChunkPromptAnalysis {
 }
 
 export async function analyzeChatWithGroq(chat: ConversationChat): Promise<CoachInsight[]> {
-  if (!hasGroqApiKey()) {
+  if (!hasAnalysisApiKey()) {
     return [];
   }
 
@@ -162,7 +196,7 @@ Rules:
 - Prefer the highest-cost 1-3 issues only.
 - If the evidence is weak or the session is healthy, return {"insights":[]}.`;
 
-  const result = await requestGroqJson<{ insights?: CoachInsight[] }>([
+  const result = await requestAnalysisJson<{ insights?: CoachInsight[] }>([
     { role: 'system', content: systemPrompt },
     { role: 'user', content: JSON.stringify(coachPayload, null, 2) },
   ]);
@@ -187,7 +221,7 @@ export async function generateFullSessionAnalysis(
   }));
 
   if (payloadText.length <= FULL_REPORT_MAX_PAYLOAD_CHARS) {
-    const report = await streamGroqJson<FullSessionAnalysisReport>([
+    const report = await streamAnalysisJson<FullSessionAnalysisReport>([
       { role: 'system', content: buildFullSessionSystemPrompt() },
       { role: 'user', content: JSON.stringify(payload, null, 2) },
     ]);
@@ -195,7 +229,7 @@ export async function generateFullSessionAnalysis(
   }
 
   const chunkResults = await analyzePromptBreakdownChunks(payload);
-  const report = await streamGroqJson<Omit<FullSessionAnalysisReport, 'promptBreakdown'>>([
+  const report = await streamAnalysisJson<Omit<FullSessionAnalysisReport, 'promptBreakdown'>>([
     { role: 'system', content: buildChunkSynthesisSystemPrompt() },
     {
       role: 'user',
@@ -332,7 +366,7 @@ async function analyzePromptBreakdownChunks(
   const results: ChunkPromptAnalysis[] = [];
 
   for (const chunk of chunks) {
-    const result = await streamGroqJson<ChunkPromptAnalysis>([
+    const result = await streamAnalysisJson<ChunkPromptAnalysis>([
       { role: 'system', content: buildChunkPromptSystemPrompt() },
       {
         role: 'user',
@@ -876,8 +910,46 @@ export function renderFullSessionAnalysisHtml(
 </html>`;
 }
 
-function hasGroqApiKey(): boolean {
-  return Boolean(getGroqApiKey());
+export function getAnalysisProviderState(): AnalysisProviderState {
+  const geminiApiKey = getGeminiApiKey();
+  const groqApiKey = getGroqApiKey();
+  const preferredProvider = geminiApiKey
+    ? 'gemini'
+    : groqApiKey
+      ? 'groq'
+      : undefined;
+
+  return {
+    hasAnyKey: Boolean(geminiApiKey || groqApiKey),
+    hasGeminiKey: Boolean(geminiApiKey),
+    hasGroqKey: Boolean(groqApiKey),
+    preferredProvider,
+    preferredProviderLabel: preferredProvider === 'gemini'
+      ? 'Gemini'
+      : preferredProvider === 'groq'
+        ? 'Groq'
+        : undefined,
+    coachModel: preferredProvider === 'gemini'
+      ? GEMINI_COACH_MODEL
+      : preferredProvider === 'groq'
+        ? GROQ_MODEL
+        : undefined,
+    reportModel: preferredProvider === 'gemini'
+      ? GEMINI_REPORT_MODEL
+      : preferredProvider === 'groq'
+        ? GROQ_MODEL
+        : undefined,
+  };
+}
+
+function hasAnalysisApiKey(): boolean {
+  return getAnalysisProviderState().hasAnyKey;
+}
+
+function getGeminiApiKey(): string | undefined {
+  const config = vscode.workspace.getConfiguration('aiAgentMonitor');
+  const apiKey = config.get<string>('geminiApiKey', '').trim();
+  return apiKey || undefined;
 }
 
 function getGroqApiKey(): string | undefined {
@@ -886,35 +958,154 @@ function getGroqApiKey(): string | undefined {
   return apiKey || undefined;
 }
 
-async function requestGroqJson<T>(
-  messages: Array<{ role: 'system' | 'user'; content: string }>
-): Promise<T | undefined> {
-  const text = await requestGroqText(messages, false);
-  return parseGroqJson<T>(text);
+function resolveAnalysisProviderConfig(): AnalysisProviderConfig | undefined {
+  const geminiApiKey = getGeminiApiKey();
+  if (geminiApiKey) {
+    return {
+      id: 'gemini',
+      label: 'Gemini',
+      apiKey: geminiApiKey,
+      coachModel: GEMINI_COACH_MODEL,
+      reportModel: GEMINI_REPORT_MODEL,
+    };
+  }
+
+  const groqApiKey = getGroqApiKey();
+  if (groqApiKey) {
+    return {
+      id: 'groq',
+      label: 'Groq',
+      apiKey: groqApiKey,
+      coachModel: GROQ_MODEL,
+      reportModel: GROQ_MODEL,
+    };
+  }
+
+  return undefined;
 }
 
-async function streamGroqJson<T>(
+async function requestAnalysisJson<T>(
+  messages: Array<{ role: 'system' | 'user'; content: string }>
+): Promise<T | undefined> {
+  const text = await requestAnalysisText(messages, { stream: false, task: 'coach' });
+  return parseAnalysisJson<T>(text);
+}
+
+async function streamAnalysisJson<T>(
   messages: Array<{ role: 'system' | 'user'; content: string }>
 ): Promise<T> {
-  const text = await requestGroqText(messages, true);
-  const parsed = parseGroqJson<T>(text);
+  const text = await requestAnalysisText(messages, { stream: true, task: 'report' });
+  const parsed = parseAnalysisJson<T>(text);
   if (!parsed) {
-    throw new Error('Groq returned malformed analysis JSON.');
+    throw new Error('The analysis provider returned malformed JSON.');
   }
   return parsed;
 }
 
-async function requestGroqText(
+async function requestAnalysisText(
   messages: Array<{ role: 'system' | 'user'; content: string }>,
-  stream: boolean
+  options: {
+    stream: boolean;
+    task: 'coach' | 'report';
+  }
 ): Promise<string> {
-  const apiKey = getGroqApiKey();
-  if (!apiKey) {
-    throw new Error('Groq API key is not configured.');
+  const provider = resolveAnalysisProviderConfig();
+  if (!provider) {
+    throw new Error('No Gemini or Groq API key is configured.');
+  }
+
+  if (provider.id === 'gemini') {
+    return requestGeminiText(messages, options.task, provider);
+  }
+
+  return requestGroqText(messages, options.stream, options.task, provider);
+}
+
+async function requestGeminiText(
+  messages: Array<{ role: 'system' | 'user'; content: string }>,
+  task: 'coach' | 'report',
+  provider: AnalysisProviderConfig
+): Promise<string> {
+  const systemInstruction = messages.find((message) => message.role === 'system')?.content.trim();
+  const contents = messages
+    .filter((message) => message.role === 'user')
+    .map((message) => ({
+      role: 'user',
+      parts: [{ text: message.content }],
+    }));
+
+  if (contents.length === 0) {
+    contents.push({
+      role: 'user',
+      parts: [{ text: '' }],
+    });
   }
 
   const requestBody = JSON.stringify({
-    model: GROQ_MODEL,
+    contents,
+    generationConfig: {
+      temperature: 0.2,
+      responseMimeType: 'application/json',
+      maxOutputTokens: task === 'report' ? 8_192 : 4_096,
+    },
+    ...(systemInstruction
+      ? {
+        systemInstruction: {
+          parts: [{ text: systemInstruction }],
+        },
+      }
+      : {}),
+  });
+
+  return new Promise((resolve, reject) => {
+    const model = task === 'report' ? provider.reportModel : provider.coachModel;
+    const req = https.request(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+      method: 'POST',
+      headers: {
+        'x-goog-api-key': provider.apiKey,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(requestBody),
+        [NETWORK_INTERCEPTOR_IGNORE_HEADER]: NETWORK_INTERCEPTOR_IGNORE_VALUE,
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', (chunk: Buffer) => {
+        data += chunk.toString('utf8');
+      });
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          reject(new Error(extractGeminiErrorMessage(data) || `Gemini request failed with status ${res.statusCode}`));
+          return;
+        }
+
+        try {
+          const payload = JSON.parse(data) as GeminiGenerateContentResponse;
+          const text = payload.candidates
+            ?.flatMap((candidate) => candidate.content?.parts ?? [])
+            .map((part) => part.text ?? '')
+            .join('')
+            .trim() ?? '';
+          resolve(text);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(requestBody);
+    req.end();
+  });
+}
+
+async function requestGroqText(
+  messages: Array<{ role: 'system' | 'user'; content: string }>,
+  stream: boolean,
+  task: 'coach' | 'report',
+  provider: AnalysisProviderConfig
+): Promise<string> {
+  const requestBody = JSON.stringify({
+    model: task === 'report' ? provider.reportModel : provider.coachModel,
     messages,
     temperature: 0.2,
     stream,
@@ -925,14 +1116,14 @@ async function requestGroqText(
     const req = https.request('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${provider.apiKey}`,
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(requestBody),
         [NETWORK_INTERCEPTOR_IGNORE_HEADER]: NETWORK_INTERCEPTOR_IGNORE_VALUE,
       },
     }, (res) => {
       if (!stream) {
-        collectBufferedResponse(res, resolve, reject);
+        collectGroqBufferedResponse(res, resolve, reject);
         return;
       }
 
@@ -945,12 +1136,12 @@ async function requestGroqText(
         sseBuffer = lines.pop() || '';
 
         for (const line of lines) {
-          output += extractStreamDelta(line);
+          output += extractGroqStreamDelta(line);
         }
       });
 
       res.on('end', () => {
-        output += extractStreamDelta(sseBuffer);
+        output += extractGroqStreamDelta(sseBuffer);
         if (res.statusCode !== 200) {
           reject(new Error(output || `Groq request failed with status ${res.statusCode}`));
           return;
@@ -965,7 +1156,7 @@ async function requestGroqText(
   });
 }
 
-function collectBufferedResponse(
+function collectGroqBufferedResponse(
   res: IncomingMessage,
   resolve: (value: string) => void,
   reject: (reason?: unknown) => void
@@ -989,7 +1180,7 @@ function collectBufferedResponse(
   });
 }
 
-function extractStreamDelta(line: string): string {
+function extractGroqStreamDelta(line: string): string {
   const trimmed = line.trim();
   if (!trimmed.startsWith('data:')) {
     return '';
@@ -1008,7 +1199,20 @@ function extractStreamDelta(line: string): string {
   }
 }
 
-function parseGroqJson<T>(value: string): T | undefined {
+function extractGeminiErrorMessage(value: string): string | undefined {
+  if (!value.trim()) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(value) as GeminiGenerateContentResponse;
+    return parsed.error?.message?.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseAnalysisJson<T>(value: string): T | undefined {
   const trimmed = value.trim();
   if (!trimmed) {
     return undefined;

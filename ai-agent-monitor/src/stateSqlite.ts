@@ -176,6 +176,28 @@ export async function createMergedSqliteBuffer(dbPath: string): Promise<Buffer<A
   return merged;
 }
 
+export function extractCursorActiveComposerIds(
+  composerDataValue: string | undefined,
+  embeddedAuxBarStateValue: string | undefined
+): string[] {
+  const selectedIds = parseCursorComposerSelectionCandidates(composerDataValue);
+  const embeddedIds = parseCursorEmbeddedComposerCandidates(embeddedAuxBarStateValue);
+  const merged: string[] = [];
+  const seen = new Set<string>();
+
+  for (const candidate of [...embeddedIds, ...selectedIds]) {
+    const composerId = typeof candidate === 'string' ? candidate.trim() : '';
+    if (!composerId || seen.has(composerId)) {
+      continue;
+    }
+
+    seen.add(composerId);
+    merged.push(composerId);
+  }
+
+  return merged;
+}
+
 export function extractAntigravitySelectedModelName(
   modelPreferencesValue: string | undefined,
   userStatusValue: string | undefined
@@ -356,6 +378,150 @@ function readSqlitePageSize(buffer: Buffer): number {
 
 function quoteSqliteString(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
+}
+
+function parseCursorComposerSelectionCandidates(value: string | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value) as {
+      selectedComposerIds?: unknown[];
+      lastFocusedComposerIds?: unknown[];
+    };
+    return [
+      ...(Array.isArray(parsed.lastFocusedComposerIds) ? parsed.lastFocusedComposerIds : []),
+      ...(Array.isArray(parsed.selectedComposerIds) ? parsed.selectedComposerIds : []),
+    ].filter((candidate): candidate is string =>
+      typeof candidate === 'string' && candidate.trim().length > 0
+    );
+  } catch {
+    return [];
+  }
+}
+
+function parseCursorEmbeddedComposerCandidates(value: string | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(value) as {
+      activeGroup?: unknown;
+      mostRecentActiveGroups?: unknown[];
+      serializedGrid?: {
+        root?: CursorEmbeddedEditorNode;
+      };
+    };
+    const root = parsed.serializedGrid?.root;
+    if (!root || typeof root !== 'object') {
+      return [];
+    }
+
+    const leaves = collectCursorEmbeddedEditorLeaves(root);
+    if (leaves.length === 0) {
+      return [];
+    }
+
+    const preferredGroupIds = [
+      parsed.activeGroup,
+      ...(Array.isArray(parsed.mostRecentActiveGroups) ? parsed.mostRecentActiveGroups : []),
+    ].filter((candidate): candidate is number =>
+      typeof candidate === 'number' && Number.isFinite(candidate)
+    );
+
+    const orderedLeaves = [
+      ...preferredGroupIds
+        .map((groupId) => leaves.find((leaf) => leaf.groupId === groupId))
+        .filter((leaf): leaf is CursorEmbeddedEditorLeaf => Boolean(leaf)),
+      ...leaves,
+    ];
+
+    const result: string[] = [];
+    const seen = new Set<string>();
+    for (const leaf of orderedLeaves) {
+      for (const composerId of extractComposerIdsFromEmbeddedLeaf(leaf)) {
+        if (seen.has(composerId)) {
+          continue;
+        }
+        seen.add(composerId);
+        result.push(composerId);
+      }
+    }
+
+    return result;
+  } catch {
+    return [];
+  }
+}
+
+interface CursorEmbeddedEditorNode {
+  type?: string;
+  data?: unknown;
+}
+
+interface CursorEmbeddedEditorLeaf {
+  groupId?: number;
+  editors: Array<{ id?: unknown; value?: unknown }>;
+  mru: number[];
+}
+
+function collectCursorEmbeddedEditorLeaves(node: CursorEmbeddedEditorNode): CursorEmbeddedEditorLeaf[] {
+  if (node.type === 'leaf' && node.data && typeof node.data === 'object') {
+    const data = node.data as {
+      id?: unknown;
+      editors?: Array<{ id?: unknown; value?: unknown }>;
+      mru?: unknown[];
+    };
+    return [{
+      groupId: typeof data.id === 'number' && Number.isFinite(data.id) ? data.id : undefined,
+      editors: Array.isArray(data.editors) ? data.editors : [],
+      mru: Array.isArray(data.mru)
+        ? data.mru.filter((candidate): candidate is number =>
+            typeof candidate === 'number' && Number.isFinite(candidate)
+          )
+        : [],
+    }];
+  }
+
+  const branches = Array.isArray(node.data) ? node.data : [];
+  return branches.flatMap((entry) =>
+    entry && typeof entry === 'object'
+      ? collectCursorEmbeddedEditorLeaves(entry as CursorEmbeddedEditorNode)
+      : []
+  );
+}
+
+function extractComposerIdsFromEmbeddedLeaf(leaf: CursorEmbeddedEditorLeaf): string[] {
+  const preferredIndexes = [
+    ...leaf.mru,
+    ...leaf.editors.map((_editor, index) => index),
+  ].filter((index, position, allIndexes) =>
+    Number.isInteger(index)
+    && index >= 0
+    && index < leaf.editors.length
+    && allIndexes.indexOf(index) === position
+  );
+
+  const result: string[] = [];
+  for (const index of preferredIndexes) {
+    const editor = leaf.editors[index];
+    if (editor?.id !== 'workbench.editor.composer.input' || typeof editor.value !== 'string') {
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(editor.value) as { composerId?: unknown };
+      if (typeof parsed.composerId === 'string' && parsed.composerId.trim()) {
+        result.push(parsed.composerId.trim());
+      }
+    } catch {
+      // Ignore malformed embedded editor payloads.
+    }
+  }
+
+  return result;
 }
 
 function parseBase64Protobuf(value: string | undefined): ProtoNode[] {
