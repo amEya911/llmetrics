@@ -1,0 +1,51 @@
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+# Note: package-lock.json is typically tracked, but since this project has no root package.json, 
+# any root package-lock.json is likely an accident. We'll ignore it at the root.
+/package-lock.json
+
+# Editor/IDE
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.sublime-workspace
+.idea/
+
+# Binaries / compiled / build outputs
+*.vsix
+dist/
+out/
+build/
+*.bin
+stream_req.bin
+
+# Environment variables
+.env
+.env.test
+.env.production
+.env.local
+
+# Test coverage
+coverage/
+.nyc_output/

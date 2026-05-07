@@ -3,7 +3,10 @@ import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { ConversationStoreWatcher } from './ConversationStoreWatcher';
-import { AntigravityLanguageServerCollector } from './AntigravityLanguageServerCollector';
+import {
+  AntigravityLanguageServerCollector,
+  AntigravityTurnUpdateEvent,
+} from './AntigravityLanguageServerCollector';
 import { CursorSiblingNetworkBridge } from './CursorSiblingNetworkBridge';
 import { NetworkInterceptor } from './NetworkInterceptor';
 import {
@@ -940,7 +943,8 @@ export class AgentMonitor implements vscode.Disposable {
     });
 
     collector.onTurnUpdate((turnUpdate) => {
-      const binding = this.antigravityRequestBindings.get(turnUpdate.executionId);
+      const binding = this.antigravityRequestBindings.get(turnUpdate.executionId)
+        ?? this.recoverAntigravityBindingForLateUpdate(turnUpdate);
       if (!binding) {
         return;
       }
@@ -1269,9 +1273,7 @@ export class AgentMonitor implements vscode.Disposable {
       subtitle: preferredSubtitle,
       createdAt: Math.min(persistedChat.createdAt, liveChat.createdAt),
       updatedAt: Math.max(persistedChat.updatedAt, liveChat.updatedAt),
-      turns: liveChat.turns.length > 0
-        ? liveChat.turns.map((turn) => cloneTurn(turn))
-        : persistedChat.turns.map((turn) => cloneTurn(turn)),
+      turns: mergeCursorTurns(persistedChat.turns, liveChat.turns),
       model: preferredModel,
       modelConfidence: preferredConfidence,
     };
@@ -1916,6 +1918,38 @@ export class AgentMonitor implements vscode.Disposable {
       clearTimeout(handle);
     }
     this.antigravityBindingCleanupHandles.clear();
+  }
+
+  private recoverAntigravityBindingForLateUpdate(
+    turnUpdate: AntigravityTurnUpdateEvent
+  ): { chatId: string; turnId: string; requestType: InterceptedRequestType; liveTurnKey: string } | undefined {
+    const directChat = this.antigravityLiveChats.get(turnUpdate.conversationId);
+    const fallbackChat = directChat
+      ?? [...this.antigravityLiveChats.values()]
+        .filter((chat) => chat.turns.some((turn) => turn.blocks['user-input'].content.trim()))
+        .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+    if (!fallbackChat) {
+      return undefined;
+    }
+
+    const candidateTurn = [...fallbackChat.turns]
+      .filter((turn) => turn.blocks['user-input'].content.trim())
+      .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+    if (!candidateTurn) {
+      return undefined;
+    }
+
+    const recoveredBinding = {
+      chatId: fallbackChat.id,
+      turnId: candidateTurn.id,
+      requestType: 'primary' as const,
+      liveTurnKey: this.currentLiveTurnKeys.get(this.liveChatKey('antigravity', fallbackChat.id)) ?? '',
+    };
+    this.antigravityRequestBindings.set(turnUpdate.executionId, recoveredBinding);
+    this.output.appendLine(
+      `[antigravity-live] Reattached late execution ${turnUpdate.executionId} to ${fallbackChat.id}:${candidateTurn.id}.`
+    );
+    return recoveredBinding;
   }
 
   private ensureAntigravityLiveChat(

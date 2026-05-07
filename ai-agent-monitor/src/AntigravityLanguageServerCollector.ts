@@ -19,6 +19,7 @@ const STREAM_RETRY_MS = 3_000;
 const STREAM_STARTUP_STALL_MS = 4_000;
 const BRAIN_COMPLETION_GRACE_MS = 30_000;
 const BRAIN_IDLE_AUTOCOMPLETE_MS = 15_000;
+const BRAIN_POST_COMPLETION_SYNC_MS = 60_000;
 const BRAIN_LIVE_DISCOVERY_MAX_AGE_MS = 10 * 60 * 1000;
 const BRAIN_DIRECTORY_SCAN_INTERVAL_MS = 2_000;
 const MAX_ACTIVE_STREAM_TARGETS = 12;
@@ -82,6 +83,7 @@ interface ActiveRunState {
   contextWindowTokens?: number;
   startedEmitted: boolean;
   completed: boolean;
+  completedAt?: number;
   completionRequestedAt?: number;
   capturedTokenUsage: Required<Pick<CapturedTokenUsage, 'thinkingTokens' | 'subagentTokens' | 'editorTokens' | 'outputTokens'>>;
   stepTokenContributions: Map<string, StepTokenContribution>;
@@ -1220,6 +1222,7 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
     }
 
     run.completed = true;
+    run.completedAt = Date.now();
     run.completionRequestedAt = undefined;
     const updatedAt = run.lastUpdatedAt ?? run.promptStartedAt ?? Date.now();
     this._onTurnUpdate.fire({
@@ -1255,7 +1258,22 @@ export class AntigravityLanguageServerCollector implements vscode.Disposable {
 
     const activeRuns = [...this.runStates.values()].filter((run) =>
       run.startedEmitted
-      && (!run.completed || Boolean(run.completionRequestedAt))
+      && (
+        !run.completed
+        || Boolean(run.completionRequestedAt)
+        || (
+          Math.max(
+            run.completedAt ?? 0,
+            run.lastUpdatedAt ?? 0,
+            run.promptStartedAt ?? 0
+          ) > 0
+          && Date.now() - Math.max(
+            run.completedAt ?? 0,
+            run.lastUpdatedAt ?? 0,
+            run.promptStartedAt ?? 0
+          ) < BRAIN_POST_COMPLETION_SYNC_MS
+        )
+      )
     );
 
     for (const run of activeRuns) {
@@ -2223,87 +2241,12 @@ function buildBrainFallbackSnapshot(
   artifactEntries: BrainArtifactEntry[]
 ): BrainFallbackSnapshot | undefined {
   const steps = coalesceOverviewLogEntries(parseOverviewLogEntries(overviewRaw));
-  if (steps.length === 0) {
+  const range = findLastOverviewTurnRange(steps);
+  if (!range) {
     return undefined;
   }
 
-  let lastUserInputIndex = -1;
-  for (let index = 0; index < steps.length; index += 1) {
-    if (steps[index]?.type === 'USER_INPUT' && steps[index]?.source?.startsWith('USER')) {
-      lastUserInputIndex = index;
-    }
-  }
-  if (lastUserInputIndex < 0) {
-    return undefined;
-  }
-
-  const turnSteps = steps.slice(lastUserInputIndex);
-  const promptStep = turnSteps[0];
-  const prompt = extractOverviewPrompt(promptStep?.content);
-  let thinking = '';
-  let editor = '';
-  let output = '';
-  let updatedAt = promptStep?.createdAt ?? 0;
-
-  for (const step of turnSteps.slice(1)) {
-    updatedAt = Math.max(updatedAt, step.createdAt ?? 0);
-    if (step.type !== 'PLANNER_RESPONSE' || step.status !== 'DONE') {
-      continue;
-    }
-
-    const stepContent = normalizeBrainFallbackText(step.content);
-    if (stepContent) {
-      output = mergeStepText(output, stepContent);
-    }
-
-    for (const toolCall of step.toolCalls) {
-      if (classifyOverviewToolCall(toolCall) !== 'editor') {
-        continue;
-      }
-
-      const toolText = buildOverviewToolCallText(toolCall);
-      if (toolText) {
-        editor = mergeStepText(editor, toolText);
-      }
-    }
-
-    const referencedArtifacts = step.toolCalls
-      .flatMap((toolCall) => resolveOverviewToolCallTarget(toolCall))
-      .flatMap((toolTarget) => artifactEntries.filter((artifact) => artifact.filePath === toolTarget.filePath))
-      .sort((left, right) => left.baseName.localeCompare(right.baseName));
-
-    for (const artifact of referencedArtifacts) {
-      updatedAt = Math.max(updatedAt, artifact.updatedAt);
-      if (!artifact.content) {
-        continue;
-      }
-
-      if (classifyBrainFallbackArtifact(artifact.baseName, artifact.filePath) === 'thinking') {
-        thinking = mergeStepText(thinking, artifact.content);
-        continue;
-      }
-
-      output = mergeStepText(output, artifact.content);
-    }
-  }
-
-  const normalizedThinking = normalizeBrainFallbackText(thinking);
-  const normalizedEditor = normalizeBrainFallbackText(editor);
-  const normalizedOutput = normalizeBrainFallbackText(output);
-  const normalizedPrompt = normalizeBrainFallbackText(prompt);
-  if (!normalizedPrompt && !normalizedThinking && !normalizedEditor && !normalizedOutput) {
-    return undefined;
-  }
-
-  return {
-    prompt: normalizedPrompt || undefined,
-    promptStartedAt: promptStep?.createdAt,
-    promptStepIndex: promptStep?.stepIndex,
-    thinking: normalizedThinking || undefined,
-    editor: normalizedEditor || undefined,
-    output: normalizedOutput || undefined,
-    updatedAt: updatedAt || undefined,
-  };
+  return buildBrainFallbackSnapshotFromTurnRange(range, artifactEntries);
 }
 
 async function loadBrainArtifactEntries(
@@ -2433,86 +2376,22 @@ function buildBrainFallbackSnapshotForRun(
   if (steps.length === 0 && artifactEntries.length === 0) {
     return undefined;
   }
-
-  const timeFloor = Math.max(0, promptStartedAt - 2_000);
-  const relevantSteps = steps.filter((step) => (step.createdAt ?? 0) >= timeFloor);
-  const relevantArtifacts = artifactEntries
-    .filter((artifact) => artifact.updatedAt >= timeFloor)
-    .sort((left, right) => left.baseName.localeCompare(right.baseName));
-
-  let promptStepIndex = run.promptStepIndex;
-  let thinking = '';
-  let editor = '';
-  let output = '';
-  let updatedAt = 0;
-  const referencedArtifactPaths = new Set<string>();
-
-  for (const step of relevantSteps) {
-    updatedAt = Math.max(updatedAt, step.createdAt ?? 0);
-
-    if (step.type === 'USER_INPUT') {
-      const stepPrompt = extractOverviewPrompt(step.content);
-      if (stepPrompt && promptsMatch(normalizedPrompt, stepPrompt)) {
-        promptStepIndex = step.stepIndex ?? promptStepIndex;
-      }
-      continue;
-    }
-
-    if (step.type !== 'PLANNER_RESPONSE') {
-      continue;
-    }
-
-    const stepContent = normalizeBrainFallbackText(step.content);
-    if (stepContent) {
-      output = mergeStepText(output, stepContent);
-    }
-
-    for (const toolCall of step.toolCalls) {
-      for (const target of resolveOverviewToolCallTarget(toolCall)) {
-        referencedArtifactPaths.add(target.filePath);
-      }
-
-      if (classifyOverviewToolCall(toolCall) !== 'editor') {
-        continue;
-      }
-
-      const toolText = buildOverviewToolCallText(toolCall);
-      if (toolText) {
-        editor = mergeStepText(editor, toolText);
-      }
-    }
+  const range = findOverviewTurnRangeForRun(steps, run);
+  if (!range) {
+    return undefined;
   }
 
-  const targetedArtifacts = relevantArtifacts.filter((artifact) => referencedArtifactPaths.has(artifact.filePath));
-  const artifactsToMerge = targetedArtifacts.length > 0 ? targetedArtifacts : relevantArtifacts;
-  for (const artifact of artifactsToMerge) {
-    updatedAt = Math.max(updatedAt, artifact.updatedAt);
-    if (!artifact.content) {
-      continue;
-    }
-
-    if (classifyBrainFallbackArtifact(artifact.baseName, artifact.filePath) === 'thinking') {
-      thinking = mergeStepText(thinking, artifact.content);
-    } else {
-      output = mergeStepText(output, artifact.content);
-    }
-  }
-
-  const normalizedThinking = normalizeBrainFallbackText(thinking);
-  const normalizedEditor = normalizeBrainFallbackText(editor);
-  const normalizedOutput = normalizeBrainFallbackText(output);
-  if (!normalizedThinking && !normalizedEditor && !normalizedOutput) {
+  const snapshot = buildBrainFallbackSnapshotFromTurnRange(range, artifactEntries);
+  if (!snapshot) {
     return undefined;
   }
 
   return {
-    prompt: normalizedPrompt,
-    promptStartedAt,
-    promptStepIndex,
-    thinking: normalizedThinking || undefined,
-    editor: normalizedEditor || undefined,
-    output: normalizedOutput || undefined,
-    updatedAt: updatedAt || promptStartedAt || undefined,
+    ...snapshot,
+    prompt: snapshot.prompt || normalizedPrompt,
+    promptStartedAt: snapshot.promptStartedAt ?? promptStartedAt,
+    promptStepIndex: snapshot.promptStepIndex ?? run.promptStepIndex,
+    updatedAt: snapshot.updatedAt ?? (promptStartedAt || undefined),
   };
 }
 
@@ -2575,6 +2454,182 @@ function coalesceOverviewLogEntries(entries: OverviewLogEntry[]): OverviewLogEnt
   return order
     .map((key) => coalesced.get(key))
     .filter((entry): entry is OverviewLogEntry => Boolean(entry));
+}
+
+interface OverviewTurnRange {
+  promptStep: OverviewLogEntry;
+  turnSteps: OverviewLogEntry[];
+  nextPromptStartedAt?: number;
+}
+
+function findLastOverviewTurnRange(
+  steps: OverviewLogEntry[]
+): OverviewTurnRange | undefined {
+  const ranges = collectOverviewTurnRanges(steps);
+  return ranges.length > 0 ? ranges[ranges.length - 1] : undefined;
+}
+
+function findOverviewTurnRangeForRun(
+  steps: OverviewLogEntry[],
+  run: Pick<ActiveRunState, 'prompt' | 'promptStartedAt' | 'promptStepIndex'>
+): OverviewTurnRange | undefined {
+  const ranges = collectOverviewTurnRanges(steps);
+  if (ranges.length === 0) {
+    return undefined;
+  }
+
+  if (run.promptStepIndex !== undefined) {
+    const stepIndexMatch = ranges.find((range) => range.promptStep.stepIndex === run.promptStepIndex);
+    if (stepIndexMatch) {
+      return stepIndexMatch;
+    }
+  }
+
+  const normalizedPrompt = normalizeBrainFallbackText(run.prompt).toLowerCase();
+  const promptStartedAt = run.promptStartedAt ?? 0;
+  const matchingRanges = ranges.filter((range) => {
+    const stepPrompt = extractOverviewPrompt(range.promptStep.content);
+    return Boolean(stepPrompt) && promptsMatch(normalizedPrompt, stepPrompt ?? '');
+  });
+
+  if (matchingRanges.length === 1) {
+    return matchingRanges[0];
+  }
+
+  if (matchingRanges.length > 1 && promptStartedAt > 0) {
+    return matchingRanges.reduce((best, candidate) => {
+      const bestDistance = Math.abs((best.promptStep.createdAt ?? 0) - promptStartedAt);
+      const candidateDistance = Math.abs((candidate.promptStep.createdAt ?? 0) - promptStartedAt);
+      return candidateDistance < bestDistance ? candidate : best;
+    });
+  }
+
+  if (matchingRanges.length > 1) {
+    return matchingRanges[matchingRanges.length - 1];
+  }
+
+  if (promptStartedAt > 0) {
+    const timeMatch = ranges.find((range) =>
+      Math.abs((range.promptStep.createdAt ?? 0) - promptStartedAt) <= 5_000
+    );
+    if (timeMatch) {
+      return timeMatch;
+    }
+  }
+
+  return undefined;
+}
+
+function collectOverviewTurnRanges(
+  steps: OverviewLogEntry[]
+): OverviewTurnRange[] {
+  const userInputIndexes = steps
+    .map((step, index) => ({ step, index }))
+    .filter(({ step }) => step.type === 'USER_INPUT' && step.source?.startsWith('USER'));
+
+  return userInputIndexes.map(({ step, index }, position) => {
+    const nextUserInputIndex = userInputIndexes[position + 1]?.index;
+    return {
+      promptStep: step,
+      turnSteps: steps.slice(index + 1, nextUserInputIndex),
+      nextPromptStartedAt: nextUserInputIndex !== undefined
+        ? steps[nextUserInputIndex]?.createdAt
+        : undefined,
+    };
+  });
+}
+
+function buildBrainFallbackSnapshotFromTurnRange(
+  range: OverviewTurnRange,
+  artifactEntries: BrainArtifactEntry[]
+): BrainFallbackSnapshot | undefined {
+  const prompt = extractOverviewPrompt(range.promptStep.content);
+  let thinking = '';
+  let editor = '';
+  let output = '';
+  let updatedAt = range.promptStep.createdAt ?? 0;
+  const referencedArtifactPaths = new Set<string>();
+  const artifactTimeFloor = Math.max(0, (range.promptStep.createdAt ?? 0) - 2_000);
+  const artifactTimeCeiling = range.nextPromptStartedAt !== undefined
+    ? range.nextPromptStartedAt + 2_000
+    : undefined;
+
+  for (const step of range.turnSteps) {
+    updatedAt = Math.max(updatedAt, step.createdAt ?? 0);
+    if (step.type !== 'PLANNER_RESPONSE' || step.status !== 'DONE') {
+      continue;
+    }
+
+    const stepContent = normalizeBrainFallbackText(step.content);
+    if (stepContent) {
+      output = mergeStepText(output, stepContent);
+    }
+
+    for (const toolCall of step.toolCalls) {
+      for (const target of resolveOverviewToolCallTarget(toolCall)) {
+        referencedArtifactPaths.add(target.filePath);
+      }
+
+      if (classifyOverviewToolCall(toolCall) === 'editor') {
+        const toolText = buildOverviewToolCallText(toolCall);
+        if (toolText) {
+          editor = mergeStepText(editor, toolText);
+        }
+        continue;
+      }
+
+      const toolText = buildOverviewThinkingText(toolCall);
+      if (toolText) {
+        thinking = mergeStepText(thinking, toolText);
+      }
+    }
+  }
+
+  const relevantArtifacts = artifactEntries
+    .filter((artifact) =>
+      artifact.updatedAt >= artifactTimeFloor
+      && (artifactTimeCeiling === undefined || artifact.updatedAt < artifactTimeCeiling)
+    )
+    .sort((left, right) => {
+      if (left.updatedAt !== right.updatedAt) {
+        return left.updatedAt - right.updatedAt;
+      }
+
+      return left.baseName.localeCompare(right.baseName);
+    });
+  const targetedArtifacts = relevantArtifacts.filter((artifact) => referencedArtifactPaths.has(artifact.filePath));
+  const artifactsToMerge = targetedArtifacts.length > 0 ? targetedArtifacts : relevantArtifacts;
+  for (const artifact of artifactsToMerge) {
+    updatedAt = Math.max(updatedAt, artifact.updatedAt);
+    if (!artifact.content) {
+      continue;
+    }
+
+    if (classifyBrainFallbackArtifact(artifact.baseName, artifact.filePath) === 'thinking') {
+      thinking = mergeStepText(thinking, artifact.content);
+      continue;
+    }
+
+    output = mergeStepText(output, artifact.content);
+  }
+
+  const normalizedPrompt = normalizeBrainFallbackText(prompt);
+  const normalizedThinking = normalizeBrainFallbackText(thinking);
+  const normalizedEditor = normalizeBrainFallbackText(editor);
+  const normalizedOutput = normalizeBrainFallbackText(output);
+  if (!normalizedPrompt && !normalizedThinking && !normalizedEditor && !normalizedOutput) {
+    return undefined;
+  }
+
+  return {
+    prompt: normalizedPrompt || undefined,
+    promptStartedAt: range.promptStep.createdAt,
+    promptStepIndex: range.promptStep.stepIndex,
+    thinking: normalizedThinking || undefined,
+    editor: normalizedEditor || undefined,
+    output: normalizedOutput || undefined,
+    updatedAt: updatedAt || undefined,
+  };
 }
 
 function isBrainSnapshotContentArtifactFile(fileName: string): boolean {
@@ -2702,6 +2757,40 @@ function buildOverviewToolCallText(
     if (value) {
       parts.push(value);
     }
+  }
+
+  const content = parts
+    .map((part) => normalizeBrainFallbackText(part))
+    .filter(Boolean)
+    .join('\n\n')
+    .trim();
+  return content || undefined;
+}
+
+function buildOverviewThinkingText(
+  toolCall: { name?: string; args?: Record<string, unknown> }
+): string | undefined {
+  if (isOverviewBrainArtifactToolCall(toolCall)) {
+    return undefined;
+  }
+
+  const args = toolCall.args ?? {};
+  const parts: string[] = [];
+  const displayPath = resolveOverviewToolCallTarget(toolCall)[0]?.filePath;
+
+  if (toolCall.name) {
+    parts.push(toolCall.name);
+  }
+
+  for (const key of ['toolSummary', 'toolAction', 'Instruction', 'Description']) {
+    const value = decodeOverviewScalar(args[key]);
+    if (value) {
+      parts.push(value);
+    }
+  }
+
+  if (displayPath) {
+    parts.push(displayPath);
   }
 
   const content = parts

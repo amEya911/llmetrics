@@ -15,9 +15,6 @@
 [Features](#-features) · [Architecture](#-architecture) · [How It Works](#-how-it-works) · [Installation](#-installation) · [Configuration](#%EF%B8%8F-configuration)
 
 </div>
-happy coding
-
-happy coding
 
 ---
 
